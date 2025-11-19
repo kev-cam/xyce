@@ -54,6 +54,7 @@
 #include <N_UTL_NetlistLocation.h>
 #include <N_DEV_Pars.h>
 #include <N_DEV_InstanceName.h>
+#include <N_DEV_SourceData.h>
 
 namespace Xyce {
 namespace Device {
@@ -250,7 +251,7 @@ public:
     setDefaultParameters(*this, getParameterMap().begin(), getParameterMap().end(), devOptions_);
   }
 
-  void setParams(const std::vector<Param> & params);
+  Src_mod setParams(const std::vector<Param> & params);
 
   // special handling for parameters contained within a vector-composite parameter
   void setParamFromVCParam(CompositeParam &composite_param,
@@ -338,6 +339,9 @@ protected:
   std::vector<double>         eVarVals;
 
   std::unordered_map <std::string, std::vector <Depend> > tmpGlobalParams_; 
+
+public:
+  inline const SolverState *solState()   const {return &solState_;} 
 };
 
 } // namespace Device

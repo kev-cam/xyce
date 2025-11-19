@@ -52,11 +52,6 @@
 #include <N_DEV_DeviceBlock.h>
 #include <N_DEV_Param.h>
 
-enum Src_mod {
-  _STATIC_SRC   = 0,  
-  _DYNAMIC_SRC  = 0x10
-};
-    
 enum Src_index {
   _SIN_DATA,
   _EXP_DATA,
@@ -74,13 +69,14 @@ enum Src_index {
 namespace Xyce {
 namespace Device {
 
-#define  EXT_CLASSES 
+#define  EXT_CLASSES
 #include <N_DEV_SourceDataExt.h>
 
 typedef std::map<std::string, std::vector<Param>, LessNoCase> DeviceParamMap;
 
 void sourceFunctionMetadata(DeviceParamMap &map);
 int getSourceFunctionID(const std::string & sourceFcn);
+const std::vector<Param> &getSourceFunctionParameters(const std::string &sourceFcn);
 
 //-----------------------------------------------------------------------------
 // Class         : SourceData
@@ -158,8 +154,9 @@ public:
     localTime_ = time;
   }
 
-public:
-  double getTime_() const;
+  double getTime_();
+
+protected:
 
 private:
   SourceData ();
@@ -177,8 +174,6 @@ protected:
   double SourceValue;
 
   bool initializeFlag_;
-
-  bool resetFlag_;
 
   const SolverState & solState_;
   const DeviceOptions & devOptions_;
@@ -436,13 +431,11 @@ class PWLinData : public SourceData
   friend class VsrcInstance;
   friend class ISRCModel;
   friend class ISRCInstance;
-  friend class PWLinDynData;
 
 public:
   PWLinData(const DeviceEntity & device, const std::vector<Param> & paramRef,
             const SolverState   & ss1,
-            const DeviceOptions & do1,
-            const std::string   & t_name = "PWL");
+            const DeviceOptions & do1);
 
   ~PWLinData();
 
@@ -465,7 +458,7 @@ public:
   void setParams (double *);
   void printOutParams ();
 
-private:
+protected:
   // Data Members for Class Attributes
   int NUM; //number of time,voltage pairs
   bool REPEAT; //repeat cycle?
@@ -477,8 +470,6 @@ private:
   std::vector< std::pair<int,Util::Expression> >  timeExprList;
 
   int loc_; //current location in time vector
-  double starttime_; //absolute start time of current cycle
-
   bool preComputedBreakpointsDone;
 };
 
@@ -486,7 +477,7 @@ private:
 // Class         : PWLinDynData
 // Purpose       : This class contains the data and functions associated
 //                 with piece-wise linear independent sources from a URI
-// Special Notes : Handles like a rehgular PWL source other than how data
+// Special Notes : Handles like a regular PWL source other than how data
 //                 is acquired.
 // Creator       : Kevin Cameron
 // Creation Date : 4/28/20
@@ -502,7 +493,7 @@ class PWLinDynData : public PWLinData
 
   virtual bool updateSource();
   virtual bool getBreakPoints( std::vector<Util::BreakPoint> & breakPointTimes);
-  
+
   enum BridgeOP {
 # define BRIDGE_OP(o) o,
 # include "N_DEV_BridgeOp.inc"

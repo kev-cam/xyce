@@ -460,7 +460,7 @@ Instance::Instance(
   setDefaultParams ();
 
   // Set params according to instance line and constant defaults from metadata:
-  setParams (IB.params);
+  Src_mod mods = setParams (IB.params);
 
   const SolverState &solver_state = factory_block.solverState_;
   const DeviceOptions &device_options = factory_block.deviceOptions_;
@@ -476,7 +476,7 @@ Instance::Instance(
 
   if (HBSpecified_ || TRANSIENTSOURCETYPEgiven)
   {
-    switch (TRANSIENTSOURCETYPE)
+    switch (TRANSIENTSOURCETYPE|mods)
     {
       case _SIN_DATA:
         tranSourceData_ = new SinData(*this, IB.params, solver_state, device_options);
@@ -493,6 +493,14 @@ Instance::Instance(
       case _PWL_DATA:
         tranSourceData_ = new PWLinData(*this, IB.params, solver_state, device_options);
         break;
+
+      case _PWL_DATA | _DYNAMIC_SRC: {
+        PWLinDynData *src = new PWLinDynData(*this, IB.params, solver_state, device_options);
+        tranSourceData_ = src;
+        if (src->CallBridge(PWLinDynData::Init,this) < 0) { // initialize bridge
+            UserFatal(*this) << "Failed to connect URI " << getName();
+        }
+      } break;
 
       case _PAT_DATA:
         tranSourceData_ = new PatData(*this, IB.params, solver_state, device_options);
@@ -529,6 +537,15 @@ Instance::Instance(
     jacStamp[2][2] = 2;
   }
           
+}
+
+extern "C" {
+
+int InstanceGetVsrcV(DeviceInstance *dev_inst,double *ret) {
+    Instance *inst = (Instance *)dev_inst;
+    return 0;
+}
+
 }
 
 //-----------------------------------------------------------------------------

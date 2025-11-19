@@ -1976,8 +1976,10 @@ void DeviceEntity::checkParamVersions(double versionDouble) const
 // Creator       : Dave Shirley, PSSI
 // Creation Date : 11/20/04
 //-----------------------------------------------------------------------------
-void DeviceEntity::setParams(const std::vector<Param> &params)
+Src_mod DeviceEntity::setParams(const std::vector<Param> &params)
 {
+  Src_mod mods = _STATIC_SRC; //default
+    
   std::vector<Param>::const_iterator begin=params.begin();
   std::vector<Param>::const_iterator end=params.end();
   
@@ -2249,6 +2251,11 @@ void DeviceEntity::setParams(const std::vector<Param> &params)
     {
     }
 
+    else if (tag == "URI")
+    {
+        mods = (Src_mod)(mods|_DYNAMIC_SRC);
+    }
+
     // Must be a composite
     else
     {
@@ -2368,6 +2375,8 @@ void DeviceEntity::setParams(const std::vector<Param> &params)
 
     //tmpGlobalParams_.clear(); // we don't need this anymore
   }
+
+  return mods;
 }
 
 

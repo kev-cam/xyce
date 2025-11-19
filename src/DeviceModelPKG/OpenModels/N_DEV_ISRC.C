@@ -357,7 +357,7 @@ Instance::Instance(
   setDefaultParams ();
 
   // Set params according to instance line and constant defaults from metadata:
-  setParams (instance_block.params);
+  Src_mod mods = setParams (instance_block.params);
 
   const SolverState &solver_state = factory_block.solverState_;
   const DeviceOptions &device_options = factory_block.deviceOptions_;
@@ -373,7 +373,7 @@ Instance::Instance(
 
   if (HBSpecified_ || TRANSIENTSOURCETYPEgiven)
   {
-    switch (TRANSIENTSOURCETYPE)
+    switch (TRANSIENTSOURCETYPE|mods)        
     {
       case _SIN_DATA:
         tranSourceData_ = new SinData(*this, instance_block.params, solver_state, device_options);
@@ -390,6 +390,14 @@ Instance::Instance(
       case _PWL_DATA:
         tranSourceData_ = new PWLinData(*this, instance_block.params, solver_state, device_options);
         break;
+
+      case _PWL_DATA | _DYNAMIC_SRC: {
+        PWLinDynData *src = new PWLinDynData(*this, instance_block.params, solver_state, device_options);
+        tranSourceData_ = src;
+        if (src->CallBridge(PWLinDynData::Init,this) < 0) { // initialize bridge
+            UserFatal(*this) << "Failed to connect URI " << getName();
+        }
+      } break;
 
       case _PAT_DATA:
         tranSourceData_ = new PatData(*this, instance_block.params, solver_state, device_options);
@@ -415,6 +423,34 @@ Instance::Instance(
 
   updateDependentParameters();
   processParams();
+}
+
+extern "C" {
+
+int InstanceGetIsrcV(DeviceInstance *dev_inst,double *ret) {
+    Instance          *inst     = (Instance *)dev_inst;
+    const SolverState *ss       = inst->solState();
+    const ExternData  *extDataP = inst->extDataPtr();
+    double            *lVec     = extDataP->lastSolVectorRawPtr;
+    double            *nVec     = extDataP->nextSolVectorRawPtr;
+    double            *cVec     = extDataP->currSolVectorRawPtr;
+    int               sts       = 0;
+    ret[3] = (ret[0] = ss->currTime_)
+                     + ss->currTimeStep_;
+    if (cVec) {
+        ret[1] = cVec[inst->liPos()];
+        ret[2] = cVec[inst->liNeg()];
+        ret[4] = nVec[inst->liPos()];
+        ret[5] = nVec[inst->liNeg()];
+        sts   |= 3;
+    } else {
+        ret[1] = nVec[inst->liPos()];
+        ret[2] = nVec[inst->liNeg()];
+        sts   |= 1;
+    }
+    return sts;
+}
+    
 }
 
 //-----------------------------------------------------------------------------

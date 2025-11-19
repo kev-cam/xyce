@@ -358,7 +358,12 @@ private:
   int size_;
   Teuchos::RCP<N_UTL_FFTInterface<std::vector<double> > > ftInterface_;
   std::vector<double> ftInData_, ftOutData_, iftInData_, iftOutData_;
-                   
+
+public:
+  inline int liPos() const {return li_Pos;}
+  inline int liNeg() const {return li_Neg;}
+
+  inline const ExternData *extDataPtr() const {return &extData;}                    
 };
 
 //-----------------------------------------------------------------------------

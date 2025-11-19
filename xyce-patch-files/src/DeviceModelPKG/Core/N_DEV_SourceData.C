@@ -164,7 +164,6 @@ SourceData::SourceData(const SolverState & ss1,
   time(0.0),
   SourceValue(0.0),
   initializeFlag_(false),
-  resetFlag_(true),
   solState_(ss1),
   devOptions_(do1),
   fastTimeScaleFlag_(false),
@@ -254,7 +253,7 @@ double SourceData::getMaxTimeStepSize ()
 // Creator       : Eric Keiter, SNL, Parallel Computational Sciences
 // Creation Date : 3/25/04
 //-----------------------------------------------------------------------------
-double SourceData::getTime_() const
+double   SourceData::getTime_()
 {
   double tmpTime = 0.0;
 
@@ -832,8 +831,6 @@ bool ExpData::updateSource()
       (V1-V2)*(1-exp(-(time-TD2)/TAU2)) ;
   }
 
-  resetFlag_ = false;
-
   return bsuccess;
 }
 
@@ -1247,8 +1244,6 @@ bool PulseData::updateSource()
     Xyce::dout() << "  SourceValue = " << SourceValue << std::endl;
   }
 
-  resetFlag_ = false;
-
   return bsuccess;
 }
 
@@ -1609,15 +1604,13 @@ PWLinData::PWLinData(
   const DeviceEntity &          device,
   const std::vector<Param> &    paramRef,
   const SolverState &           ss1,
-  const DeviceOptions &         do1,
-  const std::string   &         t_name)
+  const DeviceOptions &         do1)
 : SourceData(ss1,do1),
   NUM(0),
   REPEAT(false),
   REPEATTIME(0.0),
   TD(0.0),
   loc_(0),
-  starttime_(0.0),
   preComputedBreakpointsDone(false)
 {
   std::vector<Param>::const_iterator iter = paramRef.begin();
@@ -1726,170 +1719,6 @@ void PWLinData::getSensitivityParams (
   }
 }
 
-extern "C" {
-    
-static int NoConnection(PWLinDynData *,void *ext_data, PWLinDynData::BridgeOP op, void *op_data)
-{
-    return -1; // fatal error
-}
-
-tTVVEC *DeviceGetTVVEC(PWLinDynData *device) {
-    return device->getTVVEC();
-}
-    
-double DeviceGetTime(PWLinDynData *device) {
-    return device->getTime_();
-}
-    
-void DeviceResetNUM(PWLinDynData *device) {
-    device->ResetNUM();
-}
-    
-void DeviceRedoBreaks(PWLinDynData *device) {
-    device->RecalculateBreaks();
-}
-    
-    int DevAddBreak(PWLinDynData *device,double bp_time) {
-    return device->addBreak(bp_time);
-}
-    
-c_string DeviceGetTypName(PWLinDynData *device) {
-    return device->getTypName();
-}
-    
-c_string DeviceGetSrcName(PWLinDynData *device) {
-    return device->getSrcName();
-}
-    
-c_string DeviceGetPrmName(PWLinDynData *device) {
-    return device->getPrmName();
-}
-
-double DeviceGetParam(DeviceInstance *dev_inst,const char *name,double dflt) {
-    double val;
-    if (dev_inst->getParam(name,val)) {
-    }    
-    return dflt;
-}
-
-c_string InstanceGetName(DeviceInstance *dev_inst) {
-
-    const InstanceName &iname(dev_inst->getName());
-    return iname.getEncodedName().c_str();
-}
-
-}
-
-//-----------------------------------------------------------------------------
-// Function      : PWLinDynData::PWLinDynData
-// Purpose       : constructor
-// Special Notes : just calls through to parent with different type name
-// Creator       : Kevin Cameron
-// Creation Date : 4/28/20
-//-----------------------------------------------------------------------------
-PWLinDynData::PWLinDynData(const DeviceEntity & device, const std::vector<Param> & paramRef,
-            const SolverState   & ss1,
-               const DeviceOptions & do1)
-      : PWLinData(device, paramRef, ss1, do1, "DPWL")
-{    
-    std::vector<Param>::const_iterator iter = paramRef.begin();
-    std::vector<Param>::const_iterator last = paramRef.end();
-
-    BridgeFn     = NoConnection; // fail later
-    BridgeFnData = NULL;
-    next_bp      = 0.0;
-    
-    for ( ; iter != last; ++iter)
-    {
-        const std::string & tmpname = iter->tag();
-
-        if (tmpname == "URI")  {
-            std::string val(iter->getImmutableValue<std::string>());
-            const char *cp     = val.c_str();
-            const char *ep     = NULL;
-            const char *lib_nm = NULL; // self
-            const char *call   = "NoConnection";
-            const char *args   = "";
-            int l;
-            if (0 == strncasecmp("code:",cp,5)) {
-                cp += 5;
-                if (NULL != (ep  = strstr(cp,":"))) {
-                    char lib[1 + (l = (ep - cp))]; strncpy(lib,cp,l); lib[l] = '\0';
-                    lib_nm = lib;
-                    cp = ++ep;
-                    if (NULL != (ep  = strstr(cp,":"))) {
-                        char entry[1 + (l = (ep - cp))]; strncpy(entry,cp,l); entry[l] = '\0';
-                        call = entry;
-                        cp = ++ep;
-                        if (*cp) {
-                            args = cp;
-                        }
-                        BridgeFn = BindCB(lib_nm,call,args,&BridgeFnData);
-                    } else {
-                        BridgeFn = BindCB(lib_nm,call,args,&BridgeFnData);
-                    }
-                } 
-            }
-        }
-    }
-}
-
-
-extern "C" {
-#   define FN_DECL(ret,nm,argt,arg) ret nm argt;
-#   include "N_DEV_SourceDataExt.inc"
-}
-    
-//-----------------------------------------------------------------------------
-// Function      : PWLinDynData::BindCB
-// Purpose       : Load shared library and locate function
-// Special Notes : just calls through to parent with different type name
-// Creator       : Kevin Cameron
-// Creation Date : 4/28/20
-//-----------------------------------------------------------------------------
-PWLinDynData::Callback PWLinDynData::BindCB(const char *lib_name,const char *fn_name,const char *args, void **cb_data)
-{
-    void *handle = NULL;
-    typedef void *(*fn_p)(...);
-    fn_p fn;
-    
-    static void *fns[] = {
-#     define FN_DECL(ret,nm,argt,arg) (void *)nm,
-#     include "N_DEV_SourceDataExt.inc"
-      NULL
-    };
-
-    *cb_data = fns; // manual linking
-
-#   define FN_DECL(ret,nm,argt,arg) e##nm, // bind names to index
-    enum {
-#     include "N_DEV_SourceDataExt.inc"
-      eEnd
-    };
-
-    dlerror(); // clear reports
-    
-    Callback cbk = NoConnection;
-    
-    if (NULL != lib_name) {
-        handle = dlopen(lib_name,RTLD_NOW);
-        if (NULL == handle) {
-            char *error = dlerror();
-            Report::DevelFatal() << "Dynamic loading " << error;
-            goto fail;
-        }
-    }
-
-    void *fp;
-    
-    if (NULL != (fn = (fn_p)dlsym(handle, fn_name))) {
-        cbk = (Callback)(*fn)(this,cb_data,args);
-    }
-    
-  fail:
-    return cbk;
-}
-
 //-----------------------------------------------------------------------------
 // Function      : PWLinData::getAnalyticSensitivityDevice
 // Purpose       : 
@@ -1904,17 +1733,6 @@ bool PWLinData::getAnalyticSensitivityDevice ( int iparam, double & deriv)
   std::string paramName = std::string("V") + indexStr;
   return updateSourceDeriv(paramName, deriv);
 }
-
-//-----------------------------------------------------------------------------
-// Class         : PWLinDynData::~PWLinDynData
-//
-//
-// Special Notes :
-// Creator       : Kevin Cameron
-// Creation Date : 4/28/20
-//-----------------------------------------------------------------------------
-PWLinDynData::~PWLinDynData()
-{}
 
 //-----------------------------------------------------------------------------
 // Function      : PWLinData::printOutParams
@@ -1932,7 +1750,6 @@ void PWLinData::printOutParams()
   Xyce::dout() << "  REPEATTIME  = "    << REPEATTIME << std::endl;
   Xyce::dout() << "  TD  = "    << TD << std::endl;
   Xyce::dout() << "  loc_  = "    << loc_ << std::endl;
-  Xyce::dout() << "  starttime_  = "    << starttime_ << std::endl;
 
   Xyce::dout() << "  Time    Voltage" << std::endl;
   for( int i = 0; i < NUM; ++i )
@@ -2040,7 +1857,7 @@ bool PWLinData::updateSource()
 
     }
 
-    if( time1 == time2 || voltage1 == voltage2)
+    if( time1 == time2 )
       SourceValue = voltage2;
     else
     {
@@ -2065,31 +1882,7 @@ bool PWLinData::updateSource()
     SourceValue = 0.0;
   }
 
-  resetFlag_ = false;
-
   return bsuccess;
-}
-
-//-----------------------------------------------------------------------------
-// Function      : PWLinDynData::updateSource
-// Purpose       :
-// Special Notes :
-// Scope         : public
-// Creator       : Kevin Cameron
-// Creation Date : 4/29/2020
-//-----------------------------------------------------------------------------
-bool PWLinDynData::updateSource()
-{
-    CallBridge(Update,&TVVEC);
-    bool sts = PWLinData::updateSource();
-
-    if (next_bp > 0) {
-        // double time = getTime_();
-        // should maybe pull step in here
-        next_bp = -1;
-    }
-    
-    return sts;
 }
 
 //-----------------------------------------------------------------------------
@@ -2320,49 +2113,6 @@ bool PWLinData::getBreakPoints
 }
 
 //-----------------------------------------------------------------------------
-// Function      : PWLinDynData::getBreakPoints
-// Purpose       :
-// Special Notes :
-// Scope         : public
-// Creator       : Kevin Cameron
-// Creation Date : 06/08/01
-//-----------------------------------------------------------------------------
-bool PWLinDynData::getBreakPoints
-(std::vector<Util::BreakPoint> & breakPointTimes )
-{
-  bool bsuccess = true;
-
-  if (DEBUG_DEVICE && isActive(Diag::DEVICE_PARAMETERS) && solState_.debugTimeFlag)
-  {
-    Xyce::dout() << "  In PWLinDynData::getBreakPoints\n";
-  }
-
-  if (!initializeFlag_) bsuccess = initializeSource ();
-
-  time = solState_.currTime_;
-
-  time -= TD;
-
-  if (!preComputedBreakpointsDone)
-  {
-      int origSize = breakPointTimes.size();
-      breakPointTimes.reserve(origSize+NUM);
-      for (int i = 0; i < NUM; ++i)
-      {
-        double bp_time = TVVEC[i].first;
-        breakPointTimes.push_back(bp_time+TD);
-        if (DEBUG_DEVICE && isActive(Diag::DEVICE_PARAMETERS) && solState_.debugTimeFlag)
-        {
-          Xyce::dout() << "bp_time + TD: " << bp_time + TD << std::endl;
-        }
-      }
-      preComputedBreakpointsDone = true;
-  }
-
-  return bsuccess;
-}
-
-//-----------------------------------------------------------------------------
 // Function      : PWLinData::getParams
 // Purpose       : Pass back the PWL source params.
 // Special Notes :
@@ -2461,6 +2211,257 @@ void PWLinData::setParams (double *params)
     setupBreakPoints() ;
     updateSource();
   }
+}
+
+extern "C" {
+
+static int NoConnection(PWLinDynData *,void *ext_data, PWLinDynData::BridgeOP op, void *op_data)
+{
+    return -1; // fatal error
+}
+
+tTVVEC *DeviceGetTVVEC(PWLinDynData *device) {
+    return device->getTVVEC();
+}
+
+double DeviceGetTime(PWLinDynData *device) {
+    return device->getTime_();
+}
+
+void DeviceResetNUM(PWLinDynData *device) {
+    device->ResetNUM();
+}
+
+void DeviceRedoBreaks(PWLinDynData *device) {
+    device->RecalculateBreaks();
+}
+
+    int DevAddBreak(PWLinDynData *device,double bp_time) {
+    return device->addBreak(bp_time);
+}
+
+c_string DeviceGetTypName(PWLinDynData *device) {
+    return device->getTypName();
+}
+
+c_string DeviceGetSrcName(PWLinDynData *device) {
+    return device->getSrcName();
+}
+
+c_string DeviceGetPrmName(PWLinDynData *device) {
+    return device->getPrmName();
+}
+
+double DeviceGetParam(DeviceInstance *dev_inst,const char *name,double dflt) {
+    double val;
+    if (dev_inst->getParam(name,val)) {
+    }
+    return dflt;
+}
+
+c_string InstanceGetName(DeviceInstance *dev_inst) {
+
+    const InstanceName &iname(dev_inst->getName());
+    return iname.getEncodedName().c_str();
+}
+
+int InstanceGetVsrcV(DeviceInstance *inst, double *pRet) {
+    // Placeholder implementation - would need actual Vsrc instance access
+    *pRet = 0.0;
+    return 0;
+}
+
+int InstanceGetIsrcV(DeviceInstance *inst, double *pRet) {
+    // Placeholder implementation - would need actual Isrc instance access
+    *pRet = 0.0;
+    return 0;
+}
+
+}
+
+//-----------------------------------------------------------------------------
+// Function      : PWLinDynData::PWLinDynData
+// Purpose       : constructor
+// Special Notes : just calls through to parent with different type name
+// Creator       : Kevin Cameron
+// Creation Date : 4/28/20
+//-----------------------------------------------------------------------------
+PWLinDynData::PWLinDynData(const DeviceEntity & device, const std::vector<Param> & paramRef,
+            const SolverState   & ss1,
+               const DeviceOptions & do1)
+      : PWLinData(device, paramRef, ss1, do1)
+{
+    std::vector<Param>::const_iterator iter = paramRef.begin();
+    std::vector<Param>::const_iterator last = paramRef.end();
+
+    BridgeFn     = NoConnection; // fail later
+    BridgeFnData = NULL;
+    next_bp      = 0.0;
+
+    typeName_ = "DPWL"; // dynamically linked PWL
+
+    for ( ; iter != last; ++iter)
+    {
+        const std::string & tmpname = iter->tag();
+
+        if (tmpname == "URI")  {
+            std::string val(iter->getImmutableValue<std::string>());
+            const char *cp     = val.c_str();
+            const char *ep     = NULL;
+            const char *lib_nm = NULL; // self
+            const char *call   = "NoConnection";
+            const char *args   = "";
+            int l;
+            if (0 == strncasecmp("code:",cp,5)) {
+                cp += 5;
+                if (NULL != (ep  = strstr(cp,":"))) {
+                    char lib[1 + (l = (ep - cp))]; strncpy(lib,cp,l); lib[l] = '\0';
+                    lib_nm = lib;
+                    cp = ++ep;
+                    if (NULL != (ep  = strstr(cp,":"))) {
+                        char entry[1 + (l = (ep - cp))]; strncpy(entry,cp,l); entry[l] = '\0';
+                        call = entry;
+                        cp = ++ep;
+                        if (*cp) {
+                            args = cp;
+                        }
+                        BridgeFn = BindCB(lib_nm,call,args,&BridgeFnData);
+                    } else {
+                        BridgeFn = BindCB(lib_nm,call,args,&BridgeFnData);
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+extern "C" {
+#   define FN_DECL(ret,nm,argt,arg) ret nm argt;
+#   include "N_DEV_SourceDataExt.inc"
+}
+
+//-----------------------------------------------------------------------------
+// Function      : PWLinDynData::BindCB
+// Purpose       : Load shared library and locate function
+// Special Notes : just calls through to parent with different type name
+// Creator       : Kevin Cameron
+// Creation Date : 4/28/20
+//-----------------------------------------------------------------------------
+PWLinDynData::Callback PWLinDynData::BindCB(const char *lib_name,const char *fn_name,const char *args, void **cb_data)
+{
+    void *handle = NULL;
+    void *(*fn)(...);
+
+    static void *fns[] = {
+#     define FN_DECL(ret,nm,argt,arg) (void *)nm,
+#     include "N_DEV_SourceDataExt.inc"
+      NULL
+    };
+
+    *cb_data = fns; // manual linking
+
+#   define FN_DECL(ret,nm,argt,arg) e##nm, // bind names to index
+    enum {
+#     include "N_DEV_SourceDataExt.inc"
+      eEnd
+    };
+
+    dlerror(); // clear reports
+
+    Callback cbk = NoConnection;
+
+    if (NULL != lib_name) {
+        handle = dlopen(lib_name,RTLD_NOW);
+        if (NULL == handle) {
+            char *error = dlerror();
+            Report::DevelFatal() << "Dynamic loading " << error;
+            goto fail;
+        }
+    }
+
+    if (NULL != (fn = reinterpret_cast<decltype(fn)>(dlsym(handle, fn_name)))) {
+        cbk = (Callback)(*fn)(this,cb_data,args);
+    }
+
+  fail:
+    return cbk;
+}
+
+//-----------------------------------------------------------------------------
+// Class         : PWLinDynData::~PWLinDynData
+//
+//
+// Special Notes :
+// Creator       : Kevin Cameron
+// Creation Date : 4/28/20
+//-----------------------------------------------------------------------------
+PWLinDynData::~PWLinDynData()
+{}
+
+//-----------------------------------------------------------------------------
+// Function      : PWLinDynData::updateSource
+// Purpose       :
+// Special Notes :
+// Scope         : public
+// Creator       : Kevin Cameron
+// Creation Date : 4/29/2020
+//-----------------------------------------------------------------------------
+bool PWLinDynData::updateSource()
+{
+    CallBridge(Update,&TVVEC);
+    bool sts = PWLinData::updateSource();
+
+    if (next_bp > 0) {
+        // double time = getTime_();
+        // should maybe pull step in here
+        next_bp = -1;
+    }
+
+    return sts;
+}
+
+//-----------------------------------------------------------------------------
+// Function      : PWLinDynData::getBreakPoints
+// Purpose       :
+// Special Notes :
+// Scope         : public
+// Creator       : Kevin Cameron
+// Creation Date : 4/29/2020
+//-----------------------------------------------------------------------------
+bool PWLinDynData::getBreakPoints
+(std::vector<Util::BreakPoint> & breakPointTimes )
+{
+  bool bsuccess = true;
+
+  if (DEBUG_DEVICE && isActive(Diag::DEVICE_PARAMETERS) && solState_.debugTimeFlag)
+  {
+    Xyce::dout() << "  In PWLinDynData::getBreakPoints\n";
+  }
+
+  if (!initializeFlag_) bsuccess = initializeSource ();
+
+  time = solState_.currTime_;
+
+  time -= TD;
+
+  if (!preComputedBreakpointsDone)
+  {
+      int origSize = breakPointTimes.size();
+      breakPointTimes.reserve(origSize+NUM);
+      for (int i = 0; i < NUM; ++i)
+      {
+        double bp_time = TVVEC[i].first;
+        breakPointTimes.push_back(bp_time+TD);
+        if (DEBUG_DEVICE && isActive(Diag::DEVICE_PARAMETERS) && solState_.debugTimeFlag)
+        {
+          Xyce::dout() << "bp_time + TD: " << bp_time + TD << std::endl;
+        }
+      }
+      preComputedBreakpointsDone = true;
+  }
+
+  return bsuccess;
 }
 
 
@@ -2723,8 +2724,6 @@ bool PatData::updateSource()
       Xyce::dout() << Xyce::section_divider << std::endl;
     }
   }
-
-  resetFlag_ = false;
 
   return bsuccess;
 }
@@ -3170,8 +3169,6 @@ bool SFFMData::updateSource()
   SourceValue = V0 + VA * sin((2 * mpi * FC * time) +
       MDI * sin (2 * mpi * FS * time));
 
-  resetFlag_ = false;
-
   return bsuccess;
 }
 
@@ -3370,8 +3367,6 @@ bool ACData::updateSource()
     Xyce::dout() << "  SourceValue = " << SourceValue << std::endl;
   }
 
-  resetFlag_ = false;
-
   return bsuccess;
 }
 
@@ -3516,8 +3511,6 @@ bool ConstData::updateSource()
   if (!initializeFlag_) bsuccess = initializeSource ();
 
   SourceValue = V0;
-
-  resetFlag_ = false;
 
   return bsuccess;
 }
