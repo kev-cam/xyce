@@ -63,6 +63,7 @@ libUtility_la_SOURCES = \
   N_UTL_Algorithm.C \
   N_UTL_NameLevelKey.C \
   N_UTL_CheckIfValidFile.C \
+  N_UTL_CheckIfValidURI.C \
   N_UTL_MathSpecialFunctions.C \
   N_UTL_AssemblyTypes.h \
   N_UTL_TypeIndex.h \
@@ -125,6 +126,7 @@ libUtility_la_SOURCES = \
   N_UTL_Version.h \
   N_UTL_Algorithm.h \
   N_UTL_CheckIfValidFile.h \
+  N_UTL_CheckIfValidURI.h \
   N_UTL_Math.h \
   N_UTL_MathSpecialFunctions.h  \
 	N_UTL_HspiceBools.h 
