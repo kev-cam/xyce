@@ -34,7 +34,7 @@ load_config() {
             configure
         fi
     else
-        configure
+        configure $CONFIG_OPT
     fi
 }
 

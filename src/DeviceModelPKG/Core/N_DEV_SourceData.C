@@ -1679,7 +1679,7 @@ PWLinData::PWLinData(
 
   // an empty list of time-voltage pairs will likely fail parsing in 
   // extractSourceFields().  So, this error test may never be used.
-  if (NUM == 0)
+  if (NUM == 0 && t_name[0] != 'D')
     UserError(device) << "At least one time-voltage pair must be specified for the PWL source function";
 
   // only do this test if the REPEAT parameter (R) is true
@@ -4162,9 +4162,19 @@ extractSourceFields(
             // and 785 for more details.
             if ( !(Util::checkIfValidFile(tvFileName)) )
             {
-              Report::UserError().at(device_block.getNetlistFilename(), parsedInputLine[0].lineNumber_) 
+              if (Util::checkIfValidURI(tvFileName))
+              {
+                // Lazy binding
+                Param uri( "URI", tvFileName );
+                device_block.addInstanceParameter(uri);
+                return true;
+              }
+              else
+              {
+                Report::UserError().at(device_block.getNetlistFilename(), parsedInputLine[0].lineNumber_) 
                 << "Could not find file " << tvFileName << " for PWL function in device: " << device_block.getInstanceName();
-              return false;
+                return false;
+              }
             }
 
             std::ifstream tvDataIn;

@@ -84,6 +84,7 @@ target_sources(XyceLib PRIVATE
       N_UTL_NetlistLocation.C
       N_UTL_NodeSymbols.C
       N_UTL_CheckIfValidFile.C
+      N_UTL_CheckIfValidURI.C
       N_UTL_RFparams.C)
 
 # add header files to project
