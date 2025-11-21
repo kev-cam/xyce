@@ -221,6 +221,9 @@ install(FILES
     DeviceModelPKG/Core/N_DEV_Pars.h
     DeviceModelPKG/Core/N_DEV_SolverState.h
     DeviceModelPKG/Core/N_DEV_Units.h
+    DeviceModelPKG/Core/N_DEV_SourceDataExt.h
+    DeviceModelPKG/Core/N_DEV_SourceDataExt.inc
+    DeviceModelPKG/Core/N_DEV_BridgeOp.inc
     DeviceModelPKG/Core/N_DEV_VectorComputeInterface.h
     DeviceModelPKG/OpenModels/N_DEV_ADC.h
     DeviceModelPKG/OpenModels/N_DEV_DAC.h

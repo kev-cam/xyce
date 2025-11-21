@@ -4,7 +4,7 @@
 
 set -e
 
-CONFIG_FILE="$HOME/.xyce-build-config"
+CONFIG_FILE=.$0-config
 
 # Colors
 RED='\033[0;31m'
@@ -28,11 +28,14 @@ load_config() {
         echo "  TRILINOS_INSTALL: $TRILINOS_INSTALL"
         echo "  NUM_JOBS: $NUM_JOBS"
         echo ""
-        read -p "Use these settings? [Y/n] " -n 1 -r
-        echo
-        if [[ ! $REPLY =~ ^[Yy]$ ]] && [[ ! -z $REPLY ]]; then
-            configure
-        fi
+	case $1 in
+	    auto) REPLY=Y ;;
+            *)    read -p "Use these settings? [Y/n] " -n 1 -r
+		  echo ;;
+	esac
+	if [[ ! $REPLY =~ ^[Yy]$ ]] && [[ ! -z $REPLY ]]; then
+	    configure
+	fi
     else
         configure $CONFIG_OPT
     fi
@@ -195,5 +198,10 @@ main() {
 
 # Run if not sourced
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-    main "$@"
+    
+    case $USER in
+	root) load_config auto
+	      build_xyce ;; # install
+	*)    main "$@"  ;;
+    esac
 fi
