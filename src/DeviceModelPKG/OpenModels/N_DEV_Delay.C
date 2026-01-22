@@ -122,7 +122,9 @@ Instance::Instance(
     newBreakPoint_(false),
     canSetBreakPoints_(true),
     useExtrapolation_(true),
-    useOnlyLinearInterpolation_(false)
+    useOnlyLinearInterpolation_(false),
+    lastInterpolationConverged_(false),
+    v_drop_(0.0)
 {
   numIntVars   = 1;
   numExtVars   = 4;
