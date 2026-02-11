@@ -6093,7 +6093,10 @@ bool DeviceMgr::dumpRestartData(
     comm->pack(&(solState_.ltraTimeIndex_), 1, buf, bsize, pos);
     comm->pack(&(solState_.ltraTimeHistorySize_), 1, buf, bsize, pos);
     comm->pack(&(size), 1, buf, bsize, pos);
-    comm->pack(solState_.ltraTimePoints_.data(), size, buf, bsize, pos);
+    if( size > 0 )
+    {
+      comm->pack(solState_.ltraTimePoints_.data(), size, buf, bsize, pos);
+    }
   }
   else
   {
