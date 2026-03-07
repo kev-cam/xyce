@@ -646,6 +646,10 @@ public:
   std::ostream *openBinaryFile(const std::string &path);
   int closeFile(std::ostream *os);
 
+  /// Find a mem:// stream by searching open stream map for matching prefix.
+  /// Returns nullptr if none found.
+  std::ostream *findMemStream() const;
+
   const OutputParameterMap &getOutputParameterMap() const
   {
     return outputParameterMap_;

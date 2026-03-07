@@ -45,6 +45,8 @@
 #include <N_DEV_ADC.h>
 
 #include <N_CIR_XyceCInterface.h>
+#include <N_IO_OutputMgr.h>
+#include <N_IO_MemBufStream.h>
 
 //-----------------------------------------------------------------------------
 // Function      : xyce_open
@@ -1042,7 +1044,7 @@ int xyce_checkResponseVar(void ** ptr, char * variable_name)
 // Creator       : Rich Schiek, SNL, Electrical Models and Simulation
 // Creation Date : 3/01/2018
 //-----------------------------------------------------------------------------
-int xyce_obtainResponse(void ** ptr, char * variable_name, double* value) 
+int xyce_obtainResponse(void ** ptr, char * variable_name, double* value)
 {
   Xyce::Circuit::GenCouplingSimulator * xycePtr = static_cast<Xyce::Circuit::GenCouplingSimulator *>( *ptr );
   std::string variable_nameStr( variable_name );
@@ -1052,9 +1054,86 @@ int xyce_obtainResponse(void ** ptr, char * variable_name, double* value)
   return result;
 }
 
+//-----------------------------------------------------------------------------
+// Helper: get MemBufStreambuf from an Xyce instance
+//-----------------------------------------------------------------------------
+static Xyce::IO::MemBufStreambuf * getMemBuf(void ** ptr)
+{
+  Xyce::Circuit::GenCouplingSimulator * xycePtr =
+    static_cast<Xyce::Circuit::GenCouplingSimulator *>(*ptr);
 
+  std::ostream *os = xycePtr->getOutputManager().findMemStream();
+  if (!os)
+    return nullptr;
 
+  Xyce::IO::MemBufStream *mbs = dynamic_cast<Xyce::IO::MemBufStream *>(os);
+  if (!mbs)
+    return nullptr;
 
+  return &mbs->membuf();
+}
+
+//-----------------------------------------------------------------------------
+// Function      : xyce_getMemBufData
+// Purpose       : Get pointer to unread data in the live mem:// buffer.
+//                 Zero-copy: *data points directly into the buffer.
+//                 Returns 1 if data is available, 0 otherwise.
+//                 *length is set to the number of available bytes.
+//-----------------------------------------------------------------------------
+int xyce_getMemBufData(void ** ptr, const char **data, int *length)
+{
+  Xyce::IO::MemBufStreambuf *mb = getMemBuf(ptr);
+  if (!mb)
+  {
+    *data = nullptr;
+    *length = 0;
+    return 0;
+  }
+
+  const char *p = nullptr;
+  size_t avail = mb->getReadPtr(&p);
+
+  *data = p;
+  *length = static_cast<int>(avail);
+  return (avail > 0) ? 1 : 0;
+}
+
+//-----------------------------------------------------------------------------
+// Function      : xyce_advanceMemBufRead
+// Purpose       : Advance the read pointer by n bytes after the caller
+//                 has consumed data returned by xyce_getMemBufData.
+//-----------------------------------------------------------------------------
+void xyce_advanceMemBufRead(void ** ptr, int n)
+{
+  Xyce::IO::MemBufStreambuf *mb = getMemBuf(ptr);
+  if (mb && n > 0)
+    mb->advanceRead(static_cast<size_t>(n));
+}
+
+//-----------------------------------------------------------------------------
+// Function      : xyce_memBufReaderBehind
+// Purpose       : Check if the reader has fallen behind a buffer flush.
+//                 If true, call xyce_readMemBufSlices to recover.
+//-----------------------------------------------------------------------------
+bool xyce_memBufReaderBehind(void ** ptr)
+{
+  Xyce::IO::MemBufStreambuf *mb = getMemBuf(ptr);
+  return mb ? mb->readerBehind() : false;
+}
+
+//-----------------------------------------------------------------------------
+// Function      : xyce_readMemBufSlices
+// Purpose       : Read data from slice files that the reader missed.
+//                 Copies into dest buffer, up to max_len bytes.
+//                 Returns number of bytes copied.
+//-----------------------------------------------------------------------------
+int xyce_readMemBufSlices(void ** ptr, char *dest, int max_len)
+{
+  Xyce::IO::MemBufStreambuf *mb = getMemBuf(ptr);
+  if (!mb)
+    return 0;
+  return static_cast<int>(mb->readFromSlices(dest, static_cast<size_t>(max_len)));
+}
 
 
 

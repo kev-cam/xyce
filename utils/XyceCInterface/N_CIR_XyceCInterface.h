@@ -107,6 +107,22 @@ int xyce_checkResponseVar(void ** ptr, char * variable_name);
 
 int xyce_obtainResponse(void ** ptr, char *  variable_name, double *value);
 
+// Memory-buffered output (mem:// streams) read interface.
+// Returns number of bytes available in the live buffer, and sets
+// *data to point directly into the buffer (zero-copy).
+// Returns 0 if no mem:// stream is active or no new data.
+int xyce_getMemBufData(void ** ptr, const char **data, int *length);
+
+// Advance the read pointer by n bytes after consuming data.
+void xyce_advanceMemBufRead(void ** ptr, int n);
+
+// Check if the reader has fallen behind (data in slice files).
+bool xyce_memBufReaderBehind(void ** ptr);
+
+// Read data from slice files the reader missed into dest buffer.
+// Returns bytes copied.
+int xyce_readMemBufSlices(void ** ptr, char *dest, int max_len);
+
 
 #ifdef __cplusplus
 }

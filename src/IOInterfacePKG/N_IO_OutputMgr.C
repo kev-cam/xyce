@@ -53,6 +53,7 @@
 #include <N_IO_OpBuilders.h>
 #include <N_IO_OptionBlock.h>
 #include <N_IO_OutputFileBase.h>
+#include <N_IO_MemBufStream.h>
 #include <N_IO_OutputMgr.h>
 #include <N_IO_OutputterTimePrn.h>
 #include <N_IO_OutputterHomotopy.h>
@@ -415,12 +416,21 @@ std::ostream * OutputMgr::openFile(
   {
     return &Xyce::dout();
   }
-  else if (it != openPathStreamMap_.end()) 
+  else if (it != openPathStreamMap_.end())
   {
     ++(*it).second.first;
     return (*it).second.second;
   }
-  else 
+  else if (path.substr(0, 6) == "mem://")
+  {
+    // In-memory buffered output with forked slice dumps.
+    // URI: mem:///path/to/slice_dir
+    std::string base_path = path.substr(6);
+    std::ostream *os = new MemBufStream(base_path);
+    openPathStreamMap_[path] = std::pair<int, std::ostream *>(1, os);
+    return os;
+  }
+  else
   {
     std::ostream *os = new std::ofstream(path.c_str(), mode);
     openPathStreamMap_[path] = std::pair<int, std::ostream *>(1, os);
@@ -478,21 +488,49 @@ int OutputMgr::closeFile(std::ostream * os)
 
   int open_count= 0;
 
-  for (OpenPathStreamMap::iterator it= openPathStreamMap_.begin(); it != openPathStreamMap_.end(); ++it) 
+  for (OpenPathStreamMap::iterator it= openPathStreamMap_.begin(); it != openPathStreamMap_.end(); ++it)
   {
-    if ((*it).second.second == os) 
+    if ((*it).second.second == os)
     {
       open_count= --(*it).second.first;
-      if (open_count == 0) 
+      if (open_count == 0)
       {
-        delete os;
-        openPathStreamMap_.erase(it);
+        // For mem:// streams, finalize but don't delete — the reader
+        // may still need to consume data from the buffer after the
+        // outputter is done.  Cleanup happens in the OutputMgr destructor.
+        MemBufStream *mbs = dynamic_cast<MemBufStream *>(os);
+        if (mbs)
+        {
+          mbs->membuf().finalize();
+          // Leave in the map so findMemStream() still works
+        }
+        else
+        {
+          delete os;
+          openPathStreamMap_.erase(it);
+        }
         break;
       }
     }
   }
 
   return open_count;
+}
+
+//-----------------------------------------------------------------------------
+// Function      : OutputMgr::findMemStream
+// Purpose       : Find the first mem:// stream in the open stream map.
+// Special Notes : Returns nullptr if no mem:// stream is open.
+//-----------------------------------------------------------------------------
+std::ostream * OutputMgr::findMemStream() const
+{
+  for (OpenPathStreamMap::const_iterator it = openPathStreamMap_.begin();
+       it != openPathStreamMap_.end(); ++it)
+  {
+    if ((*it).first.substr(0, 6) == "mem://")
+      return (*it).second.second;
+  }
+  return nullptr;
 }
 
 
