@@ -1,0 +1,18 @@
+# Boundary config for 5-stage alternating analog/digital inverter chain
+# Stages 1,3,5: analog (Xyce cmos_inv)
+# Stages 2,4: digital (NVC digital_inv)
+#
+# D2A: read NVC testbench signal voltage -> Xyce PWL source
+# A2D: Xyce node voltage -> deposit into NVC signal
+
+# Stage 1: stim -> analog inv -> s1
+D2A .stim in1
+A2D .s1 out1
+
+# Stage 3: s2 (digital) -> analog inv -> s3
+D2A .s2 in3
+A2D .s3 out3
+
+# Stage 5: s4 (digital) -> analog inv -> chain_out
+D2A .s4 in5
+A2D .chain_out out5
