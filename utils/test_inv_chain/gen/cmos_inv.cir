@@ -1,0 +1,50 @@
+* Xyce cosim deck: 5-stage alternating analog/digital inverter chain
+* Stages 1,3,5 are analog (Xyce); stages 2,4 are digital (NVC)
+* Each analog stage has D2A input and A2D output bridge signals
+
+* --- Subcircuit definition ---
+.SUBCKT cmos_inv IN OUT VDD VSS
+M1 OUT IN VDD VDD PMOS W=2u L=0.18u
+M2 OUT IN VSS VSS NMOS W=1u L=0.18u
+* Load capacitance on output (models gate cap of next stage)
+C1 OUT VSS 10f
+.ENDS cmos_inv
+.MODEL NMOS NMOS (LEVEL=1 VTO=0.4 KP=120u GAMMA=0.4 PHI=0.65)
+.MODEL PMOS PMOS (LEVEL=1 VTO=-0.4 KP=60u GAMMA=0.4 PHI=0.65)
+
+* --- Stage 1: analog inverter ---
+X1 n_in1 n_out1 n_vdd n_vss cmos_inv
+
+* D2A: NVC stim -> stage 1 input
+V_in1 n_in1 0 PWL FILE "code:libcosim_bridge.so:nvc_bridge_init:d2a:in1"
+
+* A2D: stage 1 output -> NVC s1
+I_out1 n_out1 0 PWL FILE "code:libcosim_bridge.so:nvc_bridge_init:a2d:out1"
+
+* --- Stage 3: analog inverter ---
+X3 n_in3 n_out3 n_vdd n_vss cmos_inv
+
+* D2A: NVC s2 (digital stage 2 output) -> stage 3 input
+V_in3 n_in3 0 PWL FILE "code:libcosim_bridge.so:nvc_bridge_init:d2a:in3"
+
+* A2D: stage 3 output -> NVC s3
+I_out3 n_out3 0 PWL FILE "code:libcosim_bridge.so:nvc_bridge_init:a2d:out3"
+
+* --- Stage 5: analog inverter ---
+X5 n_in5 n_out5 n_vdd n_vss cmos_inv
+
+* D2A: NVC s4 (digital stage 4 output) -> stage 5 input
+V_in5 n_in5 0 PWL FILE "code:libcosim_bridge.so:nvc_bridge_init:d2a:in5"
+
+* A2D: stage 5 output -> NVC chain_out
+I_out5 n_out5 0 PWL FILE "code:libcosim_bridge.so:nvc_bridge_init:a2d:out5"
+
+* Power
+V_vdd n_vdd 0 1.0
+V_vss n_vss 0 0.0
+
+.tran 0 100ns
+
+.print tran V(n_in1) V(n_out1) V(n_in3) V(n_out3) V(n_in5) V(n_out5) I(V_vdd)
+
+.end

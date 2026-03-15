@@ -149,16 +149,16 @@ def generate_cosim_deck(name, ports, params, spice, vdd=1.8, tstop='100ns',
         if direction == 'in':
             # DPWL voltage source: Xyce calls back into bridge for NVC values
             lines.append(f'* D2A: NVC .{vhdl_name} -> {node}')
-            lines.append(f'V_{vhdl_name} {node} 0 PWL(0 0)')
-            lines.append(f'+ URI="code:{bridge_lib}:nvc_bridge_init:d2a:{vhdl_name}"')
+            lines.append(f'V_{vhdl_name} {node} 0 PWL FILE'
+                         f' "code:{bridge_lib}:nvc_bridge_init:d2a:{vhdl_name}"')
             lines.append('')
 
         elif direction == 'out':
             # DPWL current source (zero current): reads node voltage,
             # pushes to bridge for NVC to pick up
             lines.append(f'* A2D: {node} -> NVC .{vhdl_name}')
-            lines.append(f'I_{vhdl_name} {node} 0 PWL(0 0)')
-            lines.append(f'+ URI="code:{bridge_lib}:nvc_bridge_init:a2d:{vhdl_name}"')
+            lines.append(f'I_{vhdl_name} {node} 0 PWL FILE'
+                         f' "code:{bridge_lib}:nvc_bridge_init:a2d:{vhdl_name}"')
             lines.append('')
 
         elif direction == 'power':
@@ -171,10 +171,10 @@ def generate_cosim_deck(name, ports, params, spice, vdd=1.8, tstop='100ns',
         else:
             # inout — D2A voltage source + A2D current source
             lines.append(f'* Bidirectional: NVC .{vhdl_name} <-> {node}')
-            lines.append(f'V_{vhdl_name} {node} 0 PWL(0 0)')
-            lines.append(f'+ URI="code:{bridge_lib}:nvc_bridge_init:d2a:{vhdl_name}"')
-            lines.append(f'I_{vhdl_name}_mon {node} 0 PWL(0 0)')
-            lines.append(f'+ URI="code:{bridge_lib}:nvc_bridge_init:a2d:{vhdl_name}"')
+            lines.append(f'V_{vhdl_name} {node} 0 PWL FILE'
+                         f' "code:{bridge_lib}:nvc_bridge_init:d2a:{vhdl_name}"')
+            lines.append(f'I_{vhdl_name}_mon {node} 0 PWL FILE'
+                         f' "code:{bridge_lib}:nvc_bridge_init:a2d:{vhdl_name}"')
             lines.append('')
 
     # Analysis
