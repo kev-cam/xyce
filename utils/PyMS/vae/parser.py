@@ -159,7 +159,10 @@ _SCALE = {
 def parse_number(s: str) -> str:
     """Convert Verilog-A number with scale suffix to numeric string."""
     if s and s[-1] in _SCALE:
-        return str(float(s[:-1]) * _SCALE[s[-1]])
+        try:
+            return str(float(s[:-1]) * _SCALE[s[-1]])
+        except ValueError:
+            return s
     return s
 
 
@@ -237,11 +240,14 @@ class Parser:
     # --- Module-level parsing ---
 
     def parse_module(self) -> Module:
-        # Skip `include and `define directives
-        while self.at('`include', '`define', '`ifdef', '`ifndef', '`else', '`endif'):
-            self._skip_directive()
+        # Skip preprocessor directives and nature/discipline blocks before module
+        self._skip_preamble()
 
-        # Parse optional attributes
+        # No module found (e.g. include-only / macro-definition file)
+        if self.pos >= len(self.tokens):
+            raise ParseError("No module found in file (macro/include-only file?)")
+
+        # Parse optional attributes (* ... *)
         attrs = {}
         if self.at('(*'):
             attrs = self._parse_attributes()
@@ -263,10 +269,16 @@ class Parser:
             for pn in port_names:
                 mod.ports.append(Port(name=pn))
 
+        # Skip `attr(...) or (* ... *) after port list, before ;
+        self._skip_inline_attrs()
+
         self.expect(';')
 
         # Module body — declarations and analog block
         while not self.at('endmodule'):
+            t = self.peek()
+            if t is None:
+                break
             if self.at('inout'):
                 self._parse_port_dir(mod, PortDir.INOUT)
             elif self.at('input'):
@@ -280,39 +292,135 @@ class Parser:
             elif self.at('real') or self.at('integer'):
                 self._parse_variables(mod)
             elif self.at('analog'):
-                mod.analog_block = self._parse_analog()
+                t2 = self.peek(1)
+                if t2 and t2.value == 'function':
+                    self._skip_analog_function()
+                else:
+                    mod.analog_block = self._parse_analog()
             elif self.at('(*'):
-                # Attribute before parameter
+                # Attribute before parameter or other declaration
                 attrs = self._parse_attributes()
                 if self.at('parameter'):
                     p = self._parse_param()
-                    # Apply attributes
                     for k, v in attrs.items():
                         if k == 'desc':
                             p.desc = v
                         elif k == 'type' and v == 'instance':
                             p.is_instance = True
                     mod.params.append(p)
+            elif self.at('branch'):
+                self._skip_to_semi()
+            elif self.at('genvar'):
+                self._skip_to_semi()
+            elif t.value.startswith('`'):
+                self._skip_directive()
             else:
-                # Skip unknown
+                # Skip unknown token
                 self.advance()
 
         self.expect('endmodule')
         return mod
 
-    def _skip_directive(self):
-        """Skip preprocessor directive to end of line."""
-        start = self.peek().pos
-        self.advance()  # `include/`define
-        # Skip to next token that starts on a different line
+    def _skip_preamble(self):
+        """Skip preprocessor directives, nature/discipline blocks before module."""
         while self.pos < len(self.tokens):
             t = self.peek()
-            if t.type == 'STRING' or t.type == 'IDENT' or t.type == 'NUMBER':
+            if t is None:
+                break
+            if t.value.startswith('`'):
+                self._skip_directive()
+            elif t.value in ('nature', 'discipline'):
+                self._skip_block(t.value, 'end' + t.value)
+            elif t.value == 'module':
+                break
+            elif t.value == '(*':
+                # Could be attribute on module — check if 'module' follows
+                break
+            else:
+                # Skip unknown preamble token
                 self.advance()
-            elif t.value in ('(', ')'):
+
+    def _skip_directive(self):
+        """Skip preprocessor directive — consume tokens on the same line."""
+        start_loc = self._loc()
+        t = self.peek()
+        directive = t.value if t else ''
+        self.advance()  # `include/`define/etc.
+
+        if directive in ('`ifdef', '`ifndef'):
+            # Skip condition identifier on same line
+            while self.pos < len(self.tokens):
+                tok = self.peek()
+                tok_loc = self._loc_at(tok.pos)
+                if tok_loc.line != start_loc.line:
+                    break
                 self.advance()
-            elif t.type == 'OP' and t.value not in (';',):
+            return
+
+        # For `else, `endif — just the directive token, already consumed
+        if directive in ('`else', '`endif', '`undef'):
+            return
+
+        # For `define — may have multi-line continuation with backslash,
+        # but our tokenizer strips comments. Just consume same line.
+        # For `include and others — consume same line.
+        while self.pos < len(self.tokens):
+            t = self.peek()
+            tok_loc = self._loc_at(t.pos)
+            if tok_loc.line != start_loc.line:
+                break
+            self.advance()
+
+    def _skip_block(self, start_kw: str, end_kw: str):
+        """Skip a block from start_kw to end_kw (e.g. nature/endnature)."""
+        self.advance()  # consume start keyword
+        while self.pos < len(self.tokens):
+            t = self.peek()
+            if t.value == end_kw:
                 self.advance()
+                # consume optional ;
+                if self.at(';'):
+                    self.advance()
+                return
+            self.advance()
+
+    def _skip_to_semi(self):
+        """Skip tokens until and including the next semicolon."""
+        while self.pos < len(self.tokens):
+            t = self.advance()
+            if t.value == ';':
+                return
+
+    def _skip_analog_function(self):
+        """Skip 'analog function ... endfunction'."""
+        self.advance()  # analog
+        self.advance()  # function
+        while self.pos < len(self.tokens):
+            t = self.advance()
+            if t.value == 'endfunction':
+                return
+
+    def _skip_inline_attrs(self):
+        """Skip inline `attr(...) or (* ... *) between tokens."""
+        while self.pos < len(self.tokens):
+            t = self.peek()
+            if t.value == '(*':
+                self._parse_attributes()  # consume and discard
+            elif t.value.startswith('`'):
+                t2 = self.peek(1)
+                if t2 and t2.value == '(':
+                    # `attr(...) or similar macro call — skip to matching )
+                    self.advance()  # `attr
+                    self.advance()  # (
+                    depth = 1
+                    while self.pos < len(self.tokens) and depth > 0:
+                        tt = self.advance()
+                        if tt.value == '(':
+                            depth += 1
+                        elif tt.value == ')':
+                            depth -= 1
+                else:
+                    break  # standalone `macro — not an attr
             else:
                 break
 
@@ -383,15 +491,19 @@ class Parser:
         default = "0"
         if self.at('='):
             self.advance()
-            default = self._collect_expr_until(';', 'from', 'exclude')
+            default = self._collect_param_value()
 
         from_range = None
-        if self.at('from'):
-            self.advance()
-            from_range = self._collect_expr_until(';')
-        elif self.at('exclude'):
-            self.advance()
-            self._collect_expr_until(';')  # skip
+        while self.at('from') or self.at('exclude'):
+            if self.at('from'):
+                self.advance()
+                from_range = self._collect_param_value()
+            elif self.at('exclude'):
+                self.advance()
+                self._collect_param_value()  # discard
+
+        # Skip inline `attr(...) or (* ... *) before ;
+        self._skip_inline_attrs()
 
         self.expect(';')
 
@@ -426,12 +538,20 @@ class Parser:
             return self._parse_if()
         elif self.at('@'):
             return self._parse_event()
+        elif self.at('case'):
+            return self._parse_case()
+        elif self.at('for'):
+            return self._parse_for()
         else:
             return self._parse_simple_statement()
 
     def _parse_begin_end(self) -> ASTNode:
         loc = self._loc()
         self.expect('begin')
+        # Optional named block: begin : label
+        if self.at(':'):
+            self.advance()
+            self.consume_ident()  # block label
         block = ASTNode(kind=NodeKind.BLOCK, loc=loc)
         while not self.at('end'):
             block.children.append(self._parse_statement())
@@ -467,6 +587,90 @@ class Parser:
         if event_name == 'initial_step':
             return ASTNode(kind=NodeKind.INITIAL_STEP, children=[body])
         return body  # Other events: just parse body for now
+
+    def _parse_case(self) -> ASTNode:
+        """Parse case(expr) ... endcase as a sequence of if/else branches."""
+        loc = self._loc()
+        self.expect('case')
+        self.expect('(')
+        case_expr = self._collect_balanced('(', ')')
+        self.expect(')')
+
+        # Collect case items: each is value[, value]: statement(s)
+        # Treat as if/else chain for the emitter
+        block = ASTNode(kind=NodeKind.BLOCK, loc=loc)
+        while not self.at('endcase'):
+            if self.at('default'):
+                self.advance()
+                self.expect(':')
+                while not self.at('endcase') and not self._is_case_label():
+                    block.children.append(self._parse_statement())
+            else:
+                # case value(s)
+                values = []
+                while not self.at(':'):
+                    if self.at(','):
+                        self.advance()
+                    else:
+                        values.append(self.advance().value)
+                self.expect(':')
+                # Build condition: (case_expr == v1 || case_expr == v2 ...)
+                cond_parts = [f'{case_expr} == {v}' for v in values]
+                cond = ' || '.join(cond_parts)
+                body = ASTNode(kind=NodeKind.BLOCK, loc=self._loc())
+                while not self.at('endcase') and not self._is_case_label():
+                    body.children.append(self._parse_statement())
+                ifnode = ASTNode(kind=NodeKind.IF, condition=cond,
+                                children=[body], loc=loc)
+                block.children.append(ifnode)
+        self.expect('endcase')
+        return block
+
+    def _is_case_label(self) -> bool:
+        """Check if current position is a case label (value :) or 'default'."""
+        if self.at('default'):
+            return True
+        # Look ahead for pattern: value [, value] :
+        save = self.pos
+        try:
+            depth = 0
+            while self.pos < len(self.tokens):
+                t = self.peek()
+                if t is None:
+                    break
+                if t.value == ':' and depth == 0:
+                    self.pos = save
+                    return True
+                if t.value in (';', 'begin', 'end', 'if', 'case', 'endcase'):
+                    break
+                if t.value in ('(', '['):
+                    depth += 1
+                elif t.value in (')', ']'):
+                    depth -= 1
+                self.pos += 1
+        finally:
+            self.pos = save
+        return False
+
+    def _parse_for(self) -> ASTNode:
+        """Parse for(init; cond; step) body — treat body as block."""
+        loc = self._loc()
+        self.expect('for')
+        self.expect('(')
+        # Skip init; cond; step
+        depth = 0
+        while self.pos < len(self.tokens):
+            t = self.peek()
+            if t.value == '(' :
+                depth += 1
+            elif t.value == ')':
+                if depth == 0:
+                    break
+                depth -= 1
+            self.advance()
+        self.expect(')')
+        body = self._parse_statement()
+        return body  # Just include the body; loop unrolling not needed for symbolic
 
     def _parse_simple_statement(self) -> ASTNode:
         # Look ahead to determine statement type
@@ -523,6 +727,31 @@ class Parser:
         )
 
     # --- Expression collectors ---
+
+    def _collect_param_value(self) -> str:
+        """Collect parameter default or range value, stopping at ;, from, exclude, or `attr(...)."""
+        parts = []
+        depth = 0
+        while self.pos < len(self.tokens):
+            t = self.peek()
+            if depth == 0:
+                if t.value in (';', 'from', 'exclude'):
+                    break
+                if t.value == '(*':
+                    break
+                # Stop at `macro(...) attribute annotations (e.g. `attr(...))
+                # but NOT value macros like `NMOS, `P_Q etc.
+                if t.value.startswith('`'):
+                    t2 = self.peek(1)
+                    if t2 and t2.value == '(':
+                        break  # `attr(...) style
+            if t.value in ('(', '['):
+                depth += 1
+            elif t.value in (')', ']'):
+                depth -= 1
+            parts.append(t.value)
+            self.advance()
+        return ' '.join(parts)
 
     def _collect_expr_until(self, *stops) -> str:
         """Collect tokens into expression string until one of stops is seen at depth 0."""
