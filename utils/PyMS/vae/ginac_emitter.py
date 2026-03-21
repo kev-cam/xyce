@@ -890,14 +890,22 @@ class GiNaCEmitter:
         br_p = node.branch[0]
         br_n = node.branch[1] if len(node.branch) > 1 else 'gnd'
 
-        # Resolve shorted nodes
+        # Resolve shorted nodes (returns None if shorted to ground)
         if br_p not in active_nodes and br_p in self.internal_nodes:
             br_p = self._resolve_shorted_node(br_p, active_nodes)
         if br_n != 'gnd' and br_n not in active_nodes and br_n in self.internal_nodes:
             br_n = self._resolve_shorted_node(br_n, active_nodes)
 
-        # Skip tautological V(c,c) <+ 0
+        # Nodes resolved to ground become 'gnd'
+        if br_p is None:
+            br_p = 'gnd'
+        if br_n is None:
+            br_n = 'gnd'
+
+        # Skip tautological V(c,c) <+ 0 or V(gnd) <+ 0
         if node.contrib_kind == ContribKind.V and br_p == br_n:
+            return
+        if node.contrib_kind == ContribKind.V and br_p == 'gnd' and br_n == 'gnd':
             return
 
         self._emit_line_directive(lines, node, pfx)
@@ -916,8 +924,11 @@ class GiNaCEmitter:
         elif node.contrib_kind == ContribKind.V:
             if br_n != 'gnd' and br_n in active_nodes:
                 lines.append(f'{pfx}    F_contribs[br_idx] += {ginac_expr} - (V_{br_p} - V_{br_n});')
-            else:
+            elif br_p != 'gnd':
                 lines.append(f'{pfx}    F_contribs[br_idx] += {ginac_expr} - V_{br_p};')
+            else:
+                # V(gnd,...) — expr contributes directly
+                lines.append(f'{pfx}    F_contribs[br_idx] += {ginac_expr};')
         else:
             lines.append(f'{pfx}    F_contribs[br_idx] += {ginac_expr};')
         lines.append(f'{pfx}}}')
@@ -1050,7 +1061,7 @@ class GiNaCEmitter:
         result = result.replace('& &', '&&')
         result = result.replace('| |', '||')
 
-        # V(a,b) → (V_a - V_b)
+        # V(a,b) → (V_a - V_b), V(a) → V_a, grounded nodes → 0
         def repl_v(m):
             p1 = m.group(1).strip()
             p2 = m.group(2).strip() if m.group(2) else None
@@ -1058,9 +1069,12 @@ class GiNaCEmitter:
                 p1 = self._resolve_shorted_node(p1, active_nodes)
             if p2 and p2 not in active_nodes and p2 in self.internal_nodes:
                 p2 = self._resolve_shorted_node(p2, active_nodes)
-            if p2:
-                return f'(V_{p1} - V_{p2})'
-            return f'V_{p1}'
+            # Handle grounded nodes (resolved to None)
+            p1_expr = 'ex(0)' if p1 is None else f'V_{p1}'
+            p2_expr = 'ex(0)' if p2 is None else f'V_{p2}' if p2 else None
+            if p2_expr:
+                return f'({p1_expr} - {p2_expr})'
+            return p1_expr
         result = re.sub(r'V\s*\(\s*(\w+)\s*(?:,\s*(\w+)\s*)?\)', repl_v, result)
 
         # $limit(expr, ...) → just expr
@@ -1234,14 +1248,17 @@ class GiNaCEmitter:
 
     # --- Node resolution ---
 
-    def _resolve_shorted_node(self, node: str, active_nodes: list[str]) -> str:
+    def _resolve_shorted_node(self, node: str, active_nodes: list[str]) -> Optional[str]:
+        """Resolve a shorted internal node to its target.
+
+        Returns the target node name, or None if the node is shorted to ground
+        (e.g. single-node V(N) <+ 0).
+        """
         target = self._find_short_target(self.mod.analog_block, node)
         if target and target in active_nodes:
             return target
-        for p in reversed(self.port_names):
-            if p in active_nodes:
-                return p
-        return node
+        # No partner found — node is shorted to ground
+        return None
 
     def _find_short_target(self, ast_node: ASTNode, internal: str) -> Optional[str]:
         """Find which node an internal node is shorted to via V(x,y) <+ 0."""
@@ -1370,9 +1387,16 @@ class GiNaCEmitter:
         for i, n in enumerate(active_nodes):
             lines.append(f'    double V_{n} = V[{i}];')
 
-        # Temperature: use the last node voltage slot or Vt
-        # Check if there's a temperature node (commonly 't' in BSIM-CMG)
-        lines.append(f'    double temperature = V[n_nodes - 1];  // temperature node')
+        # Temperature: find the temperature node by name ('t' in BSIM-CMG)
+        temp_idx = None
+        for i, n in enumerate(active_nodes):
+            if n == 't':
+                temp_idx = i
+                break
+        if temp_idx is not None:
+            lines.append(f'    double temperature = V[{temp_idx}];  // temperature node (V_{active_nodes[temp_idx]})')
+        else:
+            lines.append(f'    double temperature = V[n_nodes - 1];  // temperature node (fallback)')
         lines.append('')
 
         # Reset var_values for the walk (keep param_values intact)
@@ -1446,7 +1470,12 @@ class GiNaCEmitter:
                 if val is not None:
                     self.var_values[node.lhs] = val
                     if self._runtime_cond_depth == 0:
-                        return
+                        # Only skip emit if the variable hasn't been declared
+                        # in C++ yet; if it was already declared (e.g. with a
+                        # voltage-dependent value), we must emit the update to
+                        # avoid leaving a stale value in the C++ variable.
+                        if node.lhs not in self._declared_vars:
+                            return
                 else:
                     self.var_values.pop(node.lhs, None)
             else:
@@ -1576,7 +1605,7 @@ class GiNaCEmitter:
         result = result.replace('> =', '>=').replace('< =', '<=')
         result = result.replace('& &', '&&').replace('| |', '||')
 
-        # V(a,b) → (V_a - V_b), V(a) → V_a
+        # V(a,b) → (V_a - V_b), V(a) → V_a, grounded nodes → 0.0
         def repl_v(m):
             p1 = m.group(1).strip()
             p2 = m.group(2).strip() if m.group(2) else None
@@ -1584,9 +1613,11 @@ class GiNaCEmitter:
                 p1 = self._resolve_shorted_node(p1, active_nodes)
             if p2 and p2 not in active_nodes and p2 in self.internal_nodes:
                 p2 = self._resolve_shorted_node(p2, active_nodes)
-            if p2:
-                return f'(V_{p1} - V_{p2})'
-            return f'V_{p1}'
+            p1_expr = '0.0' if p1 is None else f'V_{p1}'
+            p2_expr = '0.0' if p2 is None else f'V_{p2}' if p2 else None
+            if p2_expr:
+                return f'({p1_expr} - {p2_expr})'
+            return p1_expr
         result = re.sub(r'V\s*\(\s*(\w+)\s*(?:,\s*(\w+)\s*)?\)', repl_v, result)
 
         # I(x,y) → 0.0 (current probes not available in evaluator)

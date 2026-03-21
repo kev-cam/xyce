@@ -253,6 +253,32 @@ def _hash_params(params: dict[str, float]) -> str:
     return h.hexdigest()[:16]
 
 
+_SPICE_SUFFIX = {
+    'T': 1e12, 'G': 1e9, 'MEG': 1e6, 'K': 1e3,
+    'M': 1e-3, 'MIL': 25.4e-6,
+    'U': 1e-6, 'N': 1e-9, 'P': 1e-12, 'F': 1e-15, 'A': 1e-18,
+}
+
+def _parse_spice_float(s: str) -> float:
+    """Parse a SPICE numeric value with optional engineering suffix."""
+    s = s.strip()
+    # Try plain float first
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    # Try with SPICE suffix (case-insensitive)
+    su = s.upper()
+    for suffix, mult in sorted(_SPICE_SUFFIX.items(), key=lambda x: -len(x[0])):
+        if su.endswith(suffix):
+            num_part = s[:len(s) - len(suffix)]
+            try:
+                return float(num_part) * mult
+            except ValueError:
+                continue
+    raise ValueError(f"Cannot parse SPICE value: {s!r}")
+
+
 def parse_modelcard(path: str) -> dict[str, float]:
     """Parse a SPICE .model card and return parameter name->value dict."""
     params = {}
@@ -268,7 +294,7 @@ def parse_modelcard(path: str) -> dict[str, float]:
             for m in re.finditer(r'(\w+)\s*=\s*([^\s,]+)', line):
                 name, val = m.group(1), m.group(2)
                 try:
-                    params[name] = float(val)
+                    params[name] = _parse_spice_float(val)
                 except ValueError:
                     pass
     return params
@@ -357,6 +383,7 @@ class RegimeCache:
         self._regimes: dict[int, CompiledRegime] = {}
         self._instance_dir: Optional[Path] = None
         self._prev_key: Optional[int] = None
+        self._eval_regime_fn = None  # compiled C++ evaluator
 
     def elaborate(self):
         """Parse model and analyze voltage-dependent conditions."""
@@ -378,14 +405,27 @@ class RegimeCache:
             indent = "  " * (c.depth + 1)
             print(f"  [{c.index:2d}]{indent}{c.condition}")
 
+        # Build compiled C++ condition evaluator for accurate regime key computation
+        self._eval_regime_fn, _, _ = self.load_condition_evaluator()
+
     def get_regime(self, voltages: list[float], vt: float = None,
                    temperature: float = None) -> tuple[CompiledRegime, bool]:
         """Get compiled regime for current operating point.
 
+        Uses the compiled C++ condition evaluator for accurate regime
+        key computation. Falls back to Python evaluator if C++ is not
+        available.
+
         Returns (regime, changed) where changed=True if the regime
         differs from the previous call (timestep should be limited).
         """
-        key = self._eval_regime_key(voltages, vt, temperature)
+        # Use compiled C++ evaluator if available
+        if self._eval_regime_fn is not None:
+            if vt is None:
+                vt = 8.617087e-5 * (temperature or 300.15)
+            key = self._eval_regime_fn(voltages, vt)
+        else:
+            key = self._eval_regime_key(voltages, vt, temperature)
         key = self.analysis.normalize_key(key)
         changed = (self._prev_key is not None and key != self._prev_key)
         self._prev_key = key
