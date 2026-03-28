@@ -1113,7 +1113,8 @@ class GiNaCEmitter:
         # Temp(node) → V_node (thermal node temperature access)
         result = re.sub(r'Temp\s*\(\s*(\w+)\s*\)', lambda m: f'V_{m.group(1)}', result)
 
-        # $vt → Vt, $temperature → temperature
+        # $vt(expr) → (8.617087e-5 * (expr)), $vt → Vt, $temperature → temperature
+        result = re.sub(r'\$vt\s*\(\s*([^)]+)\s*\)', r'(8.617087e-5 * (\1))', result)
         result = re.sub(r'\$vt\b', 'Vt', result)
         result = re.sub(r'\$temperature\b', 'temperature', result)
 
@@ -1542,7 +1543,11 @@ class GiNaCEmitter:
         lines.append('')
 
         # Function signature
-        lines.append('extern "C" uint64_t vae_eval_regime(double* V, int n_nodes, double Vt) {')
+        # Only inject Vt from argument if the model doesn't define it internally
+        _model_vars = {v.name for v in self.mod.variables}
+        lines.append('extern "C" uint64_t vae_eval_regime(double* V, int n_nodes, double _Vt_arg) {')
+        if 'Vt' not in _model_vars:
+            lines.append('    double Vt = _Vt_arg;')
         lines.append('    uint64_t key = 0;')
         lines.append('')
 
@@ -1808,7 +1813,8 @@ class GiNaCEmitter:
         result = re.sub(r'Temp\s*\(\s*(\w+)\s*\)',
                         lambda m: f'V_{m.group(1)}', result)
 
-        # $vt → Vt, $temperature → temperature
+        # $vt(expr) → (8.617087e-5 * (expr)), $vt → Vt, $temperature → temperature
+        result = re.sub(r'\$vt\s*\(\s*([^)]+)\s*\)', r'(8.617087e-5 * (\1))', result)
         result = re.sub(r'\$vt\b', 'Vt', result)
         result = re.sub(r'\$temperature\b', 'temperature', result)
 
@@ -1922,7 +1928,8 @@ class GiNaCEmitter:
         c = re.sub(r'Temp\s*\(\s*(\w+)\s*\)',
                    lambda m: f'V_{m.group(1)}', c)
 
-        # $vt → Vt, $temperature → temperature
+        # $vt(expr) → (8.617087e-5 * (expr)), $vt → Vt
+        c = re.sub(r'\$vt\s*\(\s*([^)]+)\s*\)', r'(8.617087e-5 * (\1))', c)
         c = re.sub(r'\$vt\b', 'Vt', c)
         c = re.sub(r'\$temperature\b', 'temperature', c)
 
