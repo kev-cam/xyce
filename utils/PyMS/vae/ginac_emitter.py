@@ -369,13 +369,12 @@ class GiNaCEmitter:
         lines.append('')
         # Helper: min/max for GiNaC expressions (used when args may be symbolic)
         lines.append('// min/max that work with GiNaC ex and plain doubles')
-        lines.append('ex gmin(const ex& a, const ex& b) {')
-        lines.append('    // If both numeric, evaluate directly')
+        lines.append('ex _vae_min(const ex& a, const ex& b) {')
         lines.append('    if (is_a<numeric>(a) && is_a<numeric>(b))')
         lines.append('        return ex_to<numeric>(a) < ex_to<numeric>(b) ? a : b;')
-        lines.append('    return a;  // fallback: return first arg (imprecise but safe for constants)')
+        lines.append('    return a;')
         lines.append('}')
-        lines.append('ex gmax(const ex& a, const ex& b) {')
+        lines.append('ex _vae_max(const ex& a, const ex& b) {')
         lines.append('    if (is_a<numeric>(a) && is_a<numeric>(b))')
         lines.append('        return ex_to<numeric>(a) > ex_to<numeric>(b) ? a : b;')
         lines.append('    return a;')
@@ -1125,9 +1124,9 @@ class GiNaCEmitter:
         # Function mapping
         for va_name, ginac_name in _VA_TO_GINAC.items():
             result = re.sub(rf'\b{va_name}\b(?=\s*\()', ginac_name, result)
-        # min/max → gmin/gmax (GiNaC-compatible helpers)
-        result = re.sub(r'\bmin\b(?=\s*\()', 'gmin', result)
-        result = re.sub(r'\bmax\b(?=\s*\()', 'gmax', result)
+        # min/max → _vae_min/_vae_max (GiNaC-compatible helpers, avoid name collision)
+        result = re.sub(r'\bmin\b(?=\s*\()', '_vae_min', result)
+        result = re.sub(r'\bmax\b(?=\s*\()', '_vae_max', result)
 
         # `DEFINE references → identifier
         result = re.sub(r'`(\w+)', r'\1', result)
@@ -1220,7 +1219,7 @@ class GiNaCEmitter:
         # Build the substitutable set (exclude funcs, keywords, node voltages)
         _skip = set(_VA_TO_GINAC.values()) | {'numeric', 'ex', 'Vt', 'temperature'}
         _skip |= {f'V_{n}' for n in self.all_nodes}
-        _skip |= {'gmin', 'gmax', 'hypsmooth', 'hypmax', 'Tempdep'}
+        _skip |= {'_vae_min', '_vae_max', 'hypsmooth', 'hypmax', 'Tempdep'}
         _skip |= self.instance_params
         def _subst_known(m):
             name = m.group(0)
@@ -1265,16 +1264,16 @@ class GiNaCEmitter:
                     tv_n = ' '.join(tv.strip().strip('()').strip().split())
                     fv_n = ' '.join(fv.strip().strip('()').strip().split())
                     if op == '>' and lhs == tv_n and rhs == fv_n:
-                        s = s[:start] + f'gmax({true_val}, {false_val})' + s[end:]
+                        s = s[:start] + f'_vae_max({true_val}, {false_val})' + s[end:]
                         continue
                     if op == '>' and lhs == fv_n and rhs == tv_n:
-                        s = s[:start] + f'gmin({true_val}, {false_val})' + s[end:]
+                        s = s[:start] + f'_vae_min({true_val}, {false_val})' + s[end:]
                         continue
                     if op == '<' and lhs == tv_n and rhs == fv_n:
-                        s = s[:start] + f'gmin({true_val}, {false_val})' + s[end:]
+                        s = s[:start] + f'_vae_min({true_val}, {false_val})' + s[end:]
                         continue
                     if op == '<' and lhs == fv_n and rhs == tv_n:
-                        s = s[:start] + f'gmax({true_val}, {false_val})' + s[end:]
+                        s = s[:start] + f'_vae_max({true_val}, {false_val})' + s[end:]
                         continue
                 # Not a simple min/max — leave for ex() wrapping below
                 break
