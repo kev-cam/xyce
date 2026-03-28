@@ -50,6 +50,7 @@ enum AnalysisMode
   DC_OP,
   DC_SWEEP,
   DC_NLPOISSON,
+  TRANOP,
   TRANSIENT,
   HB_MODE,
   NUM_MODES

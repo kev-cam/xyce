@@ -86,7 +86,7 @@ std::ostream &outputParameterMap(std::ostream &os, const OrderedParameterMap &pa
 
 std::ostream &outputDescriptor(std::ostream &os, const Descriptor &descriptor)
 {
-  if (&descriptor.getEntry()) {
+  if (descriptor.getEntry().type() != typeid(void)) {
     printTypeName(os, descriptor.getEntry().type());
   }
 

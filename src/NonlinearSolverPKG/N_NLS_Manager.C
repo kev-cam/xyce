@@ -857,7 +857,8 @@ bool Manager::calcSensitivity
   std::vector<double> & dOdpVec,
   std::vector<double> & dOdpAdjVec,
   std::vector<double> & scaled_dOdpVec,
-  std::vector<double> & scaled_dOdpAdjVec)
+  std::vector<double> & scaled_dOdpAdjVec,
+  double timeOfSensitivities)
 {
   bool bsuccess = true;
 
@@ -867,7 +868,8 @@ bool Manager::calcSensitivity
     return false;
   }
 
-  bsuccess = nlsSensitivityPtr_->solve(objectiveVec, dOdpVec, dOdpAdjVec, scaled_dOdpVec, scaled_dOdpAdjVec);
+  bsuccess = nlsSensitivityPtr_->solve(objectiveVec, dOdpVec, dOdpAdjVec, scaled_dOdpVec, scaled_dOdpAdjVec,
+      timeOfSensitivities);
 
   return bsuccess;
 }

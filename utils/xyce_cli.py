@@ -21,6 +21,7 @@ Commands:
     reset               Restart simulation from t=0
     devices [type]      List all devices (optionally filter by type)
     param <dev:param>   Query device parameter value
+    layout [file.gds]   Generate GDS layout from netlist (gdsfactory)
     write [file.raw]    Write accumulated waveform data to .raw file
     help                Show this help
     quit / exit         Exit
@@ -41,6 +42,11 @@ from ctypes import (
 )
 from ctypes.util import find_library
 from datetime import datetime
+
+try:
+    from kes_layout import cmd_layout
+except ImportError:
+    cmd_layout = None
 
 
 class WaveformBuffer:
@@ -974,6 +980,7 @@ class XyceCLI:
             'reset': lambda a=None: self._cmd_reset(),
             'devices': self._cmd_devices,
             'param': self._cmd_param,
+            'layout': self._cmd_layout,
             'write': self._cmd_write,
             'help': lambda a=None: self._cmd_help(),
             'quit': lambda a=None: self._cmd_quit(),
@@ -1350,6 +1357,16 @@ class XyceCLI:
         else:
             print(f"  Parameter '{param}' not found")
 
+    def _cmd_layout(self, args):
+        """Generate GDS layout from the loaded netlist."""
+        if not self._require_init():
+            return
+        if cmd_layout is None:
+            print("Layout module not available. Ensure kes_layout.py is in the same directory")
+            print("and gdsfactory is installed: pip install gdsfactory")
+            return
+        cmd_layout(self.xyce, args)
+
     def _cmd_write(self, args):
         """Write waveform data to .raw file."""
         if not self.xyce or not self.xyce.waveform_time:
@@ -1389,6 +1406,9 @@ class XyceCLI:
   reset               Restart simulation from t=0
   devices [type]      List all devices (optionally filter by prefix)
   param <dev:param>   Query device parameter value
+  layout [file.gds]   Generate GDS layout from loaded netlist
+                      Options: --subckt <name>  layout one subcircuit
+                               --list           list subcircuits
   write [file.raw]    Write waveform data to .raw file
   help                Show this help
   quit / exit         Exit""")

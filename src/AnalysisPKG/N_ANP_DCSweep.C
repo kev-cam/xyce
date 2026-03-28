@@ -473,7 +473,8 @@ bool DCSweep::doProcessSuccessfulStep()
 
   if (sensFlag_ && !firstDoubleDCOPStep() )
   {
-    nonlinearManager_.calcSensitivity(objectiveVec_, dOdpVec_, dOdpAdjVec_, scaled_dOdpVec_, scaled_dOdpAdjVec_);
+    double timeOfSensitivity=0.0;
+    nonlinearManager_.calcSensitivity(objectiveVec_, dOdpVec_, dOdpAdjVec_, scaled_dOdpVec_, scaled_dOdpAdjVec_, timeOfSensitivity);
   }
 
   // Do some statistics, as long as this isn't the first "double"
