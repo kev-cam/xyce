@@ -343,8 +343,12 @@ def _try_eval_full(expr: str, emitter: GiNaCEmitter,
     ns.update({'hypsmooth': hypsmooth, 'hypmax': hypmax, 'Tempdep': Tempdep,
                'lexp': lexp, 'lln': lln})
 
-    # Substitute V(a,b) → (V_a - V_b) and V(a) → V_a
+    # $simparam("name", default) → default value
     e = expr
+    e = re.sub(r'\$simparam\s*\(\s*"[^"]*"\s*,\s*([^)]+)\)', r'\1', e)
+    e = re.sub(r'\$simparam\s*\(\s*"[^"]*"\s*\)', '0', e)
+
+    # Substitute V(a,b) → (V_a - V_b) and V(a) → V_a
     e = re.sub(r'V\s*\(\s*(\w+)\s*,\s*(\w+)\s*\)',
                r'(V_\1 - V_\2)', e)
     e = re.sub(r'V\s*\(\s*(\w+)\s*\)', r'V_\1', e)
