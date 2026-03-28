@@ -832,7 +832,10 @@ def parse_verilog_a(source: str, filename: str = "") -> Module:
     """Parse a Verilog-A source string, return Module AST."""
     tokens = tokenize(source)
     parser = Parser(tokens, source=source, filename=filename)
-    return parser.parse_module()
+    mod = parser.parse_module()
+    if mod.analog_block:
+        mod.analog_block = _lower_ternaries(mod.analog_block)
+    return mod
 
 
 def parse_file(path: str) -> Module:
@@ -840,3 +843,169 @@ def parse_file(path: str) -> Module:
     with open(path) as f:
         source = f.read()
     return parse_verilog_a(source, filename=path)
+
+
+# ---------------------------------------------------------------------------
+# Ternary lowering — convert ?: in expressions to if/else + temp vars
+# ---------------------------------------------------------------------------
+
+_ternary_counter = [0]
+
+
+def _find_ternary(s: str):
+    """Find the innermost paren-balanced ternary in s.
+
+    Returns (start, end, cond, true_expr, false_expr) or None.
+    Finds innermost first so nested ternaries lower from inside out.
+    Handles both parenthesized `(cond ? a : b)` and bare `cond ? a : b`.
+    """
+    best = None
+    # First: look for parenthesized ternaries (innermost)
+    idx = 0
+    while idx < len(s):
+        start = s.find('(', idx)
+        if start < 0:
+            break
+        depth = 1
+        i = start + 1
+        q_pos = -1
+        colon_pos = -1
+        while i < len(s) and depth > 0:
+            ch = s[i]
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+                if depth == 0:
+                    break
+            elif ch == '?' and depth == 1 and q_pos < 0:
+                q_pos = i
+            elif ch == ':' and depth == 1 and q_pos >= 0 and colon_pos < 0:
+                colon_pos = i
+            i += 1
+        if depth == 0 and q_pos > 0 and colon_pos > 0:
+            end = i + 1
+            cond = s[start + 1:q_pos].strip()
+            true_expr = s[q_pos + 1:colon_pos].strip()
+            false_expr = s[colon_pos + 1:i].strip()
+            if best is None or (end - start) < (best[1] - best[0]):
+                best = (start, end, cond, true_expr, false_expr)
+        idx = start + 1
+    if best:
+        return best
+
+    # Second: look for bare top-level ternary (no enclosing parens)
+    # Scan for ? at depth 0
+    depth = 0
+    q_pos = -1
+    colon_pos = -1
+    for i, ch in enumerate(s):
+        if ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+        elif ch == '?' and depth == 0 and q_pos < 0:
+            q_pos = i
+        elif ch == ':' and depth == 0 and q_pos >= 0 and colon_pos < 0:
+            colon_pos = i
+    if q_pos >= 0 and colon_pos > q_pos:
+        cond = s[:q_pos].strip()
+        true_expr = s[q_pos + 1:colon_pos].strip()
+        false_expr = s[colon_pos + 1:].strip()
+        return (0, len(s), cond, true_expr, false_expr)
+
+    return None
+
+
+def _lower_expr_ternaries(expr: str, loc):
+    """Lower all ?: in an expression to IF/ASSIGN nodes + temp vars.
+
+    Returns (new_expr, [preceding_IF_nodes]).
+    """
+    preceding = []
+    s = expr
+    while True:
+        t = _find_ternary(s)
+        if t is None:
+            break
+        start, end, cond, true_e, false_e = t
+        # Generate temp var
+        _ternary_counter[0] += 1
+        tmp = f'_vae_t{_ternary_counter[0]}'
+        # Recursively lower ternaries in sub-expressions
+        true_e, true_pre = _lower_expr_ternaries(true_e, loc)
+        false_e, false_pre = _lower_expr_ternaries(false_e, loc)
+        preceding.extend(true_pre)
+        preceding.extend(false_pre)
+        # Create IF node: if (cond) tmp = true_e; else tmp = false_e;
+        true_assign = ASTNode(kind=NodeKind.ASSIGN, lhs=tmp,
+                              expr=true_e, loc=loc)
+        false_assign = ASTNode(kind=NodeKind.ASSIGN, lhs=tmp,
+                               expr=false_e, loc=loc)
+        if_node = ASTNode(
+            kind=NodeKind.IF, condition=cond,
+            children=[true_assign],
+            else_body=false_assign, loc=loc,
+        )
+        preceding.append(if_node)
+        # Replace ternary in expression with temp var
+        s = s[:start] + tmp + s[end:]
+    return s, preceding
+
+
+def _lower_ternaries(node: ASTNode) -> ASTNode:
+    """Walk AST, lowering ?: in ASSIGN/CONTRIB expressions to IF+temp vars."""
+    if node is None:
+        return None
+
+    if node.kind == NodeKind.BLOCK:
+        new_children = []
+        for child in node.children:
+            lowered = _lower_ternaries(child)
+            if lowered is not None:
+                new_children.append(lowered)
+        node.children = new_children
+        return node
+
+    elif node.kind == NodeKind.ASSIGN:
+        if node.expr and '?' in node.expr:
+            new_expr, preceding = _lower_expr_ternaries(node.expr, node.loc)
+            if preceding:
+                # Wrap in a block: [IF nodes..., modified ASSIGN]
+                node.expr = new_expr
+                block = ASTNode(kind=NodeKind.BLOCK, loc=node.loc)
+                block.children = preceding + [node]
+                return block
+        return node
+
+    elif node.kind == NodeKind.CONTRIB:
+        if node.expr and '?' in node.expr:
+            new_expr, preceding = _lower_expr_ternaries(node.expr, node.loc)
+            if preceding:
+                node.expr = new_expr
+                block = ASTNode(kind=NodeKind.BLOCK, loc=node.loc)
+                block.children = preceding + [node]
+                return block
+        return node
+
+    elif node.kind == NodeKind.IF:
+        node.children = [_lower_ternaries(c) for c in node.children
+                         if c is not None]
+        if node.else_body:
+            node.else_body = _lower_ternaries(node.else_body)
+        # Also check condition for ternaries — rare but possible
+        if node.condition and '?' in node.condition:
+            new_cond, preceding = _lower_expr_ternaries(node.condition, node.loc)
+            if preceding:
+                node.condition = new_cond
+                block = ASTNode(kind=NodeKind.BLOCK, loc=node.loc)
+                block.children = preceding + [node]
+                return block
+        return node
+
+    elif node.kind == NodeKind.INITIAL_STEP:
+        node.children = [_lower_ternaries(c) for c in node.children
+                         if c is not None]
+        return node
+
+    return node
