@@ -104,6 +104,7 @@ class Module:
     params: list[Param] = field(default_factory=list)
     variables: list[Var] = field(default_factory=list)
     internal_nodes: list[str] = field(default_factory=list)
+    branch_map: dict[str, str] = field(default_factory=dict)  # branch_name → node_name
     analog_block: Optional[ASTNode] = None
     attributes: dict[str, str] = field(default_factory=dict)
 
@@ -309,7 +310,17 @@ class Parser:
                             p.is_instance = True
                     mod.params.append(p)
             elif self.at('branch'):
-                self._skip_to_semi()
+                # branch (node) name ; → record name→node mapping
+                self.advance()  # 'branch'
+                if self.at('('):
+                    self.advance()
+                    node_name = self.consume_ident()
+                    self.expect(')')
+                    branch_name = self.consume_ident()
+                    mod.branch_map[branch_name] = node_name
+                    self.expect(';')
+                else:
+                    self._skip_to_semi()
             elif self.at('genvar'):
                 self._skip_to_semi()
             elif t.value.startswith('`'):
@@ -542,6 +553,8 @@ class Parser:
             return self._parse_case()
         elif self.at('for'):
             return self._parse_for()
+        elif self.at('while'):
+            return self._parse_while()
         else:
             return self._parse_simple_statement()
 
@@ -671,6 +684,25 @@ class Parser:
         self.expect(')')
         body = self._parse_statement()
         return body  # Just include the body; loop unrolling not needed for symbolic
+
+    def _parse_while(self) -> ASTNode:
+        """Parse while(cond) body — treat body as block."""
+        loc = self._loc()
+        self.expect('while')
+        self.expect('(')
+        depth = 0
+        while self.pos < len(self.tokens):
+            t = self.peek()
+            if t.value == '(':
+                depth += 1
+            elif t.value == ')':
+                if depth == 0:
+                    break
+                depth -= 1
+            self.advance()
+        self.expect(')')
+        body = self._parse_statement()
+        return body
 
     def _parse_simple_statement(self) -> ASTNode:
         # Look ahead to determine statement type

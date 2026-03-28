@@ -90,6 +90,7 @@ class GiNaCEmitter:
         self.port_names = [p.name for p in module.ports]
         self.internal_nodes = list(module.internal_nodes)
         self.all_nodes = self.port_names + self.internal_nodes
+        self.branch_map = dict(module.branch_map)  # branch_name → node_name
         self.line_directives = line_directives
 
         # Build parameter value map: name → numeric value
@@ -415,25 +416,30 @@ class GiNaCEmitter:
         lines.append('')
         # Condition helpers for runtime checks on GiNaC expressions
         lines.append('// Runtime condition checks — if numeric, compare; if symbolic, return default')
+        # Runtime condition helpers for GiNaC symbolic expressions.
+        # When the value is numeric, evaluate directly.
+        # When symbolic, default to false — this selects the "normal" regime
+        # (Vds >= 0, no source-drain swap) for MOSFET models.
+        # For full regime support, use forced_conditions to override.
         lines.append('bool cond_gt(const ex& a, double b) {')
         lines.append('    if (is_a<numeric>(a)) return ex_to<numeric>(a).to_double() > b;')
-        lines.append('    return true; // symbolic — assume true (branch-set binning)')
+        lines.append('    return false;')
         lines.append('}')
         lines.append('bool cond_lt(const ex& a, double b) {')
         lines.append('    if (is_a<numeric>(a)) return ex_to<numeric>(a).to_double() < b;')
-        lines.append('    return true;')
+        lines.append('    return false;')
         lines.append('}')
         lines.append('bool cond_ge(const ex& a, double b) {')
         lines.append('    if (is_a<numeric>(a)) return ex_to<numeric>(a).to_double() >= b;')
-        lines.append('    return true;')
+        lines.append('    return false;')
         lines.append('}')
         lines.append('bool cond_le(const ex& a, double b) {')
         lines.append('    if (is_a<numeric>(a)) return ex_to<numeric>(a).to_double() <= b;')
-        lines.append('    return true;')
+        lines.append('    return false;')
         lines.append('}')
         lines.append('bool cond_eq(const ex& a, double b) {')
         lines.append('    if (is_a<numeric>(a)) return ex_to<numeric>(a).to_double() == b;')
-        lines.append('    return true;')
+        lines.append('    return false;')
         lines.append('}')
         lines.append('bool cond_ne(const ex& a, double b) {')
         lines.append('    if (is_a<numeric>(a)) return ex_to<numeric>(a).to_double() != b;')
@@ -878,17 +884,34 @@ class GiNaCEmitter:
         # Check if expression contains ddt() — may be wrapped: 1.0 * ddt(q)
         if 'ddt' in expr_str:
             # Extract ddt argument and treat as charge contribution
-            # Replace ddt(x) with x, keep multiplicative wrapper
-            ddt_match = re.search(r'ddt\s*\(\s*(\w+)\s*\)', expr_str)
-            if ddt_match:
+            # ddt may contain a complex expression: ddt(MULT_i * Qg)
+            m = re.search(r'ddt\s*\(', expr_str)
+            if m:
                 is_ddt = True
-                inner_expr = re.sub(r'ddt\s*\(\s*(\w+)\s*\)', r'\1', expr_str)
+                # Find matching close paren
+                start = m.end()
+                depth = 1
+                i = start
+                while i < len(expr_str) and depth > 0:
+                    if expr_str[i] == '(':
+                        depth += 1
+                    elif expr_str[i] == ')':
+                        depth -= 1
+                    i += 1
+                ddt_arg = expr_str[start:i-1]
+                inner_expr = expr_str[:m.start()] + ddt_arg + expr_str[i:]
 
         ginac_expr = self._to_ginac_expr(inner_expr, active_nodes)
         branch_label = f'{node.contrib_kind.name}({",".join(node.branch)})'
 
         br_p = node.branch[0]
         br_n = node.branch[1] if len(node.branch) > 1 else 'gnd'
+
+        # Resolve branch names to their node
+        if br_p in self.branch_map:
+            br_p = self.branch_map[br_p]
+        if br_n in self.branch_map:
+            br_n = self.branch_map[br_n]
 
         # Resolve shorted nodes (returns None if shorted to ground)
         if br_p not in active_nodes and br_p in self.internal_nodes:
@@ -1065,6 +1088,11 @@ class GiNaCEmitter:
         def repl_v(m):
             p1 = m.group(1).strip()
             p2 = m.group(2).strip() if m.group(2) else None
+            # Resolve branch names to their node
+            if p1 in self.branch_map:
+                p1 = self.branch_map[p1]
+            if p2 and p2 in self.branch_map:
+                p2 = self.branch_map[p2]
             if p1 not in active_nodes and p1 in self.internal_nodes:
                 p1 = self._resolve_shorted_node(p1, active_nodes)
             if p2 and p2 not in active_nodes and p2 in self.internal_nodes:
@@ -1076,6 +1104,9 @@ class GiNaCEmitter:
                 return f'({p1_expr} - {p2_expr})'
             return p1_expr
         result = re.sub(r'V\s*\(\s*(\w+)\s*(?:,\s*(\w+)\s*)?\)', repl_v, result)
+
+        # I(branch) probe → 0 for DC/transient (noise branches carry no signal current)
+        result = re.sub(r'I\s*\(\s*\w+\s*\)', 'ex(0)', result)
 
         # $limit(expr, ...) → just expr
         result = re.sub(r'\$limit\s*\(\s*([^,]+),.*?\)', r'\1', result)
@@ -1123,16 +1154,48 @@ class GiNaCEmitter:
         result = _strip_noise_call('ddx', result)
 
         # Evaluate ternary (cond ? a : b) where cond is constant
-        def _eval_ternary(s):
-            # Match: (expr == val ? a : b) or similar
-            pattern = r'\(([^?]+)\?\s*([^:]+):\s*([^)]+)\)'
-            while True:
-                m = re.search(pattern, s)
-                if not m:
+        def _find_ternary(s):
+            """Find a paren-balanced ternary (cond ? true : false) and return
+            (start, end, cond_str, true_str, false_str) or None."""
+            # Find '(' followed eventually by '?' — scan for balanced match
+            idx = 0
+            while idx < len(s):
+                start = s.find('(', idx)
+                if start < 0:
                     break
-                cond_str = m.group(1).strip()
-                true_val = m.group(2).strip()
-                false_val = m.group(3).strip()
+                # Scan forward for '?' at depth 0 (relative to this open paren)
+                depth = 1
+                i = start + 1
+                q_pos = -1
+                colon_pos = -1
+                while i < len(s) and depth > 0:
+                    ch = s[i]
+                    if ch == '(':
+                        depth += 1
+                    elif ch == ')':
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    elif ch == '?' and depth == 1 and q_pos < 0:
+                        q_pos = i
+                    elif ch == ':' and depth == 1 and q_pos >= 0 and colon_pos < 0:
+                        colon_pos = i
+                    i += 1
+                if depth == 0 and q_pos > 0 and colon_pos > 0:
+                    end = i + 1  # past the closing ')'
+                    cond_str = s[start+1:q_pos].strip()
+                    true_str = s[q_pos+1:colon_pos].strip()
+                    false_str = s[colon_pos+1:i].strip()
+                    return (start, end, cond_str, true_str, false_str)
+                idx = start + 1
+            return None
+
+        def _eval_ternary(s):
+            while True:
+                t = _find_ternary(s)
+                if t is None:
+                    break
+                start, end, cond_str, true_val, false_val = t
                 # Try to evaluate the condition
                 py_cond = cond_str.replace('&&', ' and ').replace('||', ' or ')
                 py_cond = re.sub(r'(?<!=)!(?!=)', ' not ', py_cond)
@@ -1143,7 +1206,7 @@ class GiNaCEmitter:
                     ns.update(self.var_values)
                     result_val = eval(py_cond, {"__builtins__": {}}, ns)
                     replacement = true_val if result_val else false_val
-                    s = s[:m.start()] + f'({replacement})' + s[m.end():]
+                    s = s[:start] + f'({replacement})' + s[end:]
                 except Exception:
                     break  # Can't evaluate — leave as-is
             return s
@@ -1173,10 +1236,63 @@ class GiNaCEmitter:
         # condition identifiers were substituted to constants)
         result = _eval_ternary(result)
 
-        # Wrap bare integer literals in ternaries to avoid C++ type mismatch with GiNaC
-        # e.g., (cond ? 0 : sym) → (cond ? ex(0) : sym)
-        result = re.sub(r'\?\s*(\d+)\s*:', lambda m: f'? ex({m.group(1)}) :', result)
-        result = re.sub(r':\s*(\d+)\s*\)', lambda m: f': ex({m.group(1)}) )', result)
+        # Convert remaining ternaries to gmax/gmin:
+        #   (a > b ? a : b) → gmax(a, b)     i.e. max(a,b)
+        #   (a < b ? a : b) → gmin(a, b)     i.e. min(a,b)
+        #   (a > b ? b : a) → gmin(a, b)     i.e. min(a,b)
+        #   (a < b ? b : a) → gmax(a, b)     i.e. max(a,b)
+        # These come from clip()/max()/min() macros in compact models.
+        def _ternary_to_minmax(s):
+            while True:
+                t = _find_ternary(s)
+                if t is None:
+                    break
+                start, end, cond_str, true_val, false_val = t
+                # Normalize whitespace for matching
+                c = ' '.join(cond_str.split())
+                tv = ' '.join(true_val.split())
+                fv = ' '.join(false_val.split())
+                # Try to match (a) > (b) or (a) < (b)
+                m = re.match(r'^(.+?)\s*([><])\s*(.+)$', c)
+                if m:
+                    lhs = ' '.join(m.group(1).strip().strip('()').strip().split())
+                    op = m.group(2)
+                    rhs = ' '.join(m.group(3).strip().strip('()').strip().split())
+                    tv_n = ' '.join(tv.strip().strip('()').strip().split())
+                    fv_n = ' '.join(fv.strip().strip('()').strip().split())
+                    if op == '>' and lhs == tv_n and rhs == fv_n:
+                        s = s[:start] + f'gmax({true_val}, {false_val})' + s[end:]
+                        continue
+                    if op == '>' and lhs == fv_n and rhs == tv_n:
+                        s = s[:start] + f'gmin({true_val}, {false_val})' + s[end:]
+                        continue
+                    if op == '<' and lhs == tv_n and rhs == fv_n:
+                        s = s[:start] + f'gmin({true_val}, {false_val})' + s[end:]
+                        continue
+                    if op == '<' and lhs == fv_n and rhs == tv_n:
+                        s = s[:start] + f'gmax({true_val}, {false_val})' + s[end:]
+                        continue
+                # Not a simple min/max — leave for ex() wrapping below
+                break
+            return s
+
+        # Nested clip(x, lo, hi) produces nested ternaries — iterate
+        for _ in range(5):
+            prev = result
+            result = _ternary_to_minmax(result)
+            if result == prev:
+                break
+
+        # Wrap bare numeric literals adjacent to ? and : with ex() for
+        # GiNaC type compatibility in any remaining ternaries.
+        # Numbers may be wrapped in parens from macro expansion: ( 1.0e26 )
+        _num = r'-?[\d.]+[eE]?[+-]?\d*'
+        def _wrap_ternary_numerics(s):
+            s = re.sub(rf'\?\s*\(?\s*({_num})\s*\)?\s*:', lambda m: f'? ex({m.group(1)}) :', s)
+            s = re.sub(rf':\s*\(?\s*({_num})\s*\)?\s*\)', lambda m: f': ex({m.group(1)}) )', s)
+            return s
+        result = _wrap_ternary_numerics(result)
+        result = _ternary_to_minmax(result)
 
         result = re.sub(r'\s+', ' ', result).strip()
         return result
@@ -1202,7 +1318,8 @@ class GiNaCEmitter:
         idents -= {'ln', 'limexp', 'abs', 'pow', 'exp', 'log', 'sqrt',
                     'sin', 'cos', 'tan', 'tanh', 'atan', 'atan2', 'hypot',
                     'min', 'max', 'ddt', 'e', 'E',
-                    'hypsmooth', 'hypmax', 'Tempdep', 'lexp', 'lln'}
+                    'hypsmooth', 'hypmax', 'Tempdep', 'lexp', 'lln',
+                    'floor', 'ceil', 'fabs'}
 
         ns = {}
         for ident in idents:
@@ -1222,6 +1339,7 @@ class GiNaCEmitter:
             'tanh': math.tanh, 'atan': math.atan, 'atan2': math.atan2,
             'hypot': math.hypot, 'min': min, 'max': max,
             'limexp': math.exp, 'lexp': math.exp, 'lln': math.log,
+            'floor': math.floor, 'ceil': math.ceil,
         })
         # Add model-defined functions
         def _hypsmooth(x, c):
@@ -1239,6 +1357,46 @@ class GiNaCEmitter:
 
         # Translate operators
         py = expr.replace('&&', ' and ').replace('||', ' or ')
+
+        # Convert C ternary (cond ? a : b) to Python (a if cond else b)
+        def _c_ternary_to_py(s):
+            while True:
+                # Find paren-balanced ternary
+                idx = 0
+                found = False
+                while idx < len(s):
+                    start = s.find('(', idx)
+                    if start < 0:
+                        break
+                    depth = 1
+                    i = start + 1
+                    q_pos = -1
+                    colon_pos = -1
+                    while i < len(s) and depth > 0:
+                        ch = s[i]
+                        if ch == '(':
+                            depth += 1
+                        elif ch == ')':
+                            depth -= 1
+                            if depth == 0:
+                                break
+                        elif ch == '?' and depth == 1 and q_pos < 0:
+                            q_pos = i
+                        elif ch == ':' and depth == 1 and q_pos >= 0 and colon_pos < 0:
+                            colon_pos = i
+                        i += 1
+                    if depth == 0 and q_pos > 0 and colon_pos > 0:
+                        cond = s[start+1:q_pos].strip()
+                        true_v = s[q_pos+1:colon_pos].strip()
+                        false_v = s[colon_pos+1:i].strip()
+                        s = s[:start] + f'(({true_v}) if ({cond}) else ({false_v}))' + s[i+1:]
+                        found = True
+                        break
+                    idx = start + 1
+                if not found:
+                    break
+            return s
+        py = _c_ternary_to_py(py)
 
         try:
             result = eval(py, {"__builtins__": {}}, ns)
@@ -1396,7 +1554,7 @@ class GiNaCEmitter:
         if temp_idx is not None:
             lines.append(f'    double temperature = V[{temp_idx}];  // temperature node (V_{active_nodes[temp_idx]})')
         else:
-            lines.append(f'    double temperature = V[n_nodes - 1];  // temperature node (fallback)')
+            lines.append(f'    double temperature = 300.15;  // nominal (no thermal node)')
         lines.append('')
 
         # Reset var_values for the walk (keep param_values intact)

@@ -59,32 +59,38 @@ class RegimeAnalysis:
     def n_conditions(self) -> int:
         return len(self.conditions)
 
-    def forced_nodes(self, key: int) -> dict[int, bool]:
-        """Convert a regime bitmask to {node_id: True/False}.
+    def _resolve_key(self, key: int) -> dict[int, bool]:
+        """Resolve a regime bitmask to {condition_index: True/False}.
 
-        For nested conditions whose parent is False, the child is
-        forced False (unreachable).  Returns a dict keyed by AST
-        node id(node) suitable for passing to GiNaCEmitter.
+        A child condition is reachable only when its parent's outcome
+        matches the child's parent_branch:
+        - parent_branch=True  → child is in the 'if' body → reachable when parent is True
+        - parent_branch=False → child is in the 'else' body → reachable when parent is False
+        If unreachable, the child is forced False.
         """
         by_index = {}
         for c in self.conditions:
             bit = bool(key & (1 << c.index))
-            if c.parent_index >= 0 and not by_index.get(c.parent_index, True):
-                by_index[c.index] = False
+            if c.parent_index >= 0:
+                parent_val = by_index.get(c.parent_index, True)
+                reachable = (parent_val == c.parent_branch)
+                by_index[c.index] = bit if reachable else False
             else:
                 by_index[c.index] = bit
+        return by_index
 
+    def forced_nodes(self, key: int) -> dict[int, bool]:
+        """Convert a regime bitmask to {node_id: True/False}.
+
+        Returns a dict keyed by AST node id(node) suitable for passing
+        to GiNaCEmitter.
+        """
+        by_index = self._resolve_key(key)
         return {c.node_id: by_index[c.index] for c in self.conditions}
 
     def normalize_key(self, key: int) -> int:
         """Normalize a regime key by clearing unreachable condition bits."""
-        by_index = {}
-        for c in self.conditions:
-            bit = bool(key & (1 << c.index))
-            if c.parent_index >= 0 and not by_index.get(c.parent_index, True):
-                by_index[c.index] = False
-            else:
-                by_index[c.index] = bit
+        by_index = self._resolve_key(key)
         normalized = 0
         for idx, val in by_index.items():
             if val:
@@ -318,6 +324,7 @@ def _try_eval_full(expr: str, emitter: GiNaCEmitter,
         'sqrt': math.sqrt, 'pow': math.pow, 'abs': abs,
         'min': min, 'max': max, 'hypot': math.hypot,
         'tanh': math.tanh, 'cosh': math.cosh, 'sinh': math.sinh,
+        'floor': math.floor, 'ceil': math.ceil, 'fabs': abs,
     })
     # Also add model-defined functions if available
     def hypsmooth(x, c):
@@ -344,8 +351,47 @@ def _try_eval_full(expr: str, emitter: GiNaCEmitter,
     e = re.sub(r'Temp\s*\(\s*(\w+)\s*\)', r'V_\1', e)
     e = e.replace('$temperature', 'temperature')
     e = e.replace('$vt', 'Vt')
-    # Normalize operators
-    e = e.replace('? ', '? ').replace(' :', ' :')  # ternary
+
+    # Convert C-style ternary (cond ? a : b) → _ternary(cond, a, b)
+    # Handles nested ternaries (CLIP_BOTH) by iterating inner-to-outer
+    def _ternary_to_func(s):
+        for _ in range(10):
+            prev = s
+            idx = 0
+            while idx < len(s):
+                start = s.find('(', idx)
+                if start < 0:
+                    break
+                depth = 1
+                i = start + 1
+                q_pos = -1
+                colon_pos = -1
+                while i < len(s) and depth > 0:
+                    ch = s[i]
+                    if ch == '(':
+                        depth += 1
+                    elif ch == ')':
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    elif ch == '?' and depth == 1 and q_pos < 0:
+                        q_pos = i
+                    elif ch == ':' and depth == 1 and q_pos >= 0 and colon_pos < 0:
+                        colon_pos = i
+                    i += 1
+                if depth == 0 and q_pos > 0 and colon_pos > 0:
+                    cond = s[start+1:q_pos].strip()
+                    true_v = s[q_pos+1:colon_pos].strip()
+                    false_v = s[colon_pos+1:i].strip()
+                    s = s[:start] + f'_ternary({cond},{true_v},{false_v})' + s[i+1:]
+                    break  # restart after substitution
+                idx = start + 1
+            if s == prev:
+                break
+        return s
+    e = _ternary_to_func(e)
+
+    ns['_ternary'] = lambda c, a, b: a if c else b
 
     try:
         result = eval(e, {"__builtins__": {}}, ns)
@@ -405,7 +451,7 @@ class RegimeCache:
             indent = "  " * (c.depth + 1)
             print(f"  [{c.index:2d}]{indent}{c.condition}")
 
-        # Build compiled C++ condition evaluator for accurate regime key computation
+        # Build compiled C++ condition evaluator for regime key computation
         self._eval_regime_fn, _, _ = self.load_condition_evaluator()
 
     def get_regime(self, voltages: list[float], vt: float = None,
@@ -621,9 +667,8 @@ inline double conjugate(double x) {{ return x; }}
 
 #define vae_eval _vae_eval_impl
 #define vae_jacobian _vae_jacobian_impl
-#define temperature V_t
+static const double temperature = 300.15; // nominal (DTA=0)
 #include "{eval_cpp}"
-#undef temperature
 #undef vae_eval
 #undef vae_jacobian
 
