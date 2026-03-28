@@ -157,15 +157,19 @@ public:
       std::vector<double> & objectiveVec,
       std::vector<double> & dOdpVec, std::vector<double> & dOdpAdjVec,
       std::vector<double> & scaled_dOdpVec, std::vector<double> & scaled_dOdpAdjVec);
+
   bool calcSensitivity(
       std::vector<double> & objectiveVec,
       std::vector<double> & dOdpVec, std::vector<double> & dOdpAdjVec,
-      std::vector<double> & scaled_dOdpVec, std::vector<double> & scaled_dOdpAdjVec);
+      std::vector<double> & scaled_dOdpVec, std::vector<double> & scaled_dOdpAdjVec,
+      double timeOfSensitivities);
 
   bool calcTransientAdjoint(bool timePoint,
       std::vector<double> & objectiveVec,
       std::vector<double> & dOdpVec, std::vector<double> & dOdpAdjVec,
       std::vector<double> & scaled_dOdpVec, std::vector<double> & scaled_dOdpAdjVec);
+
+  void finalSensOutput();
 
   void setMatrixFreeFlag(bool matrixFreeFlag)
   {

@@ -1884,6 +1884,8 @@ PWLinDynData::Callback PWLinDynData::BindCB(const char *lib_name,const char *fn_
     
     if (NULL != (fn = (fn_p)dlsym(handle, fn_name))) {
         cbk = (Callback)(*fn)(this,cb_data,args);
+    } else {
+        Report::DevelWarning() << "Call-back not given";
     }
     
   fail:

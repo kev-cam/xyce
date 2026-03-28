@@ -306,7 +306,7 @@ public:
   ///
   /// @return const reference to the type_info of the data type being stored in the entry.
   ///
-  virtual const std::type_info &type() const = 0;
+  virtual const std::type_info &type() const {return typeid(void);};
 
   ///
   /// Prints the value of the entry to the output stream

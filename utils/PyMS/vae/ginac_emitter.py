@@ -1118,6 +1118,10 @@ class GiNaCEmitter:
         result = re.sub(r'\$vt\b', 'Vt', result)
         result = re.sub(r'\$temperature\b', 'temperature', result)
 
+        # $simparam("name", default) → default value
+        result = re.sub(r'\$simparam\s*\(\s*"[^"]*"\s*,\s*([^)]+)\)', r'\1', result)
+        result = re.sub(r'\$simparam\s*\(\s*"[^"]*"\s*\)', '0', result)
+
         # Function mapping
         for va_name, ginac_name in _VA_TO_GINAC.items():
             result = re.sub(rf'\b{va_name}\b(?=\s*\()', ginac_name, result)
@@ -1307,6 +1311,9 @@ class GiNaCEmitter:
             return None
 
         s = expr
+        # $simparam("name", default) → default value (before $ check)
+        s = re.sub(r'\$simparam\s*\(\s*"[^"]*"\s*,\s*([^)]+)\)', r'\1', s)
+        s = re.sub(r'\$simparam\s*\(\s*"[^"]*"\s*\)', '0', s)
         # Skip if contains V(), I(), $vt, etc.
         if re.search(r'[VI]\s*\(', s) or '$' in s:
             return None
@@ -1805,6 +1812,10 @@ class GiNaCEmitter:
         # $vt → Vt, $temperature → temperature
         result = re.sub(r'\$vt\b', 'Vt', result)
         result = re.sub(r'\$temperature\b', 'temperature', result)
+
+        # $simparam("name", default) → default value
+        result = re.sub(r'\$simparam\s*\(\s*"[^"]*"\s*,\s*([^)]+)\)', r'\1', result)
+        result = re.sub(r'\$simparam\s*\(\s*"[^"]*"\s*\)', '0.0', result)
 
         # Function mapping (VA → C++ std:: calls)
         _cpp_funcs = [

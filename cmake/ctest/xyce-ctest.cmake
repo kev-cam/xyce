@@ -443,6 +443,8 @@ set(CTEST_DROP_LOCATION "/submit.php?project=${CTEST_PROJECT_NAME}")
 if(VERBOSITY GREATER 4)
   message("[VERB5]: CMAKE_ARGS_LIST = ${CMAKE_ARGS_LIST}")
 endif()
+
+# default to a "Debug" build if not specified
 set(XYCE_CMAKE_CONF_ARG "")
 foreach(cmakeopt IN LISTS CMAKE_ARGS_LIST)
   set(XYCE_CMAKE_CONF_ARG "${XYCE_CMAKE_CONF_ARG} ${cmakeopt}")

@@ -114,12 +114,14 @@ Sensitivity::Sensitivity (
     outputUnscaledFlag_(true),
     maxParamStringSize_(0),
     stdOutputFlag_(false),
+    maxStdOutputFlag_(false),
     fileOutputFlag_(false),
     numSolves_(0),
     objFuncGiven_(false),
     objFuncGIDsetup_(false),
     objFuncTimeDerivGIDsetup_(false),
     difference_(SENS_FWD),
+    maxMagSensitivitiesSetup(false),
     sqrtEta_(1.0e-8),
     sqrtEtaGiven_(false),
     forceFD_(false),
@@ -130,6 +132,8 @@ Sensitivity::Sensitivity (
     computeDelays_(false),
     timeDerivsSetup_(false),
     reuseFactors_(true),
+    sortPointOutput_(false),
+    sortMaxOutput_(false),
     lambdaVectorPtr_(0),
     savedRHSVectorPtr_(0),
     savedNewtonVectorPtr_(0),
@@ -237,7 +241,8 @@ std::ostream& Sensitivity::stdOutput (
        std::vector<double> & paramVals,
        std::vector<double> & sensitivities,
        std::vector<double> & scaled_sensitivities,
-       std::ostream& os
+       std::ostream& os,
+       double timeOfSensitivities
        )
 {
   Analysis::OutputMgrAdapter & outputManagerAdapter = getAnalysisManager().getOutputManagerAdapter();
@@ -262,31 +267,98 @@ std::ostream& Sensitivity::stdOutput (
 
   for (int iobj=0;iobj<objFuncDataVec_.size();++iobj)
   {
-    os << "\n"<<idString << " Sensitivities of objective function:";
-    os
-      << objFuncDataVec_[iobj]->objFuncString << " = " 
-      << std::setw(13)<< std::scientific<< std::setprecision(4)
-      << objFuncDataVec_[iobj]->objFuncEval << std::endl;
-
-
-    os << std::setw(maxParamStringSize_)<<"Name";
-    os << "\t"<<std::setw(13)<<"Value";
-    os << "\t"<<std::setw(13)<<"Sensitivity";
-    os << "\t"<<std::setw(13)<<"Normalized"<<std::endl;
-
-    for (int iparam=0; iparam< numSensParams_; ++iparam)
+    if (!sortPointOutput_)
     {
-      os << std::setw(maxParamStringSize_)<<paramNameVec_[iparam];
+      if (mode_ != Nonlinear::TRANSIENT)
+      {
+        os << "\n"<<idString << " Steady-state Sensitivities of objective function:";
+        os
+          << objFuncDataVec_[iobj]->objFuncString << " = " 
+          << std::setw(13)<< std::scientific<< std::setprecision(4)
+          << objFuncDataVec_[iobj]->objFuncEval << std::endl;
+      }
+      else
+      {
+        os << "\n"<<idString << " Sensitivities at time = " << std::setw(13)<< std::scientific<< std::setprecision(4) << timeOfSensitivities << " of objective function:";
+        os
+          << objFuncDataVec_[iobj]->objFuncString << " = " 
+          << std::setw(13)<< std::scientific<< std::setprecision(4)
+          << objFuncDataVec_[iobj]->objFuncEval << std::endl;
+      }
 
-      os << "\t" << std::setw(13)<< std::scientific<< std::setprecision(4)
-        << paramVals[iparam];
+      os << std::setw(maxParamStringSize_)<<"Name";
+      os << "\t"<<std::setw(13)<<"Value";
+      os << "\t"<<std::setw(13)<<"Sensitivity";
+      os << "\t"<<std::setw(13)<<"Normalized"<<std::endl;
 
-      int index= iobj*numSensParams_ +iparam;
-      os << "\t" << std::setw(13)<< std::scientific<< std::setprecision(4)
-        << sensitivities[index];
+      for (int iparam=0; iparam< numSensParams_; ++iparam)
+      {
+        os << std::setw(maxParamStringSize_)<<paramNameVec_[iparam];
 
-      os << "\t" << std::setw(13)<< std::scientific<< std::setprecision(4)
-        << scaled_sensitivities[index] << std::endl;
+        os << "\t" << std::setw(13)<< std::scientific<< std::setprecision(4)
+          << paramVals[iparam];
+
+        int index= iobj*numSensParams_ +iparam;
+        os << "\t" << std::setw(13)<< std::scientific<< std::setprecision(4)
+          << sensitivities[index];
+
+        os << "\t" << std::setw(13)<< std::scientific<< std::setprecision(4)
+          << scaled_sensitivities[index] << std::endl;
+      }
+    }
+    else
+    {
+      if (mode_ != Nonlinear::TRANSIENT)
+      {
+        os << "\nSorted "<<idString << " Steady-state Sensitivities of objective function:";
+        os
+          << objFuncDataVec_[iobj]->objFuncString << " = " 
+          << std::setw(13)<< std::scientific<< std::setprecision(4)
+          << objFuncDataVec_[iobj]->objFuncEval << std::endl;
+      }
+      else
+      {
+        os << "\nSorted "<<idString << " Sensitivities at time = " << std::setw(13)<< std::scientific<< std::setprecision(4) << timeOfSensitivities << " of objective function:";
+        os
+          << objFuncDataVec_[iobj]->objFuncString << " = " 
+          << std::setw(13)<< std::scientific<< std::setprecision(4)
+          << objFuncDataVec_[iobj]->objFuncEval << std::endl;
+      }
+
+      os << std::setw(maxParamStringSize_)<<"Name";
+      os << "\t"<<std::setw(13)<<"Value";
+      os << "\t"<<std::setw(13)<<"Sensitivity";
+      os << "\t"<<std::setw(13)<<"Normalized"<<std::endl;
+
+      // sort sensitivities by value, biggest to smallest
+      std::vector<std::size_t> indices(numSensParams_,0);
+      std::iota(indices.begin(), indices.end(),0);
+      int zeroIndex= iobj*numSensParams_;
+
+      // sort the the names, sensitivities, etc vectors, using permutation based on sensitivities vector
+      // do one sort of the indices, and then use those indices for the output.
+      std::vector<double> sortedSensitivities;
+      sortedSensitivities.insert(sortedSensitivities.begin(), (sensitivities.begin()+zeroIndex), (sensitivities.begin()+zeroIndex+numSensParams_));
+
+      std::vector<double> sortedScaled_sensitivities;
+      sortedScaled_sensitivities.insert( sortedScaled_sensitivities.begin(), (scaled_sensitivities.begin()+zeroIndex), (scaled_sensitivities.begin()+zeroIndex+numSensParams_));
+
+      std::sort(indices.begin(), indices.end(), 
+        [&](const int& a, const int& b) { return (fabs(sortedSensitivities[a]) > fabs(sortedSensitivities[b])); } ) ;
+
+      for (int iparam=0; iparam< numSensParams_; ++iparam)
+      {
+        os << std::setw(maxParamStringSize_)<<paramNameVec_[indices[iparam]];
+
+        os << "\t" << std::setw(13)<< std::scientific<< std::setprecision(4)
+          << paramVals[indices[iparam]];
+
+        os << "\t" << std::setw(13)<< std::scientific<< std::setprecision(4)
+          << sortedSensitivities[indices[iparam]];
+
+        os << "\t" << std::setw(13)<< std::scientific<< std::setprecision(4)
+          << sortedScaled_sensitivities[indices[iparam]] << std::endl;
+      }
     }
   }
 
@@ -301,6 +373,158 @@ std::ostream& Sensitivity::stdOutput (
   }
 
   return os;
+}
+
+//-----------------------------------------------------------------------------
+// Function      : Sensitivity::finalOutput
+// Purpose       :
+// Special Notes :
+// Scope         : public
+// Creator       : Eric Keiter, SNL
+// Creation Date : 10/30/2025
+//-----------------------------------------------------------------------------
+void Sensitivity::finalOutput ()
+{
+  if(!maxStdOutputFlag_) { return; }
+
+  std::ostream & os = Xyce::lout();
+  std::string idString = std::string("Direct");
+  TimeIntg::DataStore & ds = *dsPtr_;
+  std::vector<double> & paramVals = ds.paramOrigVals_;
+
+  Analysis::OutputMgrAdapter & outputManagerAdapter = getAnalysisManager().getOutputManagerAdapter();
+
+  // save current stream state, and then set the stream to use scientific notation.
+  // Otherwise the info for the stepped parameters may not be output in
+  // scientific notation.
+  basic_ios_all_saver<std::ostream::char_type> save(os);
+  os.setf(std::ios::scientific);
+
+  if ( !(outputManagerAdapter.getStepSweepVector().empty()) )
+  {
+    // Output for .STEP.  Step count should be output as an integer.
+    // The other values should be output in scientific notation.
+    os << "\nFor Step " << outputManagerAdapter.getStepAnalysisStepNumber() << ":" << std::endl;
+    for (std::vector<Analysis::SweepParam>::const_iterator it = outputManagerAdapter.getStepSweepVector().begin();
+         it != outputManagerAdapter.getStepSweepVector().end(); ++it)
+    {
+      os << it->name << " = " << it->currentVal << std::endl;
+    }
+  }
+
+  for (int iobj=0;iobj<objFuncDataVec_.size();++iobj)
+  {
+    if (!sortMaxOutput_)
+    {
+      if (mode_ != Nonlinear::TRANSIENT)
+      {
+        os << "\n"<<idString << " Max Steady-state Sensitivities of objective function:";
+        os
+          << objFuncDataVec_[iobj]->objFuncString << " = " 
+          << std::setw(13)<< std::scientific<< std::setprecision(4)
+          << objFuncDataVec_[iobj]->objFuncEval << std::endl;
+      }
+      else
+      {
+        os << "\n"<<idString << " Max Sensitivities at final time of objective function:";
+        os
+          << objFuncDataVec_[iobj]->objFuncString << " = " 
+          << std::setw(13)<< std::scientific<< std::setprecision(4)
+          << objFuncDataVec_[iobj]->objFuncEval << std::endl;
+      }
+
+      os << std::setw(maxParamStringSize_)<<"Name";
+      os << "\t"<<std::setw(13)<<"Value";
+      os << "\t"<<std::setw(13)<<"Sensitivity";
+      os << "\t"<<std::setw(13)<<"Normalized";
+      os <<std::endl;
+
+      for (int iparam=0; iparam< numSensParams_; ++iparam)
+      {
+        os << std::setw(maxParamStringSize_)<<paramNameVec_[iparam];
+
+        os << "\t" << std::setw(13)<< std::scientific<< std::setprecision(4)
+          << paramVals[iparam];
+
+        int index= iobj*numSensParams_ +iparam;
+        os << "\t" << std::setw(13)<< std::scientific<< std::setprecision(4)
+          << maxMagSensitivities[index];
+
+        os << "\t" << std::setw(13)<< std::scientific<< std::setprecision(4)
+          << maxMagScaledSensitivities[index];
+
+        os << std::endl;
+      }
+    }
+    else
+    {
+      if (mode_ != Nonlinear::TRANSIENT)
+      {
+        os << "\nSorted "<<idString << " Max Steady-state Sensitivities of objective function:";
+        os
+          << objFuncDataVec_[iobj]->objFuncString << " = " 
+          << std::setw(13)<< std::scientific<< std::setprecision(4)
+          << objFuncDataVec_[iobj]->objFuncEval << std::endl;
+      }
+      else
+      {
+        os << "\nSorted "<<idString << " Max Sensitivities at final time of objective function:";
+        os
+          << objFuncDataVec_[iobj]->objFuncString << " = " 
+          << std::setw(13)<< std::scientific<< std::setprecision(4)
+          << objFuncDataVec_[iobj]->objFuncEval << std::endl;
+      }
+
+      os << std::setw(maxParamStringSize_)<<"Name";
+      os << "\t"<<std::setw(13)<<"Value";
+      os << "\t"<<std::setw(13)<<"Sensitivity";
+      os << "\t"<<std::setw(13)<<"Normalized";
+      os << std::endl;
+
+      // sort sensitivities by value, biggest to smallest
+      std::vector<std::size_t> indices(numSensParams_,0);
+      std::iota(indices.begin(), indices.end(),0);
+      int zeroIndex= iobj*numSensParams_;
+
+      // sort the the names, sensitivities, etc vectors, using permutation based on sensitivities vector
+      // do one sort of the indices, and then use those indices for the output.
+      std::vector<double> sortedSensitivities;
+      sortedSensitivities.insert(sortedSensitivities.begin(), (maxMagSensitivities.begin()+zeroIndex), (maxMagSensitivities.begin()+zeroIndex+numSensParams_));
+
+      std::vector<double> sortedScaled_sensitivities;
+      sortedScaled_sensitivities.insert( sortedScaled_sensitivities.begin(), (maxMagScaledSensitivities.begin()+zeroIndex), (maxMagScaledSensitivities.begin()+zeroIndex+numSensParams_));
+
+      std::sort(indices.begin(), indices.end(), 
+        [&](const int& a, const int& b) { return (fabs(sortedSensitivities[a]) > fabs(sortedSensitivities[b])); } ) ;
+
+      for (int iparam=0; iparam< numSensParams_; ++iparam)
+      {
+        os << std::setw(maxParamStringSize_)<<paramNameVec_[indices[iparam]];
+
+        os << "\t" << std::setw(13)<< std::scientific<< std::setprecision(4)
+          << paramVals[indices[iparam]];
+
+        os << "\t" << std::setw(13)<< std::scientific<< std::setprecision(4)
+          << sortedSensitivities[indices[iparam]];
+
+        os << "\t" << std::setw(13)<< std::scientific<< std::setprecision(4)
+          << sortedScaled_sensitivities[indices[iparam]];
+        
+        os << std::endl;
+      }
+      os << std::endl;
+    }
+  }
+
+  if ( !(outputManagerAdapter.getStepSweepVector().empty()) )
+  {
+    if ( (outputManagerAdapter.getStepAnalysisStepNumber()+1) <
+          outputManagerAdapter.getStepAnalysisMaxSteps() )
+    {
+      // add a blank line after each block of .STEP output, except for the last one
+      os << std::endl;
+    }
+  }
 }
 
 //-----------------------------------------------------------------------------
@@ -414,7 +638,8 @@ bool Sensitivity::icSensitivity (
 
     if (stdOutputFlag_)
     {
-      stdOutput(std::string("Direct"), ds.paramOrigVals_, ds.dOdpVec_, ds.scaled_dOdpVec_, Xyce::lout() );
+      double timeOfSens=0.0;
+      stdOutput(std::string("Direct"), ds.paramOrigVals_, ds.dOdpVec_, ds.scaled_dOdpVec_, Xyce::lout(), timeOfSens);
     }
   }
 
@@ -434,7 +659,9 @@ bool Sensitivity::icSensitivity (
     }
     if (stdOutputFlag_  && mode_ != Nonlinear::TRANSIENT)
     {
-      stdOutput(std::string("Adjoint"), ds.paramOrigVals_, ds.dOdpAdjVec_, ds.scaled_dOdpAdjVec_, Xyce::lout() );
+      double timeOfSensitivities=0.0; // always zero for IC
+      stdOutput(std::string("Adjoint"), ds.paramOrigVals_, ds.dOdpAdjVec_, ds.scaled_dOdpAdjVec_, Xyce::lout(),
+       timeOfSensitivities);
     }
   }
 
@@ -455,7 +682,8 @@ int Sensitivity::solve(
      std::vector<double> & dOdpVec, 
      std::vector<double> & dOdpAdjVec,
      std::vector<double> & scaled_dOdpVec, 
-     std::vector<double> & scaled_dOdpAdjVec)
+     std::vector<double> & scaled_dOdpAdjVec,
+     double timeOfSensitivities)
 {
   Stats::StatTop _solveStat("Sensistivity Solve");
   Stats::TimeBlock _solveTimer(_solveStat);
@@ -514,7 +742,7 @@ int Sensitivity::solve(
 
   if (solveDirectFlag_) 
   {
-    solveDirect ();
+    solveDirect (timeOfSensitivities);
 
     if (computeDelays_)
     {
@@ -613,7 +841,7 @@ int Sensitivity::solve(
 // Creator       : Eric Keiter, SNL, Parallel Computational Sciences
 // Creation Date : 10/31/02
 //-----------------------------------------------------------------------------
-int Sensitivity::solveDirect ()
+int Sensitivity::solveDirect (double timeOfSensitivities)
 {
   Stats::StatTop _solveDirectStat("Solve Direct");
   Stats::TimeBlock _solveDirectTimer(_solveDirectStat);
@@ -706,9 +934,29 @@ int Sensitivity::solveDirect ()
     }
   }
 
+  // get maximum direct sensitivities magnitudes
+  {
+  int tmpSize=ds.dOdpVec_.size();
+  if (!maxMagSensitivitiesSetup)
+  {
+    maxMagSensitivities.resize(tmpSize,0.0);
+    maxMagScaledSensitivities.resize(tmpSize,0.0);
+  }
+
+  for (int ii=0;ii<tmpSize;ii++)
+  {
+    if (fabs(ds.dOdpVec_[ii]) > fabs(maxMagSensitivities[ii]))
+    {
+      maxMagSensitivities[ii] = ds.dOdpVec_[ii];
+      maxMagScaledSensitivities[ii] = ds.scaled_dOdpVec_[ii]; 
+    }
+  }
+  }
+
   if (stdOutputFlag_)
   {
-    stdOutput(std::string("Direct"), ds.paramOrigVals_, ds.dOdpVec_, ds.scaled_dOdpVec_, Xyce::lout() );
+    stdOutput(std::string("Direct"), ds.paramOrigVals_, ds.dOdpVec_, ds.scaled_dOdpVec_, Xyce::lout(),
+       timeOfSensitivities);
   }
 
   if (fileOutputFlag_)
@@ -898,7 +1146,9 @@ int Sensitivity::solveAdjoint ()
   // set the sensitivity information to the screen:
   if (stdOutputFlag_  && mode_ != Nonlinear::TRANSIENT)
   {
-    stdOutput(std::string("Adjoint"), ds.paramOrigVals_, ds.dOdpAdjVec_, ds.scaled_dOdpAdjVec_, Xyce::lout() );
+    double timeOfSensitivities=0.0;
+    stdOutput(std::string("Adjoint"), ds.paramOrigVals_, ds.dOdpAdjVec_, ds.scaled_dOdpAdjVec_, Xyce::lout(),
+       timeOfSensitivities);
   }
   if (fileOutputFlag_)
   {
@@ -1455,7 +1705,20 @@ bool Sensitivity::setSensitivityOptions(const Util::OptionBlock &OB)
     }
     else if ((*it).uTag() == "REUSEFACTORS")
     {
-      reuseFactors_ = (*it).getImmutableValue<double>();
+      reuseFactors_ = (*it).getImmutableValue<bool>();
+    }
+    else if ((*it).uTag() == "SORTPOINTOUTPUT")
+    {
+      sortPointOutput_ = (*it).getImmutableValue<bool>();
+    }
+    else if ((*it).uTag() == "SORTMAXOUTPUT")
+    {
+      sortMaxOutput_ = (*it).getImmutableValue<bool>();
+    }
+    else if ((*it).uTag() == "MAXSTDOUTPUT")
+    {
+      maxStdOutputFlag_ = 
+        static_cast<bool>((*it).getImmutableValue<bool>());
     }
     else if (DEBUG_NONLINEAR && (*it).uTag() == "DEBUGLEVEL")
     {
@@ -1771,10 +2034,13 @@ void Sensitivity::populateMetadata(
     parameters.insert(Util::ParamMap::value_type("OUTPUTSCALED", Util::Param("OUTPUTSCALED", 0)));
     parameters.insert(Util::ParamMap::value_type("OUTPUTUNSCALED", Util::Param("OUTPUTUNSCALED", 1)));
     parameters.insert(Util::ParamMap::value_type("STDOUTPUT", Util::Param("STDOUTPUT", 0)));
+    parameters.insert(Util::ParamMap::value_type("MAXSTDOUTPUT", Util::Param("MAXSTDOUTPUT", 0)));
     parameters.insert(Util::ParamMap::value_type("DIAGNOSTICFILE", Util::Param("DIAGNOSTICFILE", 0)));
     parameters.insert(Util::ParamMap::value_type("DIFFERENCE", Util::Param("DIFFERENCE", 0)));
     parameters.insert(Util::ParamMap::value_type("SQRTETA", Util::Param("SQRTETA", 1.0e-8)));
     parameters.insert(Util::ParamMap::value_type("REUSEFACTORS", Util::Param("REUSEFACTORS",1)));
+    parameters.insert(Util::ParamMap::value_type("SORTPOINTOUTPUT", Util::Param("SORTPOINTOUTPUT",0)));
+    parameters.insert(Util::ParamMap::value_type("SORTMAXOUTPUT", Util::Param("SORTMAXOUTPUT",0)));
     parameters.insert(Util::ParamMap::value_type("ADJOINTBEGINTIME", Util::Param("ADJOINTBEGINTIME", 0.0)));
     parameters.insert(Util::ParamMap::value_type("ADJOINTFINALTIME", Util::Param("ADJOINTFINALTIME", 1.0e+199)));
     parameters.insert(Util::ParamMap::value_type("FORCEFD", Util::Param("FORCEFD", 0)));

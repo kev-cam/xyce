@@ -98,9 +98,10 @@ public:
        std::vector<double> & dOdpVec, 
        std::vector<double> & dOdpAdjVec,
        std::vector<double> & scaled_dOdpVec, 
-       std::vector<double> & scaled_dOdpAdjVec);
+       std::vector<double> & scaled_dOdpAdjVec,
+       double timeOfSensitivities);
 
-   int solveDirect  ();
+   int solveDirect  (double timeOfSensitivities);
    int solveAdjoint ();
 
    int solveTransientAdjoint (bool timePoint,
@@ -115,7 +116,8 @@ public:
        std::vector<double> & paramVals,
        std::vector<double> & sensitivities,
        std::vector<double> & scaled_sensitivities,
-       std::ostream& os
+       std::ostream& os,
+       double timeOfSensitivities
        );
 
    void fileOutput (
@@ -124,6 +126,8 @@ public:
        std::vector<double> & sensitivities,
        std::vector<double> & scaled_sensitivities
        );
+
+   void finalOutput();
 
    bool calcObjFuncDerivs ();
    bool calcObjFuncTimeDerivs ();
@@ -176,6 +180,7 @@ private:
   int maxParamStringSize_;
 
   bool stdOutputFlag_;
+  bool maxStdOutputFlag_;
   bool fileOutputFlag_;
   int numSolves_;
 
@@ -185,6 +190,10 @@ private:
 
   bool objFuncTimeDerivGIDsetup_;
   std::vector<objectiveFunctionData<double> *> objFuncTimeDerivDataVec_;
+
+  bool maxMagSensitivitiesSetup;
+  std::vector<double> maxMagSensitivities;
+  std::vector<double> maxMagScaledSensitivities;
 
   // finite difference variables
   int difference_;
@@ -197,8 +206,9 @@ private:
   bool sparseAdjointStorage_;
   bool computeDelays_;
   bool timeDerivsSetup_;
-
   bool reuseFactors_;
+  bool sortPointOutput_;
+  bool sortMaxOutput_;
 
   Linear::Vector * lambdaVectorPtr_;
   Linear::Vector * savedRHSVectorPtr_;
