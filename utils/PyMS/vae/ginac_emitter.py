@@ -1429,13 +1429,23 @@ class GiNaCEmitter:
     def _resolve_shorted_node(self, node: str, active_nodes: list[str]) -> Optional[str]:
         """Resolve a shorted internal node to its target.
 
+        Follows the chain: if gm→gi and gi→g, resolves gm→g.
         Returns the target node name, or None if the node is shorted to ground
         (e.g. single-node V(N) <+ 0).
         """
-        target = self._find_short_target(self.mod.analog_block, node)
-        if target and target in active_nodes:
-            return target
-        # No partner found — node is shorted to ground
+        visited = set()
+        current = node
+        while current and current not in visited:
+            visited.add(current)
+            if current in active_nodes:
+                return current
+            target = self._find_short_target(self.mod.analog_block, current)
+            if target is None:
+                return None  # shorted to ground
+            current = target
+        # Loop or couldn't resolve — check if final target is active
+        if current and current in active_nodes:
+            return current
         return None
 
     def _find_short_target(self, ast_node: ASTNode, internal: str) -> Optional[str]:
