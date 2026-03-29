@@ -1430,23 +1430,45 @@ class GiNaCEmitter:
         """Resolve a shorted internal node to its target.
 
         Follows the chain: if gm→gi and gi→g, resolves gm→g.
+        Collects ALL short partners and does BFS to find an active node.
         Returns the target node name, or None if the node is shorted to ground
         (e.g. single-node V(N) <+ 0).
         """
+        # BFS through short connections to find an active node
         visited = set()
-        current = node
-        while current and current not in visited:
+        queue = [node]
+        while queue:
+            current = queue.pop(0)
+            if current in visited:
+                continue
             visited.add(current)
-            if current in active_nodes:
+            if current != node and current in active_nodes:
                 return current
-            target = self._find_short_target(self.mod.analog_block, current)
-            if target is None:
-                return None  # shorted to ground
-            current = target
-        # Loop or couldn't resolve — check if final target is active
-        if current and current in active_nodes:
-            return current
+            # Find all nodes that current is shorted to
+            partners = self._find_all_short_partners(self.mod.analog_block, current)
+            for p in partners:
+                if p not in visited:
+                    queue.append(p)
         return None
+
+    def _find_all_short_partners(self, ast_node: ASTNode, node: str) -> list[str]:
+        """Find all nodes that `node` is directly shorted to via V(x,y) <+ 0."""
+        partners = []
+        if ast_node is None:
+            return partners
+        if ast_node.kind == NodeKind.CONTRIB and ast_node.contrib_kind == ContribKind.V:
+            expr = ast_node.expr.strip()
+            if expr in ('0', '0.0'):
+                if node in ast_node.branch:
+                    for b in ast_node.branch:
+                        if b != node:
+                            partners.append(b)
+        if ast_node.kind in (NodeKind.BLOCK, NodeKind.IF):
+            for c in ast_node.children:
+                partners.extend(self._find_all_short_partners(c, node))
+            if ast_node.kind == NodeKind.IF and ast_node.else_body:
+                partners.extend(self._find_all_short_partners(ast_node.else_body, node))
+        return partners
 
     def _find_short_target(self, ast_node: ASTNode, internal: str) -> Optional[str]:
         """Find which node an internal node is shorted to via V(x,y) <+ 0."""
