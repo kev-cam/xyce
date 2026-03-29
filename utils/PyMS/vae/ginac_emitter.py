@@ -454,9 +454,12 @@ class GiNaCEmitter:
 
         # No parameter symbols — all params are constants at compile time
 
-        # Special symbols
-        lines.append('    symbol Vt("Vt");')
-        lines.append('    symbol temperature("temperature");')
+        # Special symbols — skip if the model declares them as variables
+        _model_vars = {v.name for v in self.mod.variables}
+        if 'Vt' not in _model_vars:
+            lines.append('    symbol Vt("Vt");')
+        if 'temperature' not in _model_vars:
+            lines.append('    symbol temperature("temperature");')
         lines.append('')
 
         # Determine active nodes by walking AST with resolved conditions
@@ -518,7 +521,9 @@ class GiNaCEmitter:
         lines.append(f'{I}cout << "void vae_eval(VaeState* s, double* F, double* Q) {{" << endl;')
         for i, n in enumerate(active_nodes):
             lines.append(f'{I}cout << "    double V_{n} = s->V[{i}];" << endl;')
-        lines.append(f'{I}cout << "    double Vt = s->Vt;" << endl;')
+        _mvars = {v.name for v in self.mod.variables}
+        if 'Vt' not in _mvars:
+            lines.append(f'{I}cout << "    double Vt = s->Vt;" << endl;')
         lines.append(f'{I}cout << endl;')
 
         # Print intermediate computations using symbol names
@@ -547,7 +552,9 @@ class GiNaCEmitter:
         lines.append(f'{I}cout << "void vae_jacobian(VaeState* s, double* dFdV, double* dQdV) {{" << endl;')
         for i, n in enumerate(active_nodes):
             lines.append(f'{I}cout << "    double V_{n} = s->V[{i}];" << endl;')
-        lines.append(f'{I}cout << "    double Vt = s->Vt;" << endl;')
+        _mvars = {v.name for v in self.mod.variables}
+        if 'Vt' not in _mvars:
+            lines.append(f'{I}cout << "    double Vt = s->Vt;" << endl;')
         lines.append(f'{I}cout << endl;')
 
         # Print intermediate computations (same as eval, with dedup)
@@ -1297,6 +1304,12 @@ class GiNaCEmitter:
             return s
         result = _wrap_ternary_numerics(result)
         result = _ternary_to_minmax(result)
+
+        # Guard: division by constant zero → replace expression with ex(0)
+        # Models like BSIM6 divide by params that can be zero (e.g. NJSD=0)
+        # but multiply the result by zero later. GiNaC crashes on the division.
+        result = re.sub(r'/\s*0\.0\b', '/ ex(1) * ex(0) ', result)
+        result = re.sub(r'/\s*\(\s*0\.0\s*\)', '/ (ex(1)) * ex(0) ', result)
 
         result = re.sub(r'\s+', ' ', result).strip()
         return result
