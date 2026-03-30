@@ -157,6 +157,8 @@ def generate_device_cpp(mod, xyce_src_dir: str) -> tuple[str, str]:
     h.append('  void *vae_dl_;')
     h.append('  VaeEvalFn vae_eval_;')
     h.append('  VaeEvalFn vae_jac_;')
+    h.append(f'  double prevV_[{n_total}];')
+    h.append('  bool hasPrevV_;')
     h.append(f'  double F_[{n_total}];')
     h.append(f'  double Q_[{n_total}];')
     h.append(f'  double dFdx_[{n_total}][{n_total}];')
@@ -256,7 +258,8 @@ def generate_device_cpp(mod, xyce_src_dir: str) -> tuple[str, str]:
     c.append('                   Model &model, const FactoryBlock &fb)')
     c.append('  : DeviceInstance(ib, config.getInstanceParameters(), fb),')
     c.append('    model_(model),')
-    c.append('    vae_dl_(nullptr), vae_eval_(nullptr), vae_jac_(nullptr)')
+    c.append('    vae_dl_(nullptr), vae_eval_(nullptr), vae_jac_(nullptr),')
+    c.append('    hasPrevV_(true)  // start with zero as "previous" for limiting')
     c.append('{')
     c.append(f'  numExtVars = {n_ext};')
     c.append(f'  numIntVars = {n_int};')
@@ -408,6 +411,12 @@ def generate_device_cpp(mod, xyce_src_dir: str) -> tuple[str, str]:
     c.append(f'    double Fb[{max(n_branches,1)}]={{}}, Qb[{max(n_branches,1)}]={{}};')
     c.append(f'    vae_eval_(&state, Fb, Qb);')
     c.append('')
+    c.append('    // Sanitize: zero out NaN/Inf from model eval')
+    c.append(f'    for (int i = 0; i < {max(n_branches,1)}; i++) {{')
+    c.append(f'      if (std::isnan(Fb[i]) || std::isinf(Fb[i])) Fb[i] = 0.0;')
+    c.append(f'      if (std::isnan(Qb[i]) || std::isinf(Qb[i])) Qb[i] = 0.0;')
+    c.append(f'    }}')
+    c.append('')
     c.append(f'    // Map branches to KCL node contributions')
     for bi, (a_idx, b_idx) in enumerate(branch_map):
         if a_idx >= 0:
@@ -422,6 +431,10 @@ def generate_device_cpp(mod, xyce_src_dir: str) -> tuple[str, str]:
     c.append(f'    // Jacobian: branch derivatives → node KCL derivatives')
     c.append(f'    double dFb[{max(n_branches*n_total,1)}]={{}}, dQb[{max(n_branches*n_total,1)}]={{}};')
     c.append(f'    vae_jac_(&state, dFb, dQb);')
+    c.append(f'    for (int i = 0; i < {max(n_branches*n_total,1)}; i++) {{')
+    c.append(f'      if (std::isnan(dFb[i]) || std::isinf(dFb[i])) dFb[i] = 0.0;')
+    c.append(f'      if (std::isnan(dQb[i]) || std::isinf(dQb[i])) dQb[i] = 0.0;')
+    c.append(f'    }}')
     for bi, (a_idx, b_idx) in enumerate(branch_map):
         for j in range(n_total):
             if a_idx >= 0:
