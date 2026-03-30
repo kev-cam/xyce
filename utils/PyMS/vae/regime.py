@@ -421,11 +421,13 @@ class RegimeCache:
     def __init__(self, va_path: str, param_values: dict[str, float],
                  given_params: Optional[set[str]] = None,
                  assume_true: Optional[set[str]] = None,
-                 cache_dir: str = "~/.vae/cache"):
+                 cache_dir: str = "~/.vae/cache",
+                 collapse_nodes: bool = True):
         self.va_path = va_path
         self.param_values = dict(param_values)
         self.given_params = given_params or set(param_values.keys())
         self.assume_true = assume_true or set()
+        self.collapse_nodes = collapse_nodes
         self.cache_dir = Path(os.path.expanduser(cache_dir))
 
         self.module: Optional[Module] = None
@@ -494,7 +496,7 @@ class RegimeCache:
         each voltage-dependent condition at the current operating point.
         """
         # Build a fresh emitter for variable tracking
-        e = GiNaCEmitter(self.module, param_values=self.param_values,
+        e = GiNaCEmitter(self.module, param_values=self.param_values, collapse_nodes=self.collapse_nodes,
                          assume_true=self.assume_true)
         e._given_params = self.given_params
 
@@ -622,7 +624,7 @@ class RegimeCache:
 
         # 1. Emit GiNaC program with forced conditions (keyed by node id)
         forced = self.analysis.forced_nodes(regime_key)
-        emitter = GiNaCEmitter(self.module, param_values=self.param_values,
+        emitter = GiNaCEmitter(self.module, param_values=self.param_values, collapse_nodes=self.collapse_nodes,
                                forced_nodes=forced,
                                assume_true=self.assume_true)
         emitter._given_params = self.given_params
@@ -701,7 +703,7 @@ extern "C" void vae_jacobian(VaeState* s, double* dFdV, double* dQdV) {{
             return str(so_path)
 
         # Build emitter with same config used for analysis
-        emitter = GiNaCEmitter(self.module, param_values=self.param_values,
+        emitter = GiNaCEmitter(self.module, param_values=self.param_values, collapse_nodes=self.collapse_nodes,
                                assume_true=self.assume_true)
         emitter._given_params = self.given_params
 
@@ -753,7 +755,7 @@ extern "C" void vae_jacobian(VaeState* s, double* dFdV, double* dQdV) {{
         _print_fn.argtypes = [ctypes.c_uint64]
 
         n_active = len([p.name for p in self.module.ports])
-        shorted = GiNaCEmitter(self.module, param_values=self.param_values,
+        shorted = GiNaCEmitter(self.module, param_values=self.param_values, collapse_nodes=self.collapse_nodes,
                                assume_true=self.assume_true) \
                       ._find_shorted_nodes(self.module.analog_block)
         for n in self.module.internal_nodes:

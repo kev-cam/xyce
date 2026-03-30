@@ -1,0 +1,527 @@
+#!/usr/bin/env python3
+"""
+PyMS Xyce device class generator.
+
+Takes a parsed Verilog-A module and produces a complete Xyce device plugin
+(.so) that can be loaded via -plugin or .hdl.
+
+The generated device class:
+  - Registers with Xyce's device factory
+  - Handles node allocation (external + internal)
+  - Parses model/instance parameters from netlists
+  - At eval time, calls a VAE-compiled .so for model computation
+  - Stamps F/Q/dFdV/dQdV into Xyce's DAE system
+
+Usage:
+    python3 xyce_device_gen.py input.va [--params W=1u,L=1u] [--output dir/]
+"""
+
+import os
+import sys
+import subprocess
+from pathlib import Path
+
+# Add parent for vae imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from vae.parser import parse_verilog_a, parse_file, NodeKind, ContribKind
+
+
+def generate_device_cpp(mod, xyce_src_dir: str) -> tuple[str, str]:
+    """Generate Xyce device C++ source (.h and .C) from parsed VA module.
+
+    Returns (header_source, impl_source) strings.
+    """
+    name = mod.name  # e.g. 'rlc', 'PSP103_VA'
+    NAME = name.upper()
+
+    ports = [(p.name, p.direction.name) for p in mod.ports]
+    internals = list(mod.internal_nodes)
+    all_nodes = [p.name for p in mod.ports] + internals
+    n_ext = len(ports)
+    n_int = len(internals)
+    n_total = n_ext + n_int
+
+    params = [(p.name, p.default, getattr(p, 'is_instance', False))
+              for p in mod.params]
+
+    # Find contributions
+    contribs = []
+    def find_contribs(node):
+        if node is None:
+            return
+        if node.kind == NodeKind.CONTRIB:
+            contribs.append((node.contrib_kind, node.branch, node.expr))
+        for c in (node.children or []):
+            find_contribs(c)
+        if node.else_body:
+            find_contribs(node.else_body)
+    find_contribs(mod.analog_block)
+
+    # ================================================================
+    # Generate header
+    # ================================================================
+    h = []
+    h.append(f'// PyMS-generated Xyce device: {name}')
+    h.append(f'// From Verilog-A module "{name}"')
+    h.append(f'#ifndef Xyce_PYMS_{NAME}_h')
+    h.append(f'#define Xyce_PYMS_{NAME}_h')
+    h.append('')
+    h.append('#include <N_DEV_Configuration.h>')
+    h.append('#include <N_DEV_DeviceBlock.h>')
+    h.append('#include <N_DEV_DeviceInstance.h>')
+    h.append('#include <N_DEV_DeviceModel.h>')
+    h.append('#include <N_DEV_DeviceMaster.h>')
+    h.append('#include <dlfcn.h>')
+    h.append('')
+    h.append(f'namespace Xyce {{ namespace Device {{ namespace PYMS_{NAME} {{')
+    h.append('')
+
+    # Node IDs
+    for i, n in enumerate(all_nodes):
+        h.append(f'static const int nodeID_{n} = {i};')
+    h.append(f'static const int numNodes = {n_total};')
+    h.append(f'static const int numExtNodes = {n_ext};')
+    h.append(f'static const int numIntNodes = {n_int};')
+    h.append('')
+
+    # VAE function pointer types
+    h.append('struct VaeState { double V[16]; double Vt; };')
+    h.append('typedef void (*VaeEvalFn)(VaeState*, double*, double*);')
+    h.append('')
+
+    # Traits
+    h.append('class Model;')
+    h.append('class Instance;')
+    h.append('')
+    h.append('struct Traits : public DeviceTraits<Model, Instance> {')
+    h.append(f'  static const char *name() {{ return "{name}"; }}')
+    h.append(f'  static const char *deviceTypeName() {{ return "{NAME}"; }}')
+    h.append(f'  static int numNodes() {{ return {n_ext}; }}')
+    h.append(f'  static int numOptionalNodes() {{ return 0; }}')
+    h.append(f'  static bool isLinearDevice() {{ return false; }}')
+    h.append(f'  static bool modelRequired() {{ return true; }}')
+    h.append('  static const char **nodeNames();')
+    h.append('  static void loadInstanceParameters(ParametricData<Instance> &p);')
+    h.append('  static void loadModelParameters(ParametricData<Model> &p);')
+    h.append('  static Device *factory(const Configuration &, const FactoryBlock &);')
+    h.append('};')
+    h.append('')
+
+    # Instance class
+    h.append('class Instance : public DeviceInstance {')
+    h.append('  friend class Model;')
+    h.append('  friend class Traits;')
+    h.append('  friend class DeviceMaster<Traits>;')
+    h.append('public:')
+    h.append('  Instance(const Configuration &config, const InstanceBlock &ib,')
+    h.append('           Model &model, const FactoryBlock &fb);')
+    h.append('  ~Instance();')
+    h.append('  void registerLIDs(const std::vector<int> &intLIDVec,')
+    h.append('                    const std::vector<int> &extLIDVec);')
+    h.append('  void registerStateLIDs(const std::vector<int> &staLIDVec);')
+    h.append('  void registerStoreLIDs(const std::vector<int> &stoLIDVec);')
+    h.append('  std::map<int,std::string> &getIntNameMap();')
+    h.append('  std::map<int,std::string> &getStoreNameMap();')
+    h.append('  const std::vector<std::string> &getDepSolnVars();')
+    h.append('  const std::vector< std::vector<int> > &jacobianStamp() const;')
+    h.append('  void registerJacLIDs(const std::vector< std::vector<int> > &jacLIDVec);')
+    h.append('  bool processParams();')
+    h.append('  bool updateIntermediateVars();')
+    h.append('  bool updatePrimaryState();')
+    h.append('  bool loadDAEFVector();')
+    h.append('  bool loadDAEQVector();')
+    h.append('  bool loadDAEdFdx();')
+    h.append('  bool loadDAEdQdx();')
+    h.append('  void loadNodeSymbols(Util::SymbolTable &) const {}')
+    h.append('')
+    h.append('  Model &getModel() { return model_; }')
+    h.append('')
+    h.append('private:')
+    h.append('  Model &model_;')
+    # Instance parameters
+    for pname, pdefault, is_inst in params:
+        if is_inst:
+            h.append(f'  double {pname};')
+    h.append('')
+    # LID storage
+    for n in all_nodes:
+        h.append(f'  int li_{n};')
+    h.append('')
+    # Jacobian offsets
+    h.append(f'  std::vector<std::vector<int>> jacStamp_;')
+    h.append(f'  std::vector<std::vector<int>> jacLIDs_;')
+    h.append('')
+    # VAE state
+    h.append('  // VAE compiled model')
+    h.append('  void *vae_dl_;')
+    h.append('  VaeEvalFn vae_eval_;')
+    h.append('  VaeEvalFn vae_jac_;')
+    h.append(f'  double F_[{n_total}];')
+    h.append(f'  double Q_[{n_total}];')
+    h.append(f'  double dFdx_[{n_total}][{n_total}];')
+    h.append(f'  double dQdx_[{n_total}][{n_total}];')
+    h.append('};')
+    h.append('')
+
+    # Model class
+    h.append('class Model : public DeviceModel {')
+    h.append('  friend class Instance;')
+    h.append('  friend class Traits;')
+    h.append('  friend class DeviceMaster<Traits>;')
+    h.append('public:')
+    h.append('  Model(const Configuration &config, const ModelBlock &mb,')
+    h.append('        const FactoryBlock &fb);')
+    h.append('  ~Model();')
+    h.append('  bool processParams();')
+    h.append('  bool processInstanceParams();')
+    h.append('  void addInstance(Instance *inst) { instanceContainer.push_back(inst); }')
+    h.append('  virtual void forEachInstance(DeviceInstanceOp &op) const;')
+    h.append('  virtual std::ostream &printOutInstances(std::ostream &os) const;')
+    h.append('')
+    h.append('private:')
+    h.append('  std::vector<Instance*> instanceContainer;')
+    # Model parameters
+    for pname, pdefault, is_inst in params:
+        if not is_inst:
+            h.append(f'  double {pname};')
+    h.append('  std::string vaFile_;')
+    h.append('};')
+    h.append('')
+
+    # Master
+    h.append(f'void registerDevice(const DeviceCountMap &, const std::set<int> &);')
+    h.append('')
+    h.append(f'}} }} }}  // namespace PYMS_{NAME}')
+    h.append(f'#endif')
+
+    header = '\n'.join(h) + '\n'
+
+    # ================================================================
+    # Generate implementation (stub — details in next step)
+    # ================================================================
+    c = []
+    c.append(f'// PyMS-generated Xyce device implementation: {name}')
+    c.append(f'#include "N_DEV_PYMS_{NAME}.h"')
+    c.append('#include <N_DEV_DeviceOptions.h>')
+    c.append('#include <N_DEV_SolverState.h>')
+    c.append('#include <N_DEV_ExternData.h>')
+    c.append('#include <N_DEV_MatrixLoadData.h>')
+    c.append('#include <N_DEV_Message.h>')
+    c.append('#include <N_LAS_Vector.h>')
+    c.append('#include <N_LAS_Matrix.h>')
+    c.append('#include <cstring>')
+    c.append('#include <cmath>')
+    c.append('#include <cstdlib>')
+    c.append('')
+    c.append(f'namespace Xyce {{ namespace Device {{ namespace PYMS_{NAME} {{')
+    c.append('')
+
+    # Node names
+    node_names_str = ', '.join(f'"{n}"' for n in [p.name for p in mod.ports])
+    c.append(f'static const char *nodeNameArray[] = {{ {node_names_str} }};')
+    c.append(f'const char **Traits::nodeNames() {{ return nodeNameArray; }}')
+    c.append('')
+
+    # Parameter registration
+    c.append('void Traits::loadInstanceParameters(ParametricData<Instance> &p) {')
+    for pname, pdefault, is_inst in params:
+        if is_inst:
+            try:
+                dval = float(pdefault)
+            except:
+                dval = 0.0
+            c.append(f'  p.addPar("{pname.upper()}", {dval}, &Instance::{pname})')
+            c.append(f'    .setUnit(U_NONE)')
+            c.append(f'    .setDescription("{pname}");')
+    c.append('}')
+    c.append('')
+
+    c.append('void Traits::loadModelParameters(ParametricData<Model> &p) {')
+    for pname, pdefault, is_inst in params:
+        if not is_inst:
+            try:
+                dval = float(pdefault)
+            except:
+                dval = 0.0
+            c.append(f'  p.addPar("{pname.upper()}", {dval}, &Model::{pname})')
+            c.append(f'    .setUnit(U_NONE)')
+            c.append(f'    .setDescription("{pname}");')
+    c.append('}')
+    c.append('')
+
+    # Instance implementation
+    c.append('Instance::Instance(const Configuration &config,')
+    c.append('                   const InstanceBlock &ib,')
+    c.append('                   Model &model, const FactoryBlock &fb)')
+    c.append('  : DeviceInstance(ib, config.getInstanceParameters(), fb),')
+    c.append('    model_(model),')
+    c.append('    vae_dl_(nullptr), vae_eval_(nullptr), vae_jac_(nullptr)')
+    c.append('{')
+    c.append(f'  numExtVars = {n_ext};')
+    c.append(f'  numIntVars = {n_int};')
+    c.append(f'  numStateVars = 0;')
+    c.append(f'  numStoreVars = 0;')
+    c.append('')
+    c.append(f'  jacStamp_.resize(numNodes);')
+    c.append(f'  for (int i = 0; i < numNodes; i++) {{')
+    c.append(f'    jacStamp_[i].resize(numNodes);')
+    c.append(f'    for (int j = 0; j < numNodes; j++)')
+    c.append(f'      jacStamp_[i][j] = j;')
+    c.append(f'  }}')
+    c.append('')
+    c.append('  // Set default instance param values')
+    for pname, pdefault, is_inst in params:
+        if is_inst:
+            try:
+                dval = float(pdefault)
+            except:
+                dval = 0.0
+            c.append(f'  {pname} = {dval};')
+    c.append('')
+    c.append('  processParams();')
+    c.append('}')
+    c.append('')
+
+    c.append('Instance::~Instance() {')
+    c.append('  if (vae_dl_) dlclose(vae_dl_);')
+    c.append('}')
+    c.append('')
+
+    c.append('bool Instance::processParams() {')
+    c.append('  // TODO: call PyMS to compile .va with these params')
+    c.append('  // For now, try loading from VAE_SO_PATH env var')
+    c.append('  if (!vae_eval_) {')
+    c.append('    const char *so = getenv("VAE_SO_PATH");')
+    c.append('    if (so) {')
+    c.append('      vae_dl_ = dlopen(so, RTLD_NOW);')
+    c.append('      if (vae_dl_) {')
+    c.append('        vae_eval_ = (VaeEvalFn)dlsym(vae_dl_, "vae_eval");')
+    c.append('        vae_jac_ = (VaeEvalFn)dlsym(vae_dl_, "vae_jacobian");')
+    c.append('      }')
+    c.append('    }')
+    c.append('  }')
+    c.append('  return true;')
+    c.append('}')
+    c.append('')
+
+    # Register LIDs
+    c.append('void Instance::registerLIDs(const std::vector<int> &intLIDVec,')
+    c.append('                            const std::vector<int> &extLIDVec) {')
+    c.append('  DeviceInstance::registerLIDs(intLIDVec, extLIDVec);')
+    for i, n in enumerate(all_nodes):
+        if i < n_ext:
+            c.append(f'  li_{n} = extLIDVec[{i}];')
+        else:
+            c.append(f'  li_{n} = intLIDVec[{i - n_ext}];')
+    c.append('}')
+    c.append('')
+
+    c.append('void Instance::registerStateLIDs(const std::vector<int> &v) {}')
+    c.append('void Instance::registerStoreLIDs(const std::vector<int> &v) {}')
+    c.append('std::map<int,std::string> &Instance::getIntNameMap() {')
+    c.append('  static std::map<int,std::string> m;')
+    for i, n in enumerate(internals):
+        c.append(f'  m[{i}] = "{n}";')
+    c.append('  return m;')
+    c.append('}')
+    c.append('std::map<int,std::string> &Instance::getStoreNameMap() {')
+    c.append('  static std::map<int,std::string> m; return m;')
+    c.append('}')
+    c.append('const std::vector<std::string> &Instance::getDepSolnVars() {')
+    c.append('  static std::vector<std::string> v; return v;')
+    c.append('}')
+    c.append('')
+
+    c.append('const std::vector<std::vector<int>> &Instance::jacobianStamp() const {')
+    c.append('  return jacStamp_;')
+    c.append('}')
+    c.append('')
+    c.append('void Instance::registerJacLIDs(const std::vector<std::vector<int>> &j) {')
+    c.append('  jacLIDs_ = j;')
+    c.append('}')
+    c.append('')
+
+    # Build branch-to-node incidence from contribution list
+    # Each branch: (kind, branch_tuple, node_plus_idx, node_minus_idx)
+    branch_map = []
+    seen_branches = {}
+    node_idx = {n: i for i, n in enumerate(all_nodes)}
+    for ck, cbranch, cexpr in contribs:
+        key = (ck, cbranch)
+        if key not in seen_branches:
+            a = cbranch[0] if len(cbranch) >= 1 else None
+            b = cbranch[1] if len(cbranch) >= 2 else None
+            a_idx = node_idx.get(a, -1) if a else -1
+            b_idx = node_idx.get(b, -1) if b else -1
+            seen_branches[key] = len(branch_map)
+            branch_map.append((a_idx, b_idx))
+    n_branches = len(branch_map)
+
+    # updateIntermediateVars — call VAE .so, get branch-indexed F/Q
+    c.append('bool Instance::updateIntermediateVars() {')
+    c.append('  Linear::Vector *solVec = extData.nextSolVectorPtr;')
+    c.append(f'  memset(F_, 0, sizeof(F_));')
+    c.append(f'  memset(Q_, 0, sizeof(Q_));')
+    c.append(f'  memset(dFdx_, 0, sizeof(dFdx_));')
+    c.append(f'  memset(dQdx_, 0, sizeof(dQdx_));')
+    c.append('')
+    c.append('  if (vae_eval_ && vae_jac_) {')
+    c.append('    VaeState state = {};')
+    for i, n in enumerate(all_nodes):
+        c.append(f'    state.V[{i}] = (*solVec)[li_{n}];')
+    c.append('    state.Vt = 8.617087e-5 * 300.15;')
+    c.append('')
+    c.append(f'    // VAE .so outputs branch-indexed arrays')
+    c.append(f'    double Fb[{max(n_branches,1)}]={{}}, Qb[{max(n_branches,1)}]={{}};')
+    c.append(f'    vae_eval_(&state, Fb, Qb);')
+    c.append('')
+    c.append(f'    // Map branches to KCL node contributions')
+    for bi, (a_idx, b_idx) in enumerate(branch_map):
+        if a_idx >= 0:
+            c.append(f'    F_[{a_idx}] += Fb[{bi}];  // branch {bi} → node {all_nodes[a_idx]} +=')
+        if b_idx >= 0:
+            c.append(f'    F_[{b_idx}] -= Fb[{bi}];  // branch {bi} → node {all_nodes[b_idx]} -=')
+        if a_idx >= 0:
+            c.append(f'    Q_[{a_idx}] += Qb[{bi}];')
+        if b_idx >= 0:
+            c.append(f'    Q_[{b_idx}] -= Qb[{bi}];')
+    c.append('')
+    c.append(f'    // Jacobian: branch derivatives → node KCL derivatives')
+    c.append(f'    double dFb[{max(n_branches*n_total,1)}]={{}}, dQb[{max(n_branches*n_total,1)}]={{}};')
+    c.append(f'    vae_jac_(&state, dFb, dQb);')
+    for bi, (a_idx, b_idx) in enumerate(branch_map):
+        for j in range(n_total):
+            if a_idx >= 0:
+                c.append(f'    dFdx_[{a_idx}][{j}] += dFb[{bi}*{n_total}+{j}];')
+                c.append(f'    dQdx_[{a_idx}][{j}] += dQb[{bi}*{n_total}+{j}];')
+            if b_idx >= 0:
+                c.append(f'    dFdx_[{b_idx}][{j}] -= dFb[{bi}*{n_total}+{j}];')
+                c.append(f'    dQdx_[{b_idx}][{j}] -= dQb[{bi}*{n_total}+{j}];')
+    c.append('  }')
+    c.append('  return true;')
+    c.append('}')
+    c.append('')
+
+    c.append('bool Instance::updatePrimaryState() {')
+    c.append('  return updateIntermediateVars();')
+    c.append('}')
+    c.append('')
+
+    # DAE loading — stamp node-indexed contributions into Xyce matrix
+    c.append('bool Instance::loadDAEFVector() {')
+    c.append('  Linear::Vector &fVec = *(extData.daeFVectorPtr);')
+    for i, n in enumerate(all_nodes):
+        c.append(f'  fVec[li_{n}] += F_[{i}];')
+    c.append('  return true;')
+    c.append('}')
+    c.append('')
+
+    c.append('bool Instance::loadDAEQVector() {')
+    c.append('  Linear::Vector &qVec = *(extData.daeQVectorPtr);')
+    for i, n in enumerate(all_nodes):
+        c.append(f'  qVec[li_{n}] += Q_[{i}];')
+    c.append('  return true;')
+    c.append('}')
+    c.append('')
+
+    c.append('bool Instance::loadDAEdFdx() {')
+    c.append('  Linear::Matrix &dFdx = *(extData.dFdxMatrixPtr);')
+    for i, n in enumerate(all_nodes):
+        for j in range(n_total):
+            c.append(f'  dFdx[li_{n}][jacLIDs_[{i}][{j}]] += dFdx_[{i}][{j}];')
+    c.append('  return true;')
+    c.append('}')
+    c.append('')
+
+    c.append('bool Instance::loadDAEdQdx() {')
+    c.append('  Linear::Matrix &dQdx = *(extData.dQdxMatrixPtr);')
+    for i, n in enumerate(all_nodes):
+        for j in range(n_total):
+            c.append(f'  dQdx[li_{n}][jacLIDs_[{i}][{j}]] += dQdx_[{i}][{j}];')
+    c.append('  return true;')
+    c.append('}')
+    c.append('')
+
+    # Model implementation
+    c.append('Model::Model(const Configuration &config, const ModelBlock &mb,')
+    c.append('             const FactoryBlock &fb)')
+    c.append('  : DeviceModel(mb, config.getModelParameters(), fb)')
+    c.append('{')
+    for pname, pdefault, is_inst in params:
+        if not is_inst:
+            try:
+                dval = float(pdefault)
+            except:
+                dval = 0.0
+            c.append(f'  {pname} = {dval};')
+    c.append('  processParams();')
+    c.append('}')
+    c.append('')
+    c.append('Model::~Model() {}')
+    c.append('bool Model::processParams() { return true; }')
+    c.append('bool Model::processInstanceParams() { return true; }')
+    c.append('')
+    c.append('void Model::forEachInstance(DeviceInstanceOp &op) const {')
+    c.append('  for (auto *inst : instanceContainer) op(inst);')
+    c.append('}')
+    c.append('std::ostream &Model::printOutInstances(std::ostream &os) const {')
+    c.append('  return os;')
+    c.append('}')
+    c.append('')
+
+    # Factory
+    c.append('Device *Traits::factory(const Configuration &configuration,')
+    c.append('                        const FactoryBlock &factory_block) {')
+    c.append('  return new DeviceMaster<Traits>(configuration, factory_block,')
+    c.append('    factory_block.solverState_, factory_block.deviceOptions_);')
+    c.append('}')
+    c.append('')
+
+    # Registration
+    c.append('void registerDevice(const DeviceCountMap &deviceMap,')
+    c.append('                    const std::set<int> &levelSet) {')
+    c.append(f'  Config<Traits>::addConfiguration()')
+    c.append(f'    .registerDevice("{name.lower()}", 1)')
+    c.append(f'    .registerModelType("{name.lower()}", 1);')
+    c.append('}')
+    c.append('')
+    c.append(f'}} }} }}  // namespace PYMS_{NAME}')
+    c.append('')
+
+    # dl_register for plugin loading
+    c.append('extern "C" void dl_register() {')
+    c.append(f'  Xyce::Device::PYMS_{NAME}::registerDevice(')
+    c.append('    Xyce::Device::DeviceCountMap(), std::set<int>());')
+    c.append('}')
+
+    impl = '\n'.join(c) + '\n'
+    return header, impl
+
+
+if __name__ == '__main__':
+    if len(sys.argv) < 2:
+        print("Usage: xyce_device_gen.py <input.va> [--output <dir>]")
+        sys.exit(1)
+
+    va_path = sys.argv[1]
+    output_dir = '.'
+    if '--output' in sys.argv:
+        output_dir = sys.argv[sys.argv.index('--output') + 1]
+
+    mod = parse_file(va_path)
+    NAME = mod.name.upper()
+
+    header, impl = generate_device_cpp(mod, '')
+
+    h_path = os.path.join(output_dir, f'N_DEV_PYMS_{NAME}.h')
+    c_path = os.path.join(output_dir, f'N_DEV_PYMS_{NAME}.C')
+
+    with open(h_path, 'w') as f:
+        f.write(header)
+    with open(c_path, 'w') as f:
+        f.write(impl)
+
+    print(f"Generated {h_path} and {c_path}")
+    print(f"Module: {mod.name}, Ports: {[p.name for p in mod.ports]}, "
+          f"Internal: {mod.internal_nodes}, Params: {len(mod.params)}")

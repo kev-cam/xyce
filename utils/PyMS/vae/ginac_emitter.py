@@ -69,7 +69,8 @@ class GiNaCEmitter:
                  line_directives: Optional[bool] = None,
                  forced_conditions: Optional[dict[int, bool]] = None,
                  forced_nodes: Optional[dict[int, bool]] = None,
-                 assume_true: Optional[set[str]] = None):
+                 assume_true: Optional[set[str]] = None,
+                 collapse_nodes: bool = True):
         """
         Args:
             module: Parsed Verilog-A module AST.
@@ -91,6 +92,7 @@ class GiNaCEmitter:
         self.internal_nodes = list(module.internal_nodes)
         self.all_nodes = self.port_names + self.internal_nodes
         self.branch_map = dict(module.branch_map)  # branch_name → node_name
+        self.collapse_nodes = collapse_nodes
         self.line_directives = line_directives
 
         # Build parameter value map: name → numeric value
@@ -464,7 +466,10 @@ class GiNaCEmitter:
 
         # Determine active nodes by walking AST with resolved conditions
         active_nodes = list(self.port_names)
-        shorted = self._find_shorted_nodes(self.mod.analog_block)
+        if self.collapse_nodes:
+            shorted = self._find_shorted_nodes(self.mod.analog_block)
+        else:
+            shorted = set()  # keep all nodes active for Xyce integration
         for n in self.internal_nodes:
             if n not in shorted:
                 active_nodes.append(n)

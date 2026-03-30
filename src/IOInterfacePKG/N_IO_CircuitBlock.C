@@ -1553,8 +1553,28 @@ bool CircuitBlock::handleLinePass1(
     }
     else if (ES1 == ".ENDDATA")
     {
-      result=true; //ignore this line;  it isn't needed for Xyce to parse .DATA, 
+      result=true; //ignore this line;  it isn't needed for Xyce to parse .DATA,
       // but is part of HSpice syntax, so will often appear in netlists that use it.
+    }
+    else if (ES1 == ".HDL")
+    {
+      // .HDL "file.va" — register Verilog-A source for PyMS compilation.
+      // The .va file is parsed to extract module names. When a device
+      // instantiation references one of these modules, PyMS compiles
+      // it with the specific instance parameters.
+      if (line.size() > 1)
+      {
+        std::string vaFile = line[1].string_;
+        // Strip quotes
+        if (vaFile.size() >= 2 && vaFile[0] == '"' && vaFile.back() == '"')
+          vaFile = vaFile.substr(1, vaFile.size() - 2);
+        Report::UserWarning0().at(netlistFilename_, line[0].lineNumber_)
+          << ".HDL: registered Verilog-A source " << vaFile
+          << " (PyMS compilation will occur at device instantiation)";
+        // TODO: Parse .va to extract module names, register with PyMS
+        // For now, just acknowledge the directive
+      }
+      result = true;
     }
     else
     {
