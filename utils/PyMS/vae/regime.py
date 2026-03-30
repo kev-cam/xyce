@@ -665,7 +665,7 @@ class RegimeCache:
 #include <cstring>
 
 struct VaeState {{
-    double V[{n_nodes}];
+    double V[16];  // fixed size for ABI compatibility
     double Vt;
 }};
 
