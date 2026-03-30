@@ -446,7 +446,7 @@ def generate_device_cpp(mod, xyce_src_dir: str) -> tuple[str, str]:
     c.append('  }')
     c.append('')
     c.append('  // Add gmin conductance to prevent singular matrix')
-    c.append('  const double gmin = 1e-12;')
+    c.append('  const double gmin = 1e-3;  // large gmin for initial convergence')
     c.append('  Linear::Vector *solVec2 = extData.nextSolVectorPtr;')
     for i, n in enumerate(all_nodes):
         c.append(f'  F_[{i}] += gmin * (*solVec2)[li_{n}];')
