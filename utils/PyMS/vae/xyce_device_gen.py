@@ -343,17 +343,43 @@ def generate_device_cpp(mod, xyce_src_dir: str) -> tuple[str, str]:
     c.append('')
 
     # Build branch-to-node incidence from contribution list
-    # Each branch: (kind, branch_tuple, node_plus_idx, node_minus_idx)
+    # When nodes are collapsed, map internal names to their external equivalents
+    # (e.g. DI→D, SI→S, GP→G when series resistance is zero)
     branch_map = []
     seen_branches = {}
     node_idx = {n: i for i, n in enumerate(all_nodes)}
+
+    # Build collapse map: for branch node names not in all_nodes,
+    # find their target via V(a,b)<+0 shorting relationships
+    from vae.ginac_emitter import GiNaCEmitter
+    _unknown_nodes = set()
+    for ck, cbranch, cexpr in contribs:
+        for bn in cbranch:
+            if bn and bn not in node_idx:
+                _unknown_nodes.add(bn)
+    _emitter = GiNaCEmitter(mod, param_values={})
+    collapse_map = {}
+    for n in _unknown_nodes:
+        target = _emitter._resolve_shorted_node(n, all_nodes)
+        if target and target in node_idx:
+            collapse_map[n] = target
+
+    def resolve_node(name):
+        if name is None:
+            return -1
+        if name in node_idx:
+            return node_idx[name]
+        if name in collapse_map:
+            return node_idx[collapse_map[name]]
+        return -1
+
     for ck, cbranch, cexpr in contribs:
         key = (ck, cbranch)
         if key not in seen_branches:
             a = cbranch[0] if len(cbranch) >= 1 else None
             b = cbranch[1] if len(cbranch) >= 2 else None
-            a_idx = node_idx.get(a, -1) if a else -1
-            b_idx = node_idx.get(b, -1) if b else -1
+            a_idx = resolve_node(a)
+            b_idx = resolve_node(b)
             seen_branches[key] = len(branch_map)
             branch_map.append((a_idx, b_idx))
     n_branches = len(branch_map)
