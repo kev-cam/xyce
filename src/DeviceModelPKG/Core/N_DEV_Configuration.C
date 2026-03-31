@@ -238,8 +238,13 @@ Configuration::addDevice(
   if (model_type_id == model_group_id) {
     std::pair<NameEntityTypeIdMap::iterator, bool> result = getData().modelTypeNameModelGroupMap_.insert(NameEntityTypeIdMap::value_type(model_name, model_type_id));
     if (!result.second && (*result.first).second != model_type_id)
-      Report::DevelFatal0().in("Configuration::addDevice")
-        << "Attempt to register more than one device model group to the name " << model_name;
+    {
+      // Last-one-sticks: allow later registrations (e.g. PyMS .hdl) to
+      // override earlier ones (e.g. compiled-in ADMS models).
+      Report::UserWarning0()
+        << "Device model group '" << model_name << "' re-registered (overriding previous definition)";
+      (*result.first).second = model_type_id;
+    }
   }
   else {
     if (model_type_nodes < model_group_nodes) {
@@ -253,19 +258,15 @@ Configuration::addDevice(
   {
     std::pair<ConfigurationMap::iterator, bool> result
       = getData().configurationMap_.insert(ConfigurationMap::value_type(NameLevelKey(model_name, model_level), this));
-//    if (!result.second)
-//      Report::DevelFatal0().in("Configuration::addDevice")
-//        << "Device with name " << model_name << " level " << model_level
-//        << " already registered as " << (*result.first).second->getName();
+    if (!result.second)
+      (*result.first).second = this;  // last-one-sticks override
   }
 
   {
     std::pair<EntityTypeIdConfigurationMap::iterator, bool> result
       = getData().modelTypeConfigurationMap_.insert(EntityTypeIdConfigurationMap::value_type(model_type_id, this));
-//    if (!result.second && (*result.first).second != this)
- //     Report::DevelFatal().in("Configuration::addDevice")
-//        << "Model " << demangle(model_type_id.type().name()) << " already registered to device " << (*result.first).second->getName()
-//        << " while trying to register with device " << model_name << " level " << model_level;
+    if (!result.second && (*result.first).second != this)
+      (*result.first).second = this;  // last-one-sticks override
   }
 }
 
@@ -288,14 +289,13 @@ Configuration::addModel(
   if (model_type_id == model_group_id) {
     std::pair<NameEntityTypeIdMap::iterator, bool> result = getData().modelTypeNameModelGroupMap_.insert(NameEntityTypeIdMap::value_type(model_name, model_type_id));
     if (!result.second && (*result.first).second != model_type_id)
-      Report::DevelFatal0().in("Configuration::addDevice")
-        << "Attempt to register more than one device model group to the name " << model_name;
+      (*result.first).second = model_type_id;  // last-one-sticks
   }
 
   std::pair<NameLevelKeyEntityTypeIdMap::iterator, bool> result
     = getData().modelTypeNameLevelModelTypeMap_.insert(NameLevelKeyEntityTypeIdMap::value_type(NameLevelKey(model_name, level), model_type_id));
   if (!result.second && (*result.first).second != model_type_id)
-    Report::DevelFatal0() << "Attempt to register more than one model type to the device " << model_name << " level " << level;
+    (*result.first).second = model_type_id;  // last-one-sticks
 
   if (std::find_if(modelTypeNames_.begin(), modelTypeNames_.end(), EqualNoCasePred(model_name)) == modelTypeNames_.end())
     modelTypeNames_.push_back(model_name);

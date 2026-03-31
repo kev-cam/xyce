@@ -56,8 +56,19 @@ struct PyMSHandle {
     }
 };
 
-// Global registry: .hdl "file.va" → path
-// Populated by netlist parser when .HDL is encountered
+// .HDL handler: compile Verilog-A via PyMS and register device(s).
+//
+// Called from the netlist parser when .HDL "file.va" is encountered.
+// Invokes xyce_device_gen.py to parse the VA → generate C++ → compile
+// to .so → dlopen (constructor auto-registers the device type).
+//
+// The device wrapper .so is compiled once per module.  The per-instance
+// VAE math .so is compiled later in processParams() for each unique
+// parameter set.
+//
+// Returns true if compilation and registration succeeded.
+bool pyms_register_hdl(const std::string &va_path);
+
 void pyms_register_va(const std::string &module_name, const std::string &va_path);
 const std::string &pyms_get_va(const std::string &module_name);
 bool pyms_has_va(const std::string &module_name);

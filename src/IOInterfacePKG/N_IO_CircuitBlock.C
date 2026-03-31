@@ -53,6 +53,7 @@
 
 #include <N_DEV_Configuration.h>
 #include <N_DEV_DeviceMgr.h>
+#include <N_DEV_PyMS.h>
 #include <N_ERH_ErrorMgr.h>
 #include <N_IO_CircuitBlock.h>
 #include <N_IO_CircuitContext.h>
@@ -1558,21 +1559,26 @@ bool CircuitBlock::handleLinePass1(
     }
     else if (ES1 == ".HDL")
     {
-      // .HDL "file.va" — register Verilog-A source for PyMS compilation.
-      // The .va file is parsed to extract module names. When a device
-      // instantiation references one of these modules, PyMS compiles
-      // it with the specific instance parameters.
-      if (line.size() > 1)
+      // .HDL "file.va" — compile Verilog-A via PyMS and register device.
+      // With -adms flag, ignore .hdl and use compiled-in ADMS models instead.
+      if (commandLine_.argExists("-adms"))
+      {
+        // ADMS fallback: ignore .hdl, compiled-in models handle the device
+        result = true;
+      }
+      else if (line.size() > 1)
       {
         std::string vaFile = line[1].string_;
-        // Strip quotes
         if (vaFile.size() >= 2 && vaFile[0] == '"' && vaFile.back() == '"')
           vaFile = vaFile.substr(1, vaFile.size() - 2);
-        Report::UserWarning0().at(netlistFilename_, line[0].lineNumber_)
-          << ".HDL: registered Verilog-A source " << vaFile
-          << " (PyMS compilation will occur at device instantiation)";
-        // TODO: Parse .va to extract module names, register with PyMS
-        // For now, just acknowledge the directive
+        if (!Device::pyms_register_hdl(vaFile))
+          result = false;
+      }
+      else
+      {
+        Report::UserError().at(netlistFilename_, line[0].lineNumber_)
+          << ".HDL requires a Verilog-A file path";
+        result = false;
       }
       result = true;
     }

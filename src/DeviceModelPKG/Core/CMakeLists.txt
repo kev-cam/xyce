@@ -19,6 +19,7 @@
 target_sources(XyceLib PRIVATE
 #      ${BISON_XyceReactionParser_OUTPUTS}
       N_DEV_RegisterDevices.C
+      N_DEV_PyMS.C
       N_DEV_DeviceInstance.C
       N_DEV_DeviceBlock.C
       N_DEV_DeviceState.C

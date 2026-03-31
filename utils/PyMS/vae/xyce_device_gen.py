@@ -27,13 +27,36 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from vae.parser import parse_verilog_a, parse_file, NodeKind, ContribKind
 
 
-def generate_device_cpp(mod, xyce_src_dir: str) -> tuple[str, str]:
+def scan_va_attributes(va_path: str) -> dict:
+    """Extract (* key=value *) attributes from a Verilog-A module declaration."""
+    attrs = {}
+    if not va_path or not os.path.exists(va_path):
+        return attrs
+    import re
+    with open(va_path, 'r', errors='replace') as f:
+        text = f.read()
+    # Find module ... (* ... *) pattern
+    m = re.search(r'module\s+\w+\s*\([^)]*\)\s*\(\*([^*]*)\*\)', text)
+    if m:
+        attr_str = m.group(1)
+        for am in re.finditer(r'(\w+)\s*=\s*"([^"]*)"', attr_str):
+            attrs[am.group(1)] = am.group(2)
+    return attrs
+
+
+def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str, str]:
     """Generate Xyce device C++ source (.h and .C) from parsed VA module.
 
     Returns (header_source, impl_source) strings.
     """
     name = mod.name  # e.g. 'rlc', 'PSP103_VA'
     NAME = name.upper()
+
+    # Extract Xyce ADMS-style attributes from the VA source
+    va_attrs = scan_va_attributes(va_path)
+    model_group = va_attrs.get('xyceModelGroup', '')  # e.g. "MOSFET", "Diode"
+    level_number = va_attrs.get('xyceLevelNumber', '')  # e.g. "77"
+    type_variable = va_attrs.get('xyceTypeVariable', '')  # e.g. "TYPE"
 
     ports = [(p.name, p.direction.name) for p in mod.ports]
     internals = list(mod.internal_nodes)
@@ -531,19 +554,37 @@ def generate_device_cpp(mod, xyce_src_dir: str) -> tuple[str, str]:
     c.append('}')
     c.append('')
 
-    # Registration
+    # Registration — use ADMS attributes if available so .model cards resolve
+    # e.g. xyceModelGroup="MOSFET" → register as "m" with "nmos"/"pmos" model types
     c.append('void registerDevice(const DeviceCountMap &deviceMap,')
     c.append('                    const std::set<int> &levelSet) {')
-    c.append(f'  Config<Traits>::addConfiguration()')
-    c.append(f'    .registerDevice("{name.lower()}", 1)')
-    c.append(f'    .registerModelType("{name.lower()}", 1);')
+    if model_group.upper() == 'MOSFET' and level_number:
+        # Register as a MOSFET level, matching ADMS convention
+        c.append(f'  Config<Traits>::addConfiguration()')
+        c.append(f'    .registerDevice("m", {level_number})')
+        c.append(f'    .registerModelType("nmos", {level_number})')
+        c.append(f'    .registerModelType("pmos", {level_number});')
+    elif model_group.upper() == 'DIODE' and level_number:
+        c.append(f'  Config<Traits>::addConfiguration()')
+        c.append(f'    .registerDevice("d", {level_number})')
+        c.append(f'    .registerModelType("d", {level_number});')
+    elif model_group.upper() == 'BJT' and level_number:
+        c.append(f'  Config<Traits>::addConfiguration()')
+        c.append(f'    .registerDevice("q", {level_number})')
+        c.append(f'    .registerModelType("npn", {level_number})')
+        c.append(f'    .registerModelType("pnp", {level_number});')
+    else:
+        # Generic Y device — register with module name
+        c.append(f'  Config<Traits>::addConfiguration()')
+        c.append(f'    .registerDevice("{name.lower()}", 1)')
+        c.append(f'    .registerModelType("{name.lower()}", 1);')
     c.append('}')
     c.append('')
     c.append(f'}} }} }}  // namespace PYMS_{NAME}')
     c.append('')
 
-    # dl_register for plugin loading
-    c.append('extern "C" void dl_register() {')
+    # Auto-register on dlopen via constructor attribute
+    c.append('__attribute__((constructor)) static void pyms_register() {')
     c.append(f'  Xyce::Device::PYMS_{NAME}::registerDevice(')
     c.append('    Xyce::Device::DeviceCountMap(), std::set<int>());')
     c.append('}')
@@ -565,7 +606,7 @@ if __name__ == '__main__':
     mod = parse_file(va_path)
     NAME = mod.name.upper()
 
-    header, impl = generate_device_cpp(mod, '')
+    header, impl = generate_device_cpp(mod, '', va_path=va_path)
 
     h_path = os.path.join(output_dir, f'N_DEV_PYMS_{NAME}.h')
     c_path = os.path.join(output_dir, f'N_DEV_PYMS_{NAME}.C')

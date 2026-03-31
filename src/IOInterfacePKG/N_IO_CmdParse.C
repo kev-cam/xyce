@@ -213,6 +213,7 @@ void usage(std::ostream &os)
      << "  -r <file>                   generate a rawfile named <file> in binary format\n"
      << "  -a                          use with -r <file> to output in ascii format\n"
      << "  -randseed <number>          seed random number generator used by expressions and sampling methods\n"
+     << "  -adms                       use compiled-in ADMS models (ignore .hdl directives)\n"
 
 #ifdef HAVE_DLFCN_H
      << "  -plugin <plugin list>       load device plugin libraries (comma-separated list)\n"
@@ -355,7 +356,8 @@ CmdParse::setCommandArgs()
   stArgs[ "-r" ] = "";                  // Output binary rawfile.
   swArgs[ "-a" ] = 0;                   // Use ascii instead of binary in rawfile output
   stArgs[ "-randseed" ] = "";           // random number seed
-  
+  swArgs[ "-adms" ] = 0;                // use compiled-in ADMS models, ignore .hdl
+
 #ifdef HAVE_DLFCN_H
   stArgs[ "-plugin" ] = "";
 #endif
