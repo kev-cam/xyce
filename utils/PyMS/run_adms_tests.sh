@@ -45,7 +45,7 @@ prepare_test() {
         [[ -f "$dep" ]] && cp "$dep" "$testdir/" 2>/dev/null
     done
     for vadir in "$dir/../code" "$dir/../../code" "$dir/.."; do
-        [[ -d "$vadir" ]] && find "$vadir" -maxdepth 1 -name "*.va" -exec cp {} "$testdir/" \; 2>/dev/null
+        [[ -d "$vadir" ]] && find "$vadir" -maxdepth 1 \( -name "*.va" -o -name "*.include" \) -exec cp {} "$testdir/" \; 2>/dev/null
     done
 
     # Run preprocessor on the copy (modifies modelcards in testdir)

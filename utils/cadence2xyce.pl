@@ -151,6 +151,25 @@ for my $line (@lines) {
         next;
     }
 
+    # .hdl "file.va" — produce inlined VA with all `includes resolved
+    if ($l =~ /^\s*\.hdl\s+"?([^"\s]+)"?/i) {
+        my $va_file = $1;
+        my $va_path = find_va_file($va_file);
+        if ($va_path && -f $va_path) {
+            my $inlined = inline_va($va_path);
+            my $out_dir = $opt_output ? dirname($opt_output) : '.';
+            my $inlined_name = basename($va_file, '.va') . '_inlined.va';
+            my $inlined_path = "$out_dir/$inlined_name";
+            open my $vfh, '>', $inlined_path or warn "Cannot write $inlined_path: $!\n";
+            if ($vfh) {
+                print $vfh $inlined;
+                close $vfh;
+                $l = ".hdl \"$inlined_name\"";
+                verbose("  Inlined $va_file → $inlined_name");
+            }
+        }
+    }
+
     # dc=val → dc val (Cadence voltage source syntax)
     $l =~ s/\bdc\s*=\s*(\S+)/dc $1/gi;
     $l =~ s/\bac\s*=\s*(\S+)/ac $1/gi;
@@ -268,6 +287,15 @@ for my $line (@lines) {
     push @output, "$l\n";
 }
 
+# Post-processing: fix .PRINT lines with Cadence {expr} references
+for my $ol (@output) {
+    if ($ol =~ /^\s*\.print\b/i && $ol =~ /\{/) {
+        # Strip {expr} probe aliases — replace entire .print with simple form
+        my ($analysis) = $ol =~ /\.print\s+(\S+)/i;
+        $ol = ".PRINT $analysis V(*) I(*)\n" if $analysis;
+    }
+}
+
 # Post-processing: ensure .PRINT exists
 my $has_print = grep { /^\s*\.print\b/i } @output;
 unless ($has_print) {
@@ -310,6 +338,54 @@ if ($opt_inplace) {
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+sub find_va_file {
+    my ($va_file) = @_;
+    return $va_file if -f $va_file;
+    for my $try ("$input_dir/$va_file",
+                 "$input_dir/../code/$va_file",
+                 "$input_dir/../../code/$va_file",
+                 "$input_dir/../$va_file") {
+        return $try if -f $try;
+    }
+    return undef;
+}
+
+sub inline_va {
+    # Recursively inline `include directives in a VA file.
+    my ($va_path, $seen) = @_;
+    $seen //= {};
+    return "// [cadence2xyce] skipped circular include: $va_path\n"
+        if $seen->{$va_path}++;
+
+    open my $fh, '<', $va_path or return "// [cadence2xyce] cannot read $va_path\n";
+    my $dir = dirname($va_path);
+    my $out = '';
+    while (<$fh>) {
+        s/\r//g;
+        if (/^\s*`include\s+"([^"]+)"/) {
+            my $inc = $1;
+            # Skip standard discipline/constants includes (Xyce provides them)
+            if ($inc =~ /^(disciplines|constants)\.vams$/) {
+                $out .= $_;
+                next;
+            }
+            my $inc_path = "$dir/$inc";
+            if (-f $inc_path) {
+                $out .= "// [cadence2xyce] inlined from $inc\n";
+                $out .= inline_va($inc_path, $seen);
+                $out .= "// [cadence2xyce] end $inc\n";
+            } else {
+                $out .= "// [cadence2xyce] include not found: $inc\n";
+                $out .= $_;
+            }
+        } else {
+            $out .= $_;
+        }
+    }
+    close $fh;
+    return $out;
+}
 
 sub scan_va_modules {
     my ($va_path) = @_;
