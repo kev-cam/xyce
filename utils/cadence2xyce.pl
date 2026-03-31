@@ -100,6 +100,16 @@ for my $line (@joined) {
                 $hdl_modules{lc $m->{name}} = $m;
                 verbose("  .hdl module: $m->{name} ($m->{ports} ports) from $va_path");
             }
+            # Also register the .hdl filename stem as an alias for the first module
+            # This handles cases where .model references the file stem (e.g. "bsimcmg")
+            # but the module has a versioned name (e.g. "bsimcmg_108")
+            if (@mods) {
+                my $stem = lc basename($va_file, '.va');
+                unless (exists $hdl_modules{$stem}) {
+                    $hdl_modules{$stem} = $mods[0];
+                    verbose("  .hdl alias: $stem → $mods[0]{name}");
+                }
+            }
         } else {
             warn "cadence2xyce: .hdl file not found: $va_file\n";
         }
@@ -145,8 +155,13 @@ for my $line (@lines) {
     $l =~ s/\bdc\s*=\s*(\S+)/dc $1/gi;
     $l =~ s/\bac\s*=\s*(\S+)/ac $1/gi;
 
-    # par'expr' → {expr} (Cadence expression syntax)
-    $l =~ s/par'([^']+)'/{$1}/g;
+    # par'expr' → {expr} (Cadence expression syntax, with or without space)
+    $l =~ s/\bpar\s*'([^']+)'/{$1}/gi;
+
+    # .temp N → .OPTIONS DEVICE TEMP=N (Cadence temperature syntax)
+    if ($l =~ /^\s*\.temp\s+(\S+)/i) {
+        $l = ".OPTIONS DEVICE TEMP=$1";
+    }
 
     # .model name moduletype → .model name xyce_type level=N
     # when moduletype matches a .hdl-registered module with ADMS attributes
@@ -158,7 +173,7 @@ for my $line (@lines) {
             my $xyce_type;
             if    ($group eq 'MOSFET') { $xyce_type = ($rest =~ /TYPE\s*=\s*0/i) ? 'pmos' : 'nmos' }
             elsif ($group eq 'DIODE')  { $xyce_type = 'd' }
-            elsif ($group eq 'BJT')    { $xyce_type = ($rest =~ /TYPE\s*=\s*0/i) ? 'pnp' : 'npn' }
+            elsif ($group eq 'BJT')    { $xyce_type = ($rest =~ /(?:DEV)?TYPE\s*=\s*0/i) ? 'pnp' : 'npn' }
             else                       { $xyce_type = lc $mtype }
             $l = ".model $mname $xyce_type level=$mod->{level}$rest";
             verbose("  .model $mname: $mtype → $xyce_type level=$mod->{level}");
@@ -183,9 +198,9 @@ for my $line (@lines) {
                     if ($imod && $imod->{level}) {
                         my $ig = uc($imod->{group} // '');
                         my $xt;
-                        if    ($ig eq 'MOSFET') { $xt = ($r =~ /TYPE\s*=\s*0/i) ? 'pmos' : 'nmos' }
+                        if    ($ig eq 'MOSFET') { $xt = ($r =~ /(?:DEV)?TYPE\s*=\s*0/i) ? 'pmos' : 'nmos' }
                         elsif ($ig eq 'DIODE')  { $xt = 'd' }
-                        elsif ($ig eq 'BJT')    { $xt = ($r =~ /TYPE\s*=\s*0/i) ? 'pnp' : 'npn' }
+                        elsif ($ig eq 'BJT')    { $xt = ($r =~ /(?:DEV)?TYPE\s*=\s*0/i) ? 'pnp' : 'npn' }
                         else                    { $xt = lc $mt }
                         $il = ".model $mn $xt level=$imod->{level}$r\n";
                         verbose("  $inc: .model $mn: $mt → $xt level=$imod->{level}");
@@ -304,16 +319,32 @@ sub scan_va_modules {
     close $vfh;
     $text =~ s/\r//g;
 
-    # Find module declarations with optional (* attributes *)
-    while ($text =~ /\bmodule\s+(\w+)\s*\(([^)]*)\)\s*(?:\(\*([^*]*)\*\))?\s*;/g) {
+    # Follow `include directives to scan included VA files (one level)
+    my %seen_inc;
+    my @inc_texts;
+    while ($text =~ /`include\s+"([^"]+)"/g) {
+        my $inc_va = $1;
+        next if $seen_inc{$inc_va}++;
+        next if $inc_va =~ /\.vams$/;  # skip standard discipline includes
+        my $inc_path = dirname($va_path) . "/$inc_va";
+        if (-f $inc_path) {
+            open my $ivfh, '<', $inc_path or next;
+            push @inc_texts, do { local $/; <$ivfh> };
+            close $ivfh;
+        }
+    }
+    $text .= "\n" . join("\n", @inc_texts) if @inc_texts;
+
+    # Find module declarations with (* attributes *) or `attr(...) syntax
+    while ($text =~ /\bmodule\s+(\w+)\s*\(([^)]*)\)\s*(?:\(\*([^*]*)\*\)|`attr\(([^)]*)\))?\s*;/g) {
         my $name = $1;
         my $ports_str = $2;
-        my $attrs_str = $3 // '';
+        my $attrs_str = $3 // $4 // '';
         my @ports = grep { /\S/ } split /\s*,\s*/, $ports_str;
 
-        # Parse attributes
+        # Parse attributes (key="value" or key=value)
         my %attrs;
-        while ($attrs_str =~ /(\w+)\s*=\s*"([^"]*)"/g) {
+        while ($attrs_str =~ /(\w+)\s*=\s*"?([^"\s]+)"?/g) {
             $attrs{$1} = $2;
         }
 
