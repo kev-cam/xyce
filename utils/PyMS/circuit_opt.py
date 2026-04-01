@@ -920,6 +920,246 @@ endmodule
     return stats
 
 
+def find_passive_chains(lines: List[str]) -> Tuple[List[List[str]], Dict, Dict]:
+    """Find series chains of R/L/C where intermediate nodes have exactly 2 connections."""
+    devices = {}
+    for l in lines:
+        s = l.strip()
+        if not s or s.startswith('*') or s.startswith('.'):
+            continue
+        parts = s.split()
+        name = parts[0]
+        prefix = name[0].upper()
+        if prefix in ('R', 'C', 'L') and len(parts) >= 4:
+            devices[name] = (prefix, parts[1], parts[2], parts[3])
+
+    node_count: Dict[str, int] = {}
+    for l in lines:
+        s = l.strip()
+        if not s or s.startswith('*') or s.startswith('.'):
+            continue
+        parts = s.split()
+        if not parts or not parts[0][0].isalpha():
+            continue
+        for p in parts[1:]:
+            if '=' in p or p.startswith('{'):
+                break
+            if re.match(r'^[A-Za-z0-9_+\-]+$', p):
+                node_count[p] = node_count.get(p, 0) + 1
+
+    node_to_devs: Dict[str, List[str]] = {}
+    for name, (t, n1, n2, v) in devices.items():
+        node_to_devs.setdefault(n1, []).append(name)
+        node_to_devs.setdefault(n2, []).append(name)
+
+    used = set()
+    chains = []
+
+    for start in devices:
+        if start in used:
+            continue
+        # BFS/DFS to find chain
+        chain = [start]
+        used.add(start)
+        for _ in range(100):  # safety limit
+            extended = False
+            for end_dev in [chain[0], chain[-1]]:
+                t, n1, n2, v = devices[end_dev]
+                for node in (n1, n2):
+                    if node_count.get(node, 0) != 2:
+                        continue
+                    for nb in node_to_devs.get(node, []):
+                        if nb not in used and nb in devices:
+                            if end_dev == chain[-1]:
+                                chain.append(nb)
+                            else:
+                                chain.insert(0, nb)
+                            used.add(nb)
+                            extended = True
+                            break
+                    if extended:
+                        break
+                if extended:
+                    break
+            if not extended:
+                break
+
+        if len(chain) >= 2:
+            chains.append(chain)
+
+    return chains, devices, node_count
+
+
+def _gen_chain_va(chain_devices: List[Tuple[str, str, str, str]],
+                  module_name: str) -> str:
+    """Generate VA for a series chain of R/L/C devices.
+
+    Each device: (type, n1, n2, value)
+    Chain is series-connected: dev[i].n2 connects to dev[i+1].n1
+    External: first device's n1 and last device's n2.
+    Internal: all intermediate junction nodes.
+    """
+    n = len(chain_devices)
+    # Node names: a (external), b (external), m0, m1, ... (internal)
+    nodes = ['a'] + [f'm{i}' for i in range(n - 1)] + ['b']
+
+    params = []
+    analog_lines = []
+    for i, (dtype, _, _, value) in enumerate(chain_devices):
+        na = nodes[i]
+        nb = nodes[i + 1]
+        pname = f"{dtype.lower()}{i}"
+        params.append(f"    parameter real {pname} = {value};")
+        if dtype == 'R':
+            analog_lines.append(f"        I({na}, {nb}) <+ V({na}, {nb}) / {pname};")
+        elif dtype == 'C':
+            analog_lines.append(f"        I({na}, {nb}) <+ {pname} * ddt(V({na}, {nb}));")
+        elif dtype == 'L':
+            analog_lines.append(f"        V({na}, {nb}) <+ {pname} * ddt(I({na}, {nb}));")
+
+    internal = nodes[1:-1]
+    int_decl = f"    electrical {', '.join(internal)};" if internal else ""
+
+    return f"""`include "disciplines.vams"
+`include "constants.vams"
+module {module_name}(a, b);
+    inout a, b;
+    electrical a, b;
+{int_decl}
+{chr(10).join(params)}
+    analog begin
+{chr(10).join(analog_lines)}
+    end
+endmodule
+"""
+
+
+def optimize_spice(input_path: str, output_path: str,
+                   report: bool = False) -> dict:
+    """Merge series-connected passive chains into single VA devices."""
+    with open(input_path, 'r') as f:
+        lines = f.readlines()
+
+    chains, devices, node_count = find_passive_chains(lines)
+
+    stats = {'chains': len(chains), 'devices_merged': sum(len(c) for c in chains),
+             'nodes_saved': sum(len(c) - 1 for c in chains)}
+
+    if report:
+        print(f"  Passive chains: {len(chains)}")
+        for chain in chains:
+            desc = ' → '.join(f"{d}({devices[d][0]}{devices[d][3]})" for d in chain)
+            print(f"    {desc}")
+        print(f"  Nodes saved: {stats['nodes_saved']}")
+
+    if not chains:
+        with open(output_path, 'w') as f:
+            f.writelines(lines)
+        return stats
+
+    outdir = Path(output_path).parent
+    merged_names = set()
+    va_files = {}  # module_name → va_path
+    chain_info = []  # (chain, module_name, ext_n1, ext_n2, param_str)
+
+    for ci, chain in enumerate(chains):
+        merged_names.update(chain)
+        module_name = f"chain_{ci}"
+
+        # Order chain so devices connect sequentially
+        # Walk from first device through shared nodes
+        ordered = []
+        remaining = list(chain)
+        current = remaining.pop(0)
+        ordered.append(current)
+        while remaining:
+            t, n1, n2, v = devices[current]
+            found = False
+            for r in remaining:
+                rt, rn1, rn2, rv = devices[r]
+                if rn1 in (n1, n2) or rn2 in (n1, n2):
+                    ordered.append(r)
+                    remaining.remove(r)
+                    current = r
+                    found = True
+                    break
+            if not found:
+                break
+
+        # Determine external nodes (endpoints of the chain)
+        all_chain_nodes = set()
+        for d in ordered:
+            t, n1, n2, v = devices[d]
+            all_chain_nodes.update([n1, n2])
+        # External nodes: those that connect to non-chain devices
+        ext_nodes = [n for n in all_chain_nodes if node_count.get(n, 0) > 2 or
+                     n not in all_chain_nodes or
+                     sum(1 for d in ordered for nn in (devices[d][1], devices[d][2]) if nn == n) == 1]
+        if len(ext_nodes) != 2:
+            # Can't determine endpoints cleanly, skip
+            for d in ordered:
+                merged_names.discard(d)
+            continue
+
+        # Order devices from ext_nodes[0] to ext_nodes[1]
+        chain_devs = [(devices[d][0], devices[d][1], devices[d][2],
+                       _parse_eng_val(devices[d][3])) for d in ordered]
+
+        va_content = _gen_chain_va(chain_devs, module_name)
+        va_path = outdir / f"{module_name}.va"
+        va_path.write_text(va_content)
+        va_files[module_name] = va_path
+
+        # Build param string for .model
+        param_parts = []
+        for i, (dtype, _, _, value) in enumerate(chain_devs):
+            param_parts.append(f"{dtype.lower()}{i}={value}")
+
+        chain_info.append((ordered, module_name, ext_nodes[0], ext_nodes[1],
+                          ' '.join(param_parts)))
+
+    # Rewrite netlist
+    output = []
+    hdl_added = False
+
+    for line in lines:
+        s = line.strip()
+        if not hdl_added and s and not s.startswith('*') and not s.startswith('.'):
+            for mn, vp in va_files.items():
+                output.append(f'.hdl "{vp.resolve()}"\n')
+            hdl_added = True
+
+        parts = s.split()
+        if parts and parts[0] in merged_names:
+            output.append(f'* [chain merged] {s}\n')
+            continue
+
+        output.append(line)
+
+    # Add merged devices before .end
+    inserts = []
+    for ordered, module_name, n1, n2, param_str in chain_info:
+        mod_name = f"{module_name}_mod"
+        inst_name = f"{module_name}_inst"
+        inserts.append(
+            f"* [chain: {' + '.join(ordered)}]\n"
+            f".model {mod_name} {module_name} {param_str}\n"
+            f"Y{module_name.upper()} {inst_name} {n1} {n2} {mod_name}\n"
+        )
+
+    final = []
+    for line in output:
+        if line.strip().upper() == '.END':
+            for ins in inserts:
+                final.append(ins)
+        final.append(line)
+
+    with open(output_path, 'w') as f:
+        f.writelines(final)
+
+    return stats
+
+
 def main():
     p = argparse.ArgumentParser(description='Circuit-level device merger')
     p.add_argument('input', help='Input .cir file')
@@ -935,6 +1175,11 @@ def main():
         stats = optimize_esr(args.input, args.output, report=args.report)
         print(f"ESR merge: {stats['esr_merges']} R+C/R+L pairs merged, "
               f"{stats.get('nodes_saved', 0)} nodes saved")
+    elif mode == 'spice':
+        stats = optimize_spice(args.input, args.output, report=args.report)
+        print(f"SPICE merge: {stats['chains']} chains, "
+              f"{stats['devices_merged']} devices merged, "
+              f"{stats['nodes_saved']} nodes saved")
     elif mode == 'none':
         import shutil
         shutil.copy2(args.input, args.output)
