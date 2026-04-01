@@ -231,9 +231,22 @@ def optimize_circuit(input_path: str, output_path: str,
     bjts = {}
     other_lines = []
     bjt_lines = {}  # name → original line
+    model_params = {}  # model_name → {param: value}
 
     for line in lines:
         s = line.strip()
+        # Parse .model cards for BJT parameters
+        mm = re.match(r'^\.model\s+(\S+)\s+(?:NPN|PNP)\s*\(([^)]*)\)', s, re.I)
+        if mm:
+            mname = mm.group(1)
+            params = {}
+            for pm in re.finditer(r'(\w+)\s*=\s*([^\s,)]+)', mm.group(2)):
+                try:
+                    params[pm.group(1).upper()] = float(pm.group(2))
+                except ValueError:
+                    pass
+            model_params[mname] = params
+
         m = re.match(r'^(Q\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)(.*)', s, re.I)
         if m:
             bjts[m.group(1)] = BJT(
@@ -282,6 +295,7 @@ def optimize_circuit(input_path: str, output_path: str,
     hdl_added = set()
 
     # Process Darlington merges
+    darlington_params = {}  # (driver, output) → param string
     for driver, output_q in darlingtons:
         d = bjts[driver]
         o = bjts[output_q]
@@ -294,10 +308,17 @@ def optimize_circuit(input_path: str, output_path: str,
             va_path.write_text(va_content)
             va_files.add(va_name)
 
+        # Get model params for this BJT type
+        mp = model_params.get(d.model, {})
+        bf = mp.get('BF', 100.0)
+        is_val = mp.get('IS', 1e-14)
+        darlington_params[(driver, output_q)] = f"BF1={bf} BF2={bf} IS1={is_val} IS2={is_val}"
+
         merged.add(driver)
         merged.add(output_q)
 
     # Process mirror merges
+    mirror_params = {}
     for ref, mir in mirrors:
         r = bjts[ref]
         m_bjt = bjts[mir]
@@ -309,6 +330,12 @@ def optimize_circuit(input_path: str, output_path: str,
             va_path = outdir / f"{va_name}.va"
             va_path.write_text(va_content)
             va_files.add(va_name)
+
+        mp = model_params.get(r.model, {})
+        bf = mp.get('BF', 100.0)
+        is_val = mp.get('IS', 1e-14)
+        vaf = mp.get('VAF', 100.0)
+        mirror_params[(ref, mir)] = f"BF={bf} IS={is_val} VAF={vaf}"
 
         merged.add(ref)
         merged.add(mir)
@@ -346,10 +373,12 @@ def optimize_circuit(input_path: str, output_path: str,
         va_name = f"darlington_{d.model.lower()}"
         # Darlington: c=shared collector, b=driver base, e=output emitter
         inst_name = f"DARL_{driver}_{output_q}"
+        mod_name = f"dmod_{driver}_{output_q}".lower()
+        dp = darlington_params.get((driver, output_q), '')
         insert_lines.append(
             f"* [merged Darlington: {driver} + {output_q}]\n"
-            f"Y{va_name.upper()} {inst_name} {d.c} {d.b} {o.e} {va_name}_mod\n"
-            f".model {va_name}_mod {va_name}\n"
+            f".model {mod_name} {va_name} {dp}\n"
+            f"Y{va_name.upper()} {inst_name} {d.c} {d.b} {o.e} {mod_name}\n"
         )
 
     for ref, mir in mirrors:
@@ -357,10 +386,12 @@ def optimize_circuit(input_path: str, output_path: str,
         m_bjt = bjts[mir]
         va_name = f"mirror_{r.model.lower()}"
         inst_name = f"MIR_{ref}_{mir}"
+        mod_name = f"mmod_{ref}_{mir}".lower()
+        mp = mirror_params.get((ref, mir), '')
         insert_lines.append(
             f"* [merged mirror: {ref} (ref) + {mir} (mirror)]\n"
-            f"Y{va_name.upper()} {inst_name} {r.c} {m_bjt.c} {r.e} {va_name}_mod\n"
-            f".model {va_name}_mod {va_name}\n"
+            f".model {mod_name} {va_name} {mp}\n"
+            f"Y{va_name.upper()} {inst_name} {r.c} {m_bjt.c} {r.e} {mod_name}\n"
         )
 
     # Insert before .end
