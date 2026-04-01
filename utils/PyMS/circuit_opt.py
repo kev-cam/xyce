@@ -775,11 +775,17 @@ def find_series_rc(lines: List[str]) -> List[Tuple[str, str, str, str, str, str,
                 c_val = _parse_eng_val(cv)
             except (ValueError, TypeError):
                 continue
-            # Merge criterion: true ESR (low-R series with bulk C)
-            # R < 100Ω AND C > 10nF — this is a bypass/decoupling cap with ESR
-            # NOT small compensation caps or high-impedance RC networks
-            if r_val > 10 or c_val < 10e-9:
-                continue
+            # Merge criterion: true ESR (series R with bypass/decoupling C)
+            # Conservative: R < 10Ω, C > 10nF
+            # Relaxed for grounded caps: R < 1kΩ, C > 100nF
+            # (grounded caps are almost always bypass, not compensation)
+            c_grounded = ('0' in cnodes)
+            if c_grounded:
+                if r_val > 1000 or c_val < 100e-9:
+                    continue
+            else:
+                if r_val > 10 or c_val < 10e-9:
+                    continue
             shared = set(rnodes) & set(cnodes)
             if not shared:
                 continue
