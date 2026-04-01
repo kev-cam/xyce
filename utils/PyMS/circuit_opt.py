@@ -801,6 +801,69 @@ def find_series_rc(lines: List[str]) -> List[Tuple[str, str, str, str, str, str,
     return pairs
 
 
+def find_series_rd(lines: List[str]) -> List[Tuple[str, str, str, str, str, str, str]]:
+    """Find series R+D pairs where the shared node has exactly 2 connections.
+
+    Returns (r_name, d_name, ext_node_r, ext_node_d, r_val, d_model, d_polarity).
+    d_polarity: 'anode' if R connects to anode side, 'cathode' if R connects to cathode.
+    """
+    devices = {}
+    for l in lines:
+        s = l.strip()
+        if not s or s.startswith('*') or s.startswith('.'):
+            continue
+        parts = s.split()
+        name = parts[0]
+        prefix = name[0].upper()
+        if prefix == 'R' and len(parts) >= 4:
+            devices[name] = ('R', parts[1], parts[2], parts[3])
+        elif prefix == 'D' and len(parts) >= 4:
+            devices[name] = ('D', parts[1], parts[2], parts[3])  # D anode cathode model
+
+    node_count: Dict[str, int] = {}
+    for l in lines:
+        s = l.strip()
+        if not s or s.startswith('*') or s.startswith('.'):
+            continue
+        parts = s.split()
+        if not parts or not parts[0][0].isalpha():
+            continue
+        for p in parts[1:]:
+            if '=' in p or p.startswith('{'):
+                break
+            if re.match(r'^[A-Za-z0-9_+\-]+$', p):
+                node_count[p] = node_count.get(p, 0) + 1
+
+    pairs = []
+    used = set()
+    for rn, (rt, rn1, rn2, rv) in devices.items():
+        if rt != 'R' or rn in used:
+            continue
+        if '{' in rv:
+            continue
+        for dn, (dt, dn1, dn2, dm) in devices.items():
+            if dt != 'D' or dn in used:
+                continue
+            shared = set((rn1, rn2)) & set((dn1, dn2))
+            if not shared:
+                continue
+            node = shared.pop()
+            if node_count.get(node, 0) == 2:
+                r_ext = rn1 if rn2 == node else rn2
+                if node == dn1:  # R connects to anode
+                    d_ext = dn2  # cathode is external
+                    pol = 'anode'
+                else:  # R connects to cathode
+                    d_ext = dn1  # anode is external
+                    pol = 'cathode'
+                pairs.append((rn, dn, r_ext, d_ext, rv, dm, pol))
+                used.add(rn)
+                used.add(dn)
+                break
+
+    return pairs
+
+
 def optimize_esr(input_path: str, output_path: str,
                  report: bool = False) -> dict:
     """Optimize by merging series R+C into C with ESR, R+L into L with R."""
@@ -1198,8 +1261,94 @@ def main():
     mode = args.merge.lower()
 
     if mode == 'esr':
+        # Run ESR (R+C) merge first
         stats = optimize_esr(args.input, args.output, report=args.report)
-        print(f"ESR merge: {stats['esr_merges']} R+C/R+L pairs merged, "
+
+        # Then R+D merge on the result: absorb R into diode's Rs parameter
+        with open(args.output, 'r') as f:
+            lines = f.readlines()
+        rd_pairs = find_series_rd(lines)
+
+        if rd_pairs:
+            if args.report:
+                print(f"  R+D pairs: {len(rd_pairs)}")
+
+            merged_rs = set()  # R names to remove
+            diode_rewrites = {}  # dn → (new_anode, new_cathode, new_model_name)
+            new_models = []  # new .model lines to add
+
+            for rn, dn, r_ext, d_ext, rv, dm, pol in rd_pairs:
+                try:
+                    r_val = _parse_eng_val(rv)
+                except (ValueError, TypeError):
+                    continue
+                # Only merge low-R (true parasitic/current-limiting, not bias networks)
+                if r_val > 500:
+                    continue
+
+                # Find existing diode model to get Rs
+                existing_rs = 0
+                existing_params = ""
+                for ml in lines:
+                    mm = re.match(rf'^\s*\.model\s+{re.escape(dm)}\s+D\s*\(([^)]*)\)',
+                                  ml, re.I)
+                    if mm:
+                        existing_params = mm.group(1)
+                        rs_m = re.search(r'Rs\s*=\s*([^\s,)]+)', existing_params, re.I)
+                        if rs_m:
+                            try:
+                                existing_rs = _parse_eng_val(rs_m.group(1))
+                            except:
+                                pass
+                        break
+
+                new_rs = existing_rs + r_val
+                new_model = f"{dm}_r{rn}".lower()
+                # Build new params: replace Rs or add it
+                if re.search(r'Rs\s*=', existing_params, re.I):
+                    new_params = re.sub(r'Rs\s*=\s*\S+', f'Rs={new_rs}',
+                                       existing_params, flags=re.I)
+                else:
+                    new_params = f"Rs={new_rs} {existing_params}"
+                new_models.append(f".model {new_model} D({new_params})\n")
+
+                merged_rs.add(rn)
+                if pol == 'cathode':
+                    diode_rewrites[dn] = (d_ext, r_ext, new_model)
+                else:
+                    diode_rewrites[dn] = (r_ext, d_ext, new_model)
+
+                if args.report:
+                    print(f"    {rn}({rv}) + {dn}({dm}) → {new_model} Rs={new_rs}")
+
+            # Rewrite netlist
+            out = []
+            for line in lines:
+                s = line.strip()
+                parts = s.split()
+                if parts and parts[0] in merged_rs:
+                    out.append(f'* [R+D merged] {s}\n')
+                    continue
+                if parts and parts[0] in diode_rewrites:
+                    anode, cathode, model = diode_rewrites[parts[0]]
+                    out.append(f'{parts[0]} {anode} {cathode} {model}\n')
+                    continue
+                out.append(line)
+
+            # Add new model cards before .end
+            final = []
+            for line in out:
+                if line.strip().upper() == '.END':
+                    for nm in new_models:
+                        final.append(nm)
+                final.append(line)
+
+            with open(args.output, 'w') as f:
+                f.writelines(final)
+            stats['rd_merges'] = len(merged_rs)
+            stats['nodes_saved'] = stats.get('nodes_saved', 0) + len(merged_rs)
+
+        print(f"ESR merge: {stats['esr_merges']} R+C, {stats.get('rd_merges', 0)} R+D, "
               f"{stats.get('nodes_saved', 0)} nodes saved")
     elif mode == 'spice':
         stats = optimize_spice(args.input, args.output, report=args.report)
