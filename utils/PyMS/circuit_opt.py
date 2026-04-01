@@ -13,6 +13,25 @@ Usage:
 import re
 import os
 import sys
+
+
+def _parse_eng_val(s: str) -> float:
+    """Parse SPICE engineering notation: 1k→1e3, 5p→5e-12, etc."""
+    suffixes = {
+        'T': 1e12, 'G': 1e9, 'MEG': 1e6, 'K': 1e3,
+        'M': 1e-3, 'U': 1e-6, 'N': 1e-9, 'P': 1e-12, 'F': 1e-15,
+    }
+    s = s.strip()
+    m = re.match(r'^([+-]?[\d.]+(?:e[+-]?\d+)?)\s*(meg|[tgkmunpf])?', s, re.I)
+    if m:
+        num = float(m.group(1))
+        suf = m.group(2)
+        if suf:
+            mult = suffixes.get(suf.upper())
+            if mult:
+                return num * mult
+        return num
+    return float(s)
 import argparse
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -353,8 +372,8 @@ def optimize_circuit(input_path: str, output_path: str,
             params = {}
             for pm in re.finditer(r'(\w+)\s*=\s*([^\s,)]+)', mm.group(2)):
                 try:
-                    params[pm.group(1).upper()] = float(pm.group(2))
-                except ValueError:
+                    params[pm.group(1).upper()] = _parse_eng_val(pm.group(2))
+                except (ValueError, TypeError):
                     pass
             model_params[mname] = params
 
@@ -425,10 +444,10 @@ def optimize_circuit(input_path: str, output_path: str,
         # Get model params for this BJT type
         mp = model_params.get(d.model, {})
         bf = mp.get('BF', 100.0)
-        is_val = mp.get('IS', 1e-14)
+        is_val = mp.get('IS', mp.get('Is', mp.get('is', 1e-16)))
         vaf = mp.get('VAF', 1e10)
-        cje = mp.get('CJE', mp.get('Cje', 0.0))
-        cjc = mp.get('CJC', mp.get('Cjc', 0.0))
+        cje = mp.get('CJE', mp.get('Cje', mp.get('cje', 0.0)))
+        cjc = mp.get('CJC', mp.get('Cjc', mp.get('cjc', 0.0)))
         darlington_params[(driver, output_q)] = (
             f"q1_BF={bf} q1_IS={is_val} q1_VAF={vaf} q1_CJE={cje} q1_CJC={cjc} "
             f"q2_BF={bf} q2_IS={is_val} q2_VAF={vaf} q2_CJE={cje} q2_CJC={cjc}"
@@ -453,10 +472,10 @@ def optimize_circuit(input_path: str, output_path: str,
 
         mp = model_params.get(r.model, {})
         bf = mp.get('BF', 100.0)
-        is_val = mp.get('IS', 1e-14)
+        is_val = mp.get('IS', mp.get('Is', mp.get('is', 1e-16)))
         vaf = mp.get('VAF', 1e10)
-        cje = mp.get('CJE', mp.get('Cje', 0.0))
-        cjc = mp.get('CJC', mp.get('Cjc', 0.0))
+        cje = mp.get('CJE', mp.get('Cje', mp.get('cje', 0.0)))
+        cjc = mp.get('CJC', mp.get('Cjc', mp.get('cjc', 0.0)))
         mirror_params[(ref, mir)] = (
             f"q1_BF={bf} q1_IS={is_val} q1_VAF={vaf} q1_CJE={cje} q1_CJC={cjc} "
             f"q2_BF={bf} q2_IS={is_val} q2_VAF={vaf} q2_CJE={cje} q2_CJC={cjc}"

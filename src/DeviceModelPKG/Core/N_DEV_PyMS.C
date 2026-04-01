@@ -218,6 +218,11 @@ bool pyms_register_hdl(const std::string &va_path) {
         return false;
     }
 
+    // Step 6: Set VAE_SO_DIR so processParams can find the VAE math .so
+    // The VAE .so will be compiled lazily by processParams when first needed.
+    // Point VAE_SO_DIR to our cache directory so it looks there.
+    setenv("VAE_SO_DIR", cache_dir.c_str(), 0);  // don't override if already set
+
     Report::UserWarning0() << ".HDL: compiled and registered " << module_name
         << " from " << va_path;
     return true;
