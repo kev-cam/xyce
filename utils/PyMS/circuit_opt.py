@@ -757,8 +757,28 @@ def find_series_rc(lines: List[str]) -> List[Tuple[str, str, str, str, str, str,
     for rn, (rt, rnodes, rv) in devices.items():
         if rt != 'R' or rn in used:
             continue
+        # Skip if R value is a parameter expression
+        if '{' in rv or not re.match(r'^[0-9.eE+-]+[tgkmunpf]?', rv, re.I):
+            continue
+        try:
+            r_val = _parse_eng_val(rv)
+        except (ValueError, TypeError):
+            continue
+
         for cn, (ct, cnodes, cv) in devices.items():
-            if ct not in ('C', 'L') or cn in used:
+            if ct != 'C' or cn in used:  # only R+C for now, skip L
+                continue
+            # Skip if C value is a parameter expression
+            if '{' in cv or not re.match(r'^[0-9.eE+-]+[tgkmunpf]?', cv, re.I):
+                continue
+            try:
+                c_val = _parse_eng_val(cv)
+            except (ValueError, TypeError):
+                continue
+            # Merge criterion: true ESR (low-R series with bulk C)
+            # R < 100Ω AND C > 10nF — this is a bypass/decoupling cap with ESR
+            # NOT small compensation caps or high-impedance RC networks
+            if r_val > 10 or c_val < 10e-9:
                 continue
             shared = set(rnodes) & set(cnodes)
             if not shared:
