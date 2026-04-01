@@ -722,17 +722,228 @@ def optimize_circuit(input_path: str, output_path: str,
     return stats
 
 
+def find_series_rc(lines: List[str]) -> List[Tuple[str, str, str, str, str, str, str]]:
+    """Find series R+C or R+L pairs where the shared node has only 2 connections.
+
+    Returns list of (r_name, cl_name, cl_type, ext_node1, ext_node2, r_val, cl_val).
+    """
+    devices = {}
+    for l in lines:
+        s = l.strip()
+        if not s or s.startswith('*') or s.startswith('.'):
+            continue
+        parts = s.split()
+        name = parts[0]
+        prefix = name[0].upper()
+        if prefix in ('R', 'C', 'L') and len(parts) >= 4:
+            devices[name] = (prefix, (parts[1], parts[2]), parts[3])
+
+    # Count node connections across ALL devices
+    node_count: Dict[str, int] = {}
+    for l in lines:
+        s = l.strip()
+        if not s or s.startswith('*') or s.startswith('.'):
+            continue
+        parts = s.split()
+        if parts and parts[0][0].isalpha():
+            for p in parts[1:]:
+                if '=' in p or p.startswith('{'):
+                    break
+                if re.match(r'^[A-Za-z0-9_+\-]+$', p):
+                    node_count[p] = node_count.get(p, 0) + 1
+
+    pairs = []
+    used = set()
+    for rn, (rt, rnodes, rv) in devices.items():
+        if rt != 'R' or rn in used:
+            continue
+        for cn, (ct, cnodes, cv) in devices.items():
+            if ct not in ('C', 'L') or cn in used:
+                continue
+            shared = set(rnodes) & set(cnodes)
+            if not shared:
+                continue
+            node = shared.pop()
+            if node_count.get(node, 0) == 2:
+                r_other = [n for n in rnodes if n != node][0]
+                c_other = [n for n in cnodes if n != node][0]
+                pairs.append((rn, cn, ct, r_other, c_other, rv, cv))
+                used.add(rn)
+                used.add(cn)
+                break
+
+    return pairs
+
+
+def optimize_esr(input_path: str, output_path: str,
+                 report: bool = False) -> dict:
+    """Optimize by merging series R+C into C with ESR, R+L into L with R."""
+    with open(input_path, 'r') as f:
+        lines = f.readlines()
+
+    pairs = find_series_rc(lines)
+
+    stats = {'esr_merges': len(pairs)}
+
+    if report:
+        print(f"  Series R+C/R+L pairs: {len(pairs)}")
+        for rn, cn, ct, n1, n2, rv, cv in pairs:
+            print(f"    {rn}({rv}) + {cn}({cv}) → {ct} with ESR")
+
+    if not pairs:
+        with open(output_path, 'w') as f:
+            f.writelines(lines)
+        return stats
+
+    merged_names = set()
+    replacements = {}  # old device names → replacement lines
+
+    for rn, cn, ct, n1, n2, rv, cv in pairs:
+        merged_names.add(rn)
+        merged_names.add(cn)
+        if ct == 'C':
+            # R+C → C with Rser parameter (Xyce supports this natively!)
+            # Actually Xyce doesn't support Rser on C. Use a comment for clarity.
+            # The real optimization: just keep both devices but Xyce handles them.
+            # OR: for Verilog-A path, create a merged RC device.
+            #
+            # Simplest: Xyce doesn't need VA for this. Just reconnect:
+            # Remove R, connect C directly between the two external nodes.
+            # The R's effect is approximated by the C alone (for frequency response)
+            # No — that changes the circuit! Keep both but mark as optimizable.
+            #
+            # Actually the simplest valid merge: replace R+C with a single
+            # Xyce behavioral B-source or just note it.
+            # For now: use the fact that this eliminates one node.
+            # C(n1, n2) with ESR is modeled as: I = C*ddt(V) + V/R
+            # But that's not a capacitor — it's a parallel R||C, not series R+C.
+            #
+            # Series R+C needs: V(a,b) = I*R + Q/C, or equivalently
+            # keep both devices. The node reduction comes from internalizing
+            # the shared node. Need a VA device.
+            pass
+
+    # For the ESR merge, generate a simple VA: series R + C as one device
+    outdir = Path(output_path).parent
+    va_written = set()
+    merged_devices = {}
+
+    for rn, cn, ct, n1, n2, rv, cv in pairs:
+        if ct == 'C':
+            va_name = 'esr_cap'
+            if va_name not in va_written:
+                va_path = outdir / f'{va_name}.va'
+                va_path.write_text("""`include "disciplines.vams"
+`include "constants.vams"
+module esr_cap(a, b);
+    inout a, b;
+    electrical a, b;
+    electrical mid;
+    parameter real R = 1.0;
+    parameter real C = 1e-12;
+    analog begin
+        I(a, mid) <+ V(a, mid) / R;
+        I(mid, b) <+ C * ddt(V(mid, b));
+    end
+endmodule
+""")
+                va_written.add(va_name)
+
+            mod_name = f"esrc_{rn}_{cn}".lower()
+            merged_devices[(rn, cn)] = (va_name, mod_name, n1, n2, rv, cv)
+
+        elif ct == 'L':
+            va_name = 'esr_ind'
+            if va_name not in va_written:
+                va_path = outdir / f'{va_name}.va'
+                va_path.write_text("""`include "disciplines.vams"
+`include "constants.vams"
+module esr_ind(a, b);
+    inout a, b;
+    electrical a, b;
+    electrical mid;
+    parameter real R = 1.0;
+    parameter real L = 1e-6;
+    analog begin
+        I(a, mid) <+ V(a, mid) / R;
+        V(mid, b) <+ L * ddt(I(mid, b));
+    end
+endmodule
+""")
+                va_written.add(va_name)
+
+            mod_name = f"esrl_{rn}_{cn}".lower()
+            merged_devices[(rn, cn)] = (va_name, mod_name, n1, n2, rv, cv)
+
+    # Rewrite netlist
+    output = []
+    hdl_added = False
+
+    for line in lines:
+        s = line.strip()
+
+        # Add .hdl after title
+        if not hdl_added and not s.startswith('*') and not s.startswith('.'):
+            for va_name in sorted(va_written):
+                va_abs = (outdir / f'{va_name}.va').resolve()
+                output.append(f'.hdl "{va_abs}"\n')
+            hdl_added = True
+
+        # Skip merged R and C/L devices
+        parts = s.split()
+        if parts:
+            dname = parts[0]
+            if dname in merged_names:
+                output.append(f'* [merged ESR] {s}\n')
+                continue
+
+        output.append(line)
+
+    # Add merged device instances before .end
+    for (rn, cn), (va_name, mod_name, n1, n2, rv, cv) in merged_devices.items():
+        insert = (
+            f"* [ESR merge: {rn}({rv}) + {cn}({cv})]\n"
+            f".model {mod_name} {va_name} R={rv} C={cv}\n"
+            f"Y{va_name.upper()} {mod_name}_inst {n1} {n2} {mod_name}\n"
+        )
+        final = []
+        for line in output:
+            if line.strip().upper() == '.END':
+                final.append(insert)
+            final.append(line)
+        output = final
+
+    with open(output_path, 'w') as f:
+        f.writelines(output)
+
+    stats['nodes_saved'] = len(pairs)
+    return stats
+
+
 def main():
     p = argparse.ArgumentParser(description='Circuit-level device merger')
     p.add_argument('input', help='Input .cir file')
     p.add_argument('-o', '--output', required=True, help='Output .cir file')
+    p.add_argument('--merge', default='all',
+                   help='Merge mode: all, darlington, mirror, esr, none')
     p.add_argument('--report', action='store_true', help='Print optimization report')
     args = p.parse_args()
 
-    stats = optimize_circuit(args.input, args.output, report=args.report)
-    print(f"Optimized: {stats['darlingtons']} Darlingtons, "
-          f"{stats['mirrors']} mirrors merged "
-          f"({stats.get('bjts_before', 0)} → {stats.get('bjts_after', stats.get('bjts_before', 0))} BJTs)")
+    mode = args.merge.lower()
+
+    if mode == 'esr':
+        stats = optimize_esr(args.input, args.output, report=args.report)
+        print(f"ESR merge: {stats['esr_merges']} R+C/R+L pairs merged, "
+              f"{stats.get('nodes_saved', 0)} nodes saved")
+    elif mode == 'none':
+        import shutil
+        shutil.copy2(args.input, args.output)
+        print("No optimization")
+    else:
+        stats = optimize_circuit(args.input, args.output, report=args.report)
+        print(f"Optimized: {stats['darlingtons']} Darlingtons, "
+              f"{stats['mirrors']} mirrors merged "
+              f"({stats.get('bjts_before', 0)} → {stats.get('bjts_after', stats.get('bjts_before', 0))} BJTs)")
 
 
 if __name__ == '__main__':
