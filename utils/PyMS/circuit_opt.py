@@ -90,8 +90,38 @@ def find_darlington_pairs(bjts: Dict[str, BJT]) -> List[Tuple[str, str]]:
     return pairs
 
 
-def find_darlingtons(bjts: Dict[str, BJT]) -> List[Tuple[str, str]]:
-    """Find Darlington pairs: driver.e = output.b, same collector, same type."""
+def _node_connections(bjts: Dict[str, BJT], lines: List[str]) -> Dict[str, int]:
+    """Count how many device terminals connect to each node."""
+    counts: Dict[str, int] = {}
+    for b in bjts.values():
+        for n in (b.c, b.b, b.e):
+            counts[n] = counts.get(n, 0) + 1
+    # Also count non-BJT device connections from the netlist
+    for line in lines:
+        s = line.strip()
+        if not s or s.startswith('*') or s.startswith('.'):
+            continue
+        if s[0].upper() == 'Q':
+            continue  # already counted
+        # Parse device line: first letter + name, then node names
+        parts = s.split()
+        if len(parts) >= 3 and parts[0][0].isalpha():
+            for p in parts[1:]:
+                if p.startswith('{') or '=' in p:
+                    break
+                # Skip model names / values (heuristic: if it looks like a node)
+                if re.match(r'^[A-Za-z0-9_+\-]+$', p):
+                    counts[p] = counts.get(p, 0) + 1
+    return counts
+
+
+def find_darlingtons(bjts: Dict[str, BJT],
+                     node_conns: Dict[str, int] = None) -> List[Tuple[str, str]]:
+    """Find Darlington pairs: driver.e = output.b, same collector, same type.
+
+    Only merge if the shared node (driver emitter = output base) has no
+    other connections besides the two BJTs being merged.
+    """
     pairs = []
     used = set()
     names = list(bjts.keys())
@@ -108,11 +138,18 @@ def find_darlingtons(bjts: Dict[str, BJT]) -> List[Tuple[str, str]]:
                 continue
             # a is driver (input), b is output: a.e = b.b, same collector
             if a.e == b.b and a.c == b.c:
+                # Check shared node has only 2 BJT connections
+                shared = a.e
+                if node_conns and node_conns.get(shared, 0) > 2:
+                    continue  # external connections — can't internalize
                 pairs.append((na, nb))
                 used.update([na, nb])
                 break
             # b is driver, a is output
             if b.e == a.b and b.c == a.c:
+                shared = b.e
+                if node_conns and node_conns.get(shared, 0) > 2:
+                    continue
                 pairs.append((nb, na))
                 used.update([na, nb])
                 break
@@ -120,8 +157,13 @@ def find_darlingtons(bjts: Dict[str, BJT]) -> List[Tuple[str, str]]:
     return pairs
 
 
-def find_mirrors(bjts: Dict[str, BJT]) -> List[Tuple[str, str]]:
-    """Find current mirrors: diode-connected ref + mirror with shared base+emitter."""
+def find_mirrors(bjts: Dict[str, BJT],
+                 node_conns: Dict[str, int] = None) -> List[Tuple[str, str]]:
+    """Find current mirrors: diode-connected ref + mirror with shared base+emitter.
+
+    The shared base node (= ref collector for diode-connected) must have
+    no external connections besides the BJTs being merged.
+    """
     mirrors = []
     used = set()
     names = list(bjts.keys())
@@ -139,84 +181,153 @@ def find_mirrors(bjts: Dict[str, BJT]) -> List[Tuple[str, str]]:
                 continue
             b = bjts[nb]
             if b.b == a.b and b.e == a.e and b.model == a.model:
+                # Shared base node: count connections
+                # For diode-connected, base=collector, so it has at least 3 BJT
+                # terminal connections (a.b, a.c, b.b). Only merge if no others.
+                shared = a.b
+                bjt_conns = sum(1 for bj in bjts.values()
+                               for n in (bj.c, bj.b, bj.e) if n == shared)
+                if node_conns and node_conns.get(shared, 0) > bjt_conns:
+                    continue  # external connections to shared base
                 mirrors.append((na, nb))
                 used.update([na, nb])
 
     return mirrors
 
 
+def _bjt_analog_block(prefix: str, c: str, b: str, e: str, is_pnp: bool) -> str:
+    """Generate Ebers-Moll BJT equations for one transistor.
+
+    prefix: variable name prefix (e.g. 'q1_' or 'q2_')
+    c, b, e: node names in the merged module
+    """
+    if is_pnp:
+        vbe = f"V({e}, {b})"
+        vbc = f"V({e}, {c})"
+        vce = f"V({e}, {c})"
+        ice = f"I({e}, {c})"
+        ibe = f"I({e}, {b})"
+        ibc = f"I({e}, {c})"
+    else:
+        vbe = f"V({b}, {e})"
+        vbc = f"V({b}, {c})"
+        vce = f"V({c}, {e})"
+        ice = f"I({c}, {e})"
+        ibe = f"I({b}, {e})"
+        ibc = f"I({b}, {c})"
+
+    return f"""
+        // BJT {prefix} Ebers-Moll
+        {prefix}Vbe = {vbe};
+        {prefix}Vbc = {vbc};
+        {prefix}If = {prefix}IS * (limexp({prefix}Vbe / $vt) - 1.0);
+        {prefix}Ir = {prefix}IS * (limexp({prefix}Vbc / $vt) - 1.0);
+        {prefix}Ic = {prefix}If * (1.0 + {vce} / {prefix}VAF) - {prefix}Ir;
+        {ice} <+ {prefix}Ic;
+        {ibe} <+ {prefix}If / {prefix}BF;
+        {ibc} <+ {prefix}Ir / {prefix}BR;
+        {ibe} <+ {prefix}CJE * ddt({prefix}Vbe);
+        {ibc} <+ {prefix}CJC * ddt({prefix}Vbc);
+"""
+
+
 def generate_darlington_va(model_type: str) -> str:
-    """Generate Verilog-A for a Darlington pair."""
+    """Generate Verilog-A for a Darlington pair.
+
+    Two full Ebers-Moll BJTs with internal node 'm' (driver emitter = output base).
+    External: c (shared collector), b (driver base), e (output emitter).
+    """
     is_pnp = model_type.upper() in ('PNP', 'PN')
-    sign = "-" if is_pnp else ""
-    vbe_sign = "V(e, b)" if is_pnp else "V(b, e)"
-    vce_sign = "V(e, c)" if is_pnp else "V(c, e)"
-    ice_dir = "I(e, c)" if is_pnp else "I(c, e)"
-    ibe_dir = "I(e, b)" if is_pnp else "I(b, e)"
+
+    q1_block = _bjt_analog_block('q1_', 'c', 'b', 'm', is_pnp)
+    q2_block = _bjt_analog_block('q2_', 'c', 'm', 'e', is_pnp)
 
     return f"""`include "disciplines.vams"
 `include "constants.vams"
 module darlington_{model_type.lower()}(c, b, e);
     inout c, b, e;
     electrical c, b, e;
-    parameter real BF1 = 100.0;
-    parameter real BF2 = 100.0;
-    parameter real IS1 = 1e-14;
-    parameter real IS2 = 1e-14;
-    real Vbe, Vce, Ib1, Ic1, Ib2, Ic2, Vbe1, Vbe2;
+    electrical m;  // internal: driver emitter = output base
+
+    // Driver (Q1) parameters
+    parameter real q1_IS  = 1e-14;
+    parameter real q1_BF  = 100.0;
+    parameter real q1_BR  = 1.0;
+    parameter real q1_VAF = 1e10;
+    parameter real q1_CJE = 0.0;
+    parameter real q1_CJC = 0.0;
+
+    // Output (Q2) parameters
+    parameter real q2_IS  = 1e-14;
+    parameter real q2_BF  = 100.0;
+    parameter real q2_BR  = 1.0;
+    parameter real q2_VAF = 1e10;
+    parameter real q2_CJE = 0.0;
+    parameter real q2_CJC = 0.0;
+
+    real q1_Vbe, q1_Vbc, q1_If, q1_Ir, q1_Ic;
+    real q2_Vbe, q2_Vbc, q2_If, q2_Ir, q2_Ic;
+
     analog begin
-        Vbe = {vbe_sign};
-        Vce = {vce_sign};
-        // Driver: Q1 sees full Vbe, emitter drives Q2 base
-        // Effective Vbe for Q1 = Vbe - Vbe2 (roughly Vbe - 0.65)
-        Vbe2 = $vt * ln(1.0 + Vbe / (2.0 * $vt));
-        if (Vbe2 > 0.8) Vbe2 = 0.8;
-        Vbe1 = Vbe - Vbe2;
-        // Q1 (driver)
-        Ic1 = IS1 * (limexp(Vbe1 / $vt) - 1.0);
-        Ib1 = Ic1 / BF1;
-        // Q2 (output) — base current = Q1 emitter current
-        Ic2 = IS2 * (limexp(Vbe2 / $vt) - 1.0);
-        Ib2 = Ic2 / BF2;
-        // Total: Ic = Ic1 + Ic2, Ib = Ib1
-        {ice_dir} <+ Ic1 + Ic2;
-        {ibe_dir} <+ Ib1;
+{q1_block}
+{q2_block}
     end
 endmodule
 """
 
 
 def generate_mirror_va(model_type: str) -> str:
-    """Generate Verilog-A for a current mirror (no internal nodes)."""
+    """Generate Verilog-A for a current mirror.
+
+    Two full Ebers-Moll BJTs: ref is diode-connected (base=collector),
+    mirror shares base with ref. Internal node 'bp' (shared base point).
+    External: cref (ref collector), cout (mirror collector), e (shared emitter).
+    """
     is_pnp = model_type.upper() in ('PNP', 'PN')
 
+    # Ref BJT: collector=cref, base=bp, emitter=e
+    # Diode connection: V(bp, cref) = 0
+    q1_block = _bjt_analog_block('q1_', 'cref', 'bp', 'e', is_pnp)
+    # Mirror BJT: collector=cout, base=bp, emitter=e
+    q2_block = _bjt_analog_block('q2_', 'cout', 'bp', 'e', is_pnp)
+
+    # For the diode connection, short base to collector of ref
     if is_pnp:
-        vbe = "V(e, cref)"  # diode-connected: Vbe = V(e,c) for ref
-        i_ref = "I(e, cref)"
-        i_out = "I(e, cout)"
-        vce_out = "V(e, cout)"
+        short = "V(bp, cref) <+ 0.0;"
     else:
-        vbe = "V(cref, e)"
-        i_ref = "I(cref, e)"
-        i_out = "I(cout, e)"
-        vce_out = "V(cout, e)"
+        short = "V(bp, cref) <+ 0.0;"
 
     return f"""`include "disciplines.vams"
 `include "constants.vams"
 module mirror_{model_type.lower()}(cref, cout, e);
     inout cref, cout, e;
     electrical cref, cout, e;
-    parameter real BF = 100.0;
-    parameter real IS = 1e-14;
-    parameter real VAF = 100.0;
-    real Iref, Iout;
+    electrical bp;  // internal: shared base
+
+    // Ref BJT parameters
+    parameter real q1_IS  = 1e-14;
+    parameter real q1_BF  = 100.0;
+    parameter real q1_BR  = 1.0;
+    parameter real q1_VAF = 1e10;
+    parameter real q1_CJE = 0.0;
+    parameter real q1_CJC = 0.0;
+
+    // Mirror BJT parameters
+    parameter real q2_IS  = 1e-14;
+    parameter real q2_BF  = 100.0;
+    parameter real q2_BR  = 1.0;
+    parameter real q2_VAF = 1e10;
+    parameter real q2_CJE = 0.0;
+    parameter real q2_CJC = 0.0;
+
+    real q1_Vbe, q1_Vbc, q1_If, q1_Ir, q1_Ic;
+    real q2_Vbe, q2_Vbc, q2_If, q2_Ir, q2_Ic;
+
     analog begin
-        // Diode-connected ref: base=collector, so Vbe=Vce for reference
-        Iref = IS * (limexp({vbe} / $vt) - 1.0);
-        {i_ref} <+ Iref + Iref / BF;
-        // Mirror output with Early effect
-        Iout = Iref * (1.0 + {vce_out} / VAF);
-        {i_out} <+ Iout;
+        // Diode connection: base tied to ref collector
+        {short}
+{q1_block}
+{q2_block}
     end
 endmodule
 """
@@ -258,9 +369,12 @@ def optimize_circuit(input_path: str, output_path: str,
         else:
             other_lines.append(line)
 
-    # Find patterns
-    darlingtons = find_darlingtons(bjts)
-    mirrors = find_mirrors(bjts)
+    # Compute node connectivity for safe merging
+    node_conns = _node_connections(bjts, lines)
+
+    # Find patterns (only merge if shared nodes have no external connections)
+    darlingtons = find_darlingtons(bjts, node_conns)
+    mirrors = find_mirrors(bjts, node_conns)
 
     stats = {
         'darlingtons': len(darlingtons),
@@ -312,7 +426,13 @@ def optimize_circuit(input_path: str, output_path: str,
         mp = model_params.get(d.model, {})
         bf = mp.get('BF', 100.0)
         is_val = mp.get('IS', 1e-14)
-        darlington_params[(driver, output_q)] = f"BF1={bf} BF2={bf} IS1={is_val} IS2={is_val}"
+        vaf = mp.get('VAF', 1e10)
+        cje = mp.get('CJE', mp.get('Cje', 0.0))
+        cjc = mp.get('CJC', mp.get('Cjc', 0.0))
+        darlington_params[(driver, output_q)] = (
+            f"q1_BF={bf} q1_IS={is_val} q1_VAF={vaf} q1_CJE={cje} q1_CJC={cjc} "
+            f"q2_BF={bf} q2_IS={is_val} q2_VAF={vaf} q2_CJE={cje} q2_CJC={cjc}"
+        )
 
         merged.add(driver)
         merged.add(output_q)
@@ -334,8 +454,13 @@ def optimize_circuit(input_path: str, output_path: str,
         mp = model_params.get(r.model, {})
         bf = mp.get('BF', 100.0)
         is_val = mp.get('IS', 1e-14)
-        vaf = mp.get('VAF', 100.0)
-        mirror_params[(ref, mir)] = f"BF={bf} IS={is_val} VAF={vaf}"
+        vaf = mp.get('VAF', 1e10)
+        cje = mp.get('CJE', mp.get('Cje', 0.0))
+        cjc = mp.get('CJC', mp.get('Cjc', 0.0))
+        mirror_params[(ref, mir)] = (
+            f"q1_BF={bf} q1_IS={is_val} q1_VAF={vaf} q1_CJE={cje} q1_CJC={cjc} "
+            f"q2_BF={bf} q2_IS={is_val} q2_VAF={vaf} q2_CJE={cje} q2_CJC={cjc}"
+        )
 
         merged.add(ref)
         merged.add(mir)

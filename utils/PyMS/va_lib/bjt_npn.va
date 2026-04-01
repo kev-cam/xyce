@@ -1,0 +1,50 @@
+`include "disciplines.vams"
+`include "constants.vams"
+
+// Ebers-Moll NPN BJT — matches Xyce/SPICE level 1 BJT behavior
+module bjt_npn(c, b, e);
+    inout c, b, e;
+    electrical c, b, e;
+
+    parameter real IS  = 1e-14;   // saturation current
+    parameter real BF  = 100.0;   // forward beta
+    parameter real BR  = 1.0;     // reverse beta
+    parameter real VAF = 1e10;    // forward Early voltage
+    parameter real VAR = 1e10;    // reverse Early voltage
+    parameter real RB  = 0.0;     // base resistance (ignored without internal node)
+    parameter real RC  = 0.0;     // collector resistance
+    parameter real RE  = 0.0;     // emitter resistance
+    parameter real CJE = 0.0;    // B-E junction capacitance
+    parameter real CJC = 0.0;    // B-C junction capacitance
+    parameter real TF  = 0.0;    // forward transit time
+    parameter real TR  = 0.0;    // reverse transit time
+
+    real Vbe, Vbc, If, Ir, Ibe, Ibc, Ic, Ib, Ie;
+    real Qbe, Qbc;
+
+    analog begin
+        Vbe = V(b, e);
+        Vbc = V(b, c);
+
+        // Forward and reverse currents
+        If = IS * (limexp(Vbe / $vt) - 1.0);
+        Ir = IS * (limexp(Vbc / $vt) - 1.0);
+
+        // Early effect
+        Ic = If * (1.0 + V(c, e) / VAF) - Ir * (1.0 + V(c, e) / VAR);
+
+        // Terminal currents
+        Ibe = If / BF;
+        Ibc = Ir / BR;
+
+        I(c, e) <+ Ic;
+        I(b, e) <+ Ibe;
+        I(b, c) <+ Ibc;
+
+        // Charge storage
+        Qbe = TF * If + CJE * Vbe;
+        Qbc = TR * Ir + CJC * Vbc;
+        I(b, e) <+ ddt(Qbe);
+        I(b, c) <+ ddt(Qbc);
+    end
+endmodule
