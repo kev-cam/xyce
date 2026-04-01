@@ -13,6 +13,8 @@ Usage:
 import re
 import os
 import sys
+import subprocess
+import tempfile
 
 
 def _parse_eng_val(s: str) -> float:
@@ -36,6 +38,136 @@ import argparse
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Dict, List, Set, Tuple, Optional
+
+
+def _compile_merged_so(cpp_source: str, output_path: str) -> bool:
+    """Compile C++ source to a VAE .so."""
+    with tempfile.NamedTemporaryFile(suffix='.cpp', mode='w', delete=False) as f:
+        f.write(cpp_source)
+        cpp = f.name
+    try:
+        r = subprocess.run(['g++', '-shared', '-fPIC', '-O2', '-o', output_path, cpp],
+                          capture_output=True, timeout=30)
+        return r.returncode == 0
+    finally:
+        os.unlink(cpp)
+
+
+def _gen_darlington_so_src(IS=1e-16, BF=125.0, BR=1.0, CJE=0.0, CJC=0.0,
+                           is_pnp=False) -> str:
+    """Generate C++ for a Darlington VAE .so (node-indexed)."""
+    # NPN: V[0]=c, V[1]=b, V[2]=e, V[3]=m (Q1.e=Q2.b)
+    # PNP: same node layout, reversed Vbe/Vbc signs
+    if is_pnp:
+        q1_vbe = "s->V[3]-s->V[1]"  # V(m,b) = V(e1,b1)
+        q1_vbc = "s->V[0]-s->V[1]"  # V(c,b)
+        q2_vbe = "s->V[2]-s->V[3]"  # V(e,m) = V(e2,b2)
+        q2_vbc = "s->V[0]-s->V[3]"  # V(c,m)
+        sign = "-1.0"
+    else:
+        q1_vbe = "s->V[1]-s->V[3]"
+        q1_vbc = "s->V[1]-s->V[0]"
+        q2_vbe = "s->V[3]-s->V[2]"
+        q2_vbc = "s->V[3]-s->V[0]"
+        sign = "1.0"
+
+    return f"""
+#include <cstring>
+#include <cmath>
+struct VaeState {{ double V[16]; double Vt; }};
+static inline double limexp(double x) {{
+    return (x < 80.0) ? exp(x) : exp(80.0) * (1.0 + x - 80.0);
+}}
+extern "C" {{
+void vae_eval(VaeState* s, double* F, double* Q) {{
+    double vt=s->Vt, sgn={sign};
+    double IS={IS}, BF={BF}, BR={BR}, CJE={CJE}, CJC={CJC};
+    double q1_Vbe={q1_vbe}, q1_Vbc={q1_vbc};
+    double q1_If=IS*(limexp(q1_Vbe/vt)-1.0), q1_Ir=IS*(limexp(q1_Vbc/vt)-1.0);
+    double q1_Ic=q1_If-q1_Ir, q1_Ibe=q1_If/BF, q1_Ibc=q1_Ir/BR;
+    double q2_Vbe={q2_vbe}, q2_Vbc={q2_vbc};
+    double q2_If=IS*(limexp(q2_Vbe/vt)-1.0), q2_Ir=IS*(limexp(q2_Vbc/vt)-1.0);
+    double q2_Ic=q2_If-q2_Ir, q2_Ibe=q2_If/BF, q2_Ibc=q2_Ir/BR;
+    F[0]=sgn*((q1_Ic-q1_Ibc)+(q2_Ic-q2_Ibc));
+    F[1]=sgn*(q1_Ibe+q1_Ibc);
+    F[2]=sgn*(-q2_Ic-q2_Ibe);
+    F[3]=sgn*((-q1_Ic-q1_Ibe)+(q2_Ibe+q2_Ibc));
+    Q[0]=-CJC*q1_Vbc-CJC*q2_Vbc;
+    Q[1]=CJC*q1_Vbc;
+    Q[2]=-CJE*q2_Vbe;
+    Q[3]=CJE*q1_Vbe+CJE*q2_Vbe+CJC*q2_Vbc;
+}}
+void vae_jacobian(VaeState* s, double* dFdV, double* dQdV) {{
+    double dv=1e-6;double F0[4],Q0[4],Fp[4],Qp[4];VaeState sp;
+    memset(dFdV,0,16*sizeof(double));memset(dQdV,0,16*sizeof(double));
+    vae_eval(s,F0,Q0);
+    for(int j=0;j<4;j++){{sp=*s;sp.V[j]+=dv;vae_eval(&sp,Fp,Qp);
+    for(int i=0;i<4;i++){{dFdV[i*4+j]=(Fp[i]-F0[i])/dv;dQdV[i*4+j]=(Qp[i]-Q0[i])/dv;}}}}
+}}
+int vae_n_nodes(){{return 4;}}
+int vae_n_branches(){{return 4;}}
+}}
+"""
+
+
+def _gen_mirror_so_src(IS=1e-16, BF=125.0, BR=1.0, CJE=0.0, CJC=0.0,
+                       is_pnp=False) -> str:
+    """Generate C++ for a current mirror VAE .so (node-indexed).
+    Nodes: V[0]=cref, V[1]=cout, V[2]=e, V[3]=bp (internal base)
+    Diode connection: bp=cref via large conductance.
+    """
+    if is_pnp:
+        q1_vbe = "s->V[2]-s->V[3]"  # V(e,bp)
+        q1_vbc = "s->V[0]-s->V[3]"  # V(cref,bp)
+        q2_vbe = "s->V[2]-s->V[3]"  # V(e,bp) same base
+        q2_vbc = "s->V[1]-s->V[3]"  # V(cout,bp)
+        sign = "-1.0"
+    else:
+        q1_vbe = "s->V[3]-s->V[2]"
+        q1_vbc = "s->V[3]-s->V[0]"
+        q2_vbe = "s->V[3]-s->V[2]"
+        q2_vbc = "s->V[3]-s->V[1]"
+        sign = "1.0"
+
+    return f"""
+#include <cstring>
+#include <cmath>
+struct VaeState {{ double V[16]; double Vt; }};
+static inline double limexp(double x) {{
+    return (x < 80.0) ? exp(x) : exp(80.0) * (1.0 + x - 80.0);
+}}
+extern "C" {{
+void vae_eval(VaeState* s, double* F, double* Q) {{
+    double vt=s->Vt, sgn={sign};
+    double IS={IS}, BF={BF}, BR={BR}, CJE={CJE}, CJC={CJC};
+    double Gshort=1e8;
+    double q1_Vbe={q1_vbe}, q1_Vbc={q1_vbc};
+    double q1_If=IS*(limexp(q1_Vbe/vt)-1.0), q1_Ir=IS*(limexp(q1_Vbc/vt)-1.0);
+    double q1_Ic=q1_If-q1_Ir, q1_Ibe=q1_If/BF, q1_Ibc=q1_Ir/BR;
+    double q2_Vbe={q2_vbe}, q2_Vbc={q2_vbc};
+    double q2_If=IS*(limexp(q2_Vbe/vt)-1.0), q2_Ir=IS*(limexp(q2_Vbc/vt)-1.0);
+    double q2_Ic=q2_If-q2_Ir, q2_Ibe=q2_If/BF, q2_Ibc=q2_Ir/BR;
+    // Diode connection: bp shorted to cref
+    double Vshort = s->V[3] - s->V[0];
+    F[0]=sgn*(q1_Ic-q1_Ibc) - Gshort*Vshort;
+    F[1]=sgn*(q2_Ic-q2_Ibc);
+    F[2]=sgn*(-q1_Ic-q1_Ibe-q2_Ic-q2_Ibe);
+    F[3]=sgn*(q1_Ibe+q1_Ibc+q2_Ibe+q2_Ibc) + Gshort*Vshort;
+    Q[0]=-CJC*q1_Vbc; Q[1]=-CJC*q2_Vbc;
+    Q[2]=-CJE*q1_Vbe-CJE*q2_Vbe;
+    Q[3]=CJE*q1_Vbe+CJC*q1_Vbc+CJE*q2_Vbe+CJC*q2_Vbc;
+}}
+void vae_jacobian(VaeState* s, double* dFdV, double* dQdV) {{
+    double dv=1e-6;double F0[4],Q0[4],Fp[4],Qp[4];VaeState sp;
+    memset(dFdV,0,16*sizeof(double));memset(dQdV,0,16*sizeof(double));
+    vae_eval(s,F0,Q0);
+    for(int j=0;j<4;j++){{sp=*s;sp.V[j]+=dv;vae_eval(&sp,Fp,Qp);
+    for(int i=0;i<4;i++){{dFdV[i*4+j]=(Fp[i]-F0[i])/dv;dQdV[i*4+j]=(Qp[i]-Q0[i])/dv;}}}}
+}}
+int vae_n_nodes(){{return 4;}}
+int vae_n_branches(){{return 4;}}
+}}
+"""
 
 
 @dataclass
@@ -538,6 +670,42 @@ def optimize_circuit(input_path: str, output_path: str,
             f"Y{va_name.upper()} {inst_name} {r.c} {m_bjt.c} {r.e} {mod_name}\n"
         )
 
+    # Compile per-model VAE .so files with correct params
+    vae_dir = outdir / 'vae_so'
+    vae_dir.mkdir(exist_ok=True)
+
+    for driver, output_q in darlingtons:
+        d = bjts[driver]
+        mod_name = f"dmod_{driver}_{output_q}".lower()
+        mp = model_params.get(d.model, {})
+        is_pnp = d.model.upper() in ('PNP', 'PN')
+        src = _gen_darlington_so_src(
+            IS=mp.get('IS', mp.get('Is', mp.get('is', 1e-16))),
+            BF=mp.get('BF', 100.0), BR=mp.get('BR', 1.0),
+            CJE=mp.get('CJE', mp.get('Cje', mp.get('cje', 0.0))),
+            CJC=mp.get('CJC', mp.get('Cjc', mp.get('cjc', 0.0))),
+            is_pnp=is_pnp)
+        so_path = vae_dir / f"{mod_name.upper()}.so"
+        if _compile_merged_so(src, str(so_path)):
+            if report:
+                print(f"  Compiled {so_path.name}")
+
+    for ref, mir in mirrors:
+        r = bjts[ref]
+        mod_name = f"mmod_{ref}_{mir}".lower()
+        mp = model_params.get(r.model, {})
+        is_pnp = r.model.upper() in ('PNP', 'PN')
+        src = _gen_mirror_so_src(
+            IS=mp.get('IS', mp.get('Is', mp.get('is', 1e-16))),
+            BF=mp.get('BF', 100.0), BR=mp.get('BR', 1.0),
+            CJE=mp.get('CJE', mp.get('Cje', mp.get('cje', 0.0))),
+            CJC=mp.get('CJC', mp.get('Cjc', mp.get('cjc', 0.0))),
+            is_pnp=is_pnp)
+        so_path = vae_dir / f"{mod_name.upper()}.so"
+        if _compile_merged_so(src, str(so_path)):
+            if report:
+                print(f"  Compiled {so_path.name}")
+
     # Insert before .end
     final = []
     for line in output:
@@ -550,6 +718,7 @@ def optimize_circuit(input_path: str, output_path: str,
         f.writelines(final)
 
     stats['bjts_after'] = len(bjts) - len(merged)
+    stats['vae_dir'] = str(vae_dir)
     return stats
 
 
