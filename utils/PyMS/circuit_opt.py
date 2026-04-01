@@ -1254,17 +1254,22 @@ def main():
     p.add_argument('input', help='Input .cir file')
     p.add_argument('-o', '--output', required=True, help='Output .cir file')
     p.add_argument('--merge', default='all',
-                   help='Merge mode: all, darlington, mirror, esr, none')
+                   help='Merge mode: all, darlington, mirror, sr, rd, spice, none')
     p.add_argument('--report', action='store_true', help='Print optimization report')
     args = p.parse_args()
 
     mode = args.merge.lower()
 
-    if mode == 'esr':
-        # Run ESR (R+C) merge first
+    if mode == 'sr':
+        # R+C series merge (ESR absorption)
         stats = optimize_esr(args.input, args.output, report=args.report)
-
-        # Then R+D merge on the result: absorb R into diode's Rs parameter
+        print(f"SR merge: {stats['esr_merges']} R+C pairs, "
+              f"{stats.get('nodes_saved', 0)} nodes saved")
+    elif mode == 'rd':
+        # R+D series merge (absorb R into diode Rs)
+        import shutil
+        shutil.copy2(args.input, args.output)
+        stats = {'rd_merges': 0, 'nodes_saved': 0}
         with open(args.output, 'r') as f:
             lines = f.readlines()
         rd_pairs = find_series_rd(lines)
@@ -1348,7 +1353,7 @@ def main():
             stats['rd_merges'] = len(merged_rs)
             stats['nodes_saved'] = stats.get('nodes_saved', 0) + len(merged_rs)
 
-        print(f"ESR merge: {stats['esr_merges']} R+C, {stats.get('rd_merges', 0)} R+D, "
+        print(f"RD merge: {stats.get('rd_merges', 0)} R+D pairs, "
               f"{stats.get('nodes_saved', 0)} nodes saved")
     elif mode == 'spice':
         stats = optimize_spice(args.input, args.output, report=args.report)
