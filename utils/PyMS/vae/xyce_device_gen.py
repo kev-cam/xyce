@@ -156,7 +156,7 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
     h.append('  bool loadDAEQVector();')
     h.append('  bool loadDAEdFdx();')
     h.append('  bool loadDAEdQdx();')
-    h.append('  void loadNodeSymbols(Util::SymbolTable &) const {}')
+    h.append('  void loadNodeSymbols(Util::SymbolTable &symbol_table) const;')
     h.append('')
     h.append('  Model &getModel() { return model_; }')
     h.append('')
@@ -362,6 +362,13 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
     c.append('}')
     c.append('const std::vector<std::string> &Instance::getDepSolnVars() {')
     c.append('  static std::vector<std::string> v; return v;')
+    c.append('}')
+    c.append('')
+
+    # loadNodeSymbols: register internal nodes with the symbol table
+    c.append('void Instance::loadNodeSymbols(Util::SymbolTable &symbol_table) const {')
+    for i, n in enumerate(internals):
+        c.append(f'  addInternalNode(symbol_table, li_{n}, getName(), "{n}");')
     c.append('}')
     c.append('')
 
