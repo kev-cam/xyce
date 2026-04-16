@@ -62,6 +62,10 @@ class Param:
     from_range: Optional[str] = None    # e.g. "(0:inf)"
     desc: Optional[str] = None
     is_instance: bool = False           # type="instance" attribute
+    # Array-parameter support: when declared as `parameter real T[0:N-1] = '{...}`
+    # array_size is N and elements is the parsed list of initialiser values.
+    array_size: Optional[int] = None
+    elements: Optional[list[str]] = None
 
 
 @dataclass
@@ -499,10 +503,30 @@ class Parser:
         typ = self.consume_ident()  # real or integer
         name = self.consume_ident()
 
+        # Optional array bounds: `[lo:hi]` immediately after the name.
+        array_size = None
+        if self.at('['):
+            self.advance()
+            lo_str = self._collect_param_value_until(':', ']')
+            if self.at(':'):
+                self.advance()
+            hi_str = self._collect_param_value_until(']')
+            self.expect(']')
+            try:
+                lo = int(float(parse_number(lo_str.strip())))
+                hi = int(float(parse_number(hi_str.strip())))
+                array_size = hi - lo + 1
+            except ValueError:
+                array_size = 0
+
         default = "0"
+        elements = None
         if self.at('='):
             self.advance()
-            default = self._collect_param_value()
+            if array_size is not None and self._at_array_init():
+                elements = self._parse_array_init()
+            else:
+                default = self._collect_param_value()
 
         from_range = None
         while self.at('from') or self.at('exclude'):
@@ -519,11 +543,76 @@ class Parser:
         self.expect(';')
 
         p = Param(name=name, type=typ, default=parse_number(default), from_range=from_range)
+        if array_size is not None:
+            p.array_size = array_size
+            p.elements = elements or []
         if attrs.get('type') == 'instance':
             p.is_instance = True
         if 'desc' in attrs:
             p.desc = attrs['desc']
         return p
+
+    def _at_array_init(self) -> bool:
+        """Peek for the start of `'{` or `{` aggregate initialiser."""
+        t = self.peek()
+        if t is None:
+            return False
+        if t.value == "'":
+            t2 = self.peek(1)
+            return t2 is not None and t2.value == '{'
+        return t.value == '{'
+
+    def _parse_array_init(self) -> list:
+        """Parse `'{v0, v1, ...}` or `{v0, v1, ...}` aggregate, return list of
+        string values (preserving literal form for codegen)."""
+        # Consume optional `'`
+        if self.peek() and self.peek().value == "'":
+            self.advance()
+        self.expect('{')
+        elements = []
+        while not self.at('}'):
+            # Collect one element (may be signed number or expression);
+            # stops at top-level `,` or `}`.
+            val = self._collect_array_element()
+            if val.strip():
+                elements.append(val.strip())
+            if self.at(','):
+                self.advance()
+        self.expect('}')
+        return elements
+
+    def _collect_array_element(self) -> str:
+        """Collect tokens until a top-level `,` or `}`."""
+        parts = []
+        depth = 0
+        while self.pos < len(self.tokens):
+            t = self.peek()
+            if depth == 0 and t.value in (',', '}'):
+                break
+            if t.value in ('(', '[', '{'):
+                depth += 1
+            elif t.value in (')', ']', '}'):
+                depth -= 1
+            parts.append(t.value)
+            self.advance()
+        return ' '.join(parts)
+
+    def _collect_param_value_until(self, *stops) -> str:
+        """Like _collect_param_value but stops on arbitrary given tokens at depth 0.
+        Used for parsing `[lo:hi]` array bounds."""
+        parts = []
+        depth = 0
+        while self.pos < len(self.tokens):
+            t = self.peek()
+            if depth == 0 and t.value in stops:
+                break
+            if t.value in ('(', '['):
+                depth += 1
+            elif t.value in (')', ']'):
+                depth -= 1
+            parts.append(t.value)
+            self.advance()
+        return ' '.join(parts)
 
     def _parse_variables(self, mod: Module):
         typ = self.advance().value  # real or integer
@@ -592,9 +681,24 @@ class Parser:
         self.expect('@')
         self.expect('(')
         event_name = self.consume_ident()
-        # Optional arguments
-        while not self.at(')'):
-            self.advance()
+        # Optional arguments — may themselves contain nested parens (e.g.
+        # @(timer(dt, dt)) or @(cross(V(a,b)-vt, +1))). Track depth so we
+        # stop on the `)` that matches the opening `(` we consumed above.
+        depth = 0
+        while self.pos < len(self.tokens):
+            t = self.peek()
+            if t is None:
+                break
+            if t.value == '(':
+                depth += 1
+                self.advance()
+            elif t.value == ')':
+                if depth == 0:
+                    break
+                depth -= 1
+                self.advance()
+            else:
+                self.advance()
         self.expect(')')
         body = self._parse_statement()
         if event_name == 'initial_step':
@@ -786,7 +890,12 @@ class Parser:
         return ' '.join(parts)
 
     def _collect_expr_until(self, *stops) -> str:
-        """Collect tokens into expression string until one of stops is seen at depth 0."""
+        """Collect tokens into expression string until one of stops is seen at depth 0.
+
+        Depth is clamped at ≥0 so a stray closing bracket (from an earlier
+        mis-nested parse) doesn't let the loop swallow the rest of the file
+        by making every subsequent `;` appear to be at non-zero depth.
+        """
         parts = []
         depth = 0
         while self.pos < len(self.tokens):
@@ -796,7 +905,8 @@ class Parser:
             if t.value in ('(', '['):
                 depth += 1
             elif t.value in (')', ']'):
-                depth -= 1
+                if depth > 0:
+                    depth -= 1
             parts.append(t.value)
             self.advance()
         return ' '.join(parts)

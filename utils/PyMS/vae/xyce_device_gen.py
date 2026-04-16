@@ -65,8 +65,16 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
     n_int = len(internals)
     n_total = n_ext + n_int
 
-    params = [(p.name, p.default, getattr(p, 'is_instance', False))
-              for p in mod.params]
+    # Split scalar vs array params. Scalars go into Model/Instance class
+    # members via addPar; arrays are emitted once as namespace-scope static
+    # const double[].
+    params = []            # (name, default, is_instance) — scalars only
+    array_params = []      # (name, array_size, elements)
+    for p in mod.params:
+        if getattr(p, 'array_size', None):
+            array_params.append((p.name, p.array_size, p.elements or []))
+        else:
+            params.append((p.name, p.default, getattr(p, 'is_instance', False)))
 
     # Find contributions
     contribs = []
@@ -241,6 +249,20 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
     c.append('')
     c.append(f'namespace Xyce {{ namespace Device {{ namespace PYMS_{NAME} {{')
     c.append('')
+
+    # Array-param tables — emitted once as namespace-scope static const double[].
+    # These are compile-time constants baked in from the Verilog-A parameter
+    # aggregate initialiser; cheaper and shared across all instances of the
+    # device than per-Model heap members.
+    for aname, asize, elements in array_params:
+        if not elements or len(elements) != asize:
+            # Fallback — zero-initialise when the aggregate is missing or wrong size.
+            init = ', '.join(['0.0'] * asize)
+        else:
+            init = ', '.join(elements)
+        c.append(f'static const double {aname}[{asize}] = {{ {init} }};')
+    if array_params:
+        c.append('')
 
     # Node names
     node_names_str = ', '.join(f'"{n}"' for n in [p.name for p in mod.ports])

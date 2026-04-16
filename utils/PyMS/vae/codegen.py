@@ -42,6 +42,8 @@ _VA_BUILTINS = {
     'hypot': 'hypot',
     'min': 'fmin',
     'max': 'fmax',
+    'floor': 'floor',
+    'ceil':  'ceil',
 }
 
 # Verilog-A → sympy function mapping
@@ -292,7 +294,11 @@ class CodeGen:
         result = re.sub(r'flicker_noise\s*\([^)]*\)', '0.0', result)
 
         # Parameter references → s->params[idx]
+        # Skip array parameters — those are emitted as namespace-scope
+        # static const double[] and referenced directly by name + subscript.
         for i, p in enumerate(self.mod.params):
+            if getattr(p, 'array_size', None):
+                continue
             result = re.sub(rf'\b{re.escape(p.name)}\b', f's->params[{i}]', result)
 
         # Clean up spacing
