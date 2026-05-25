@@ -28,18 +28,73 @@ from vae.parser import parse_verilog_a, parse_file, NodeKind, ContribKind
 
 
 def scan_va_attributes(va_path: str) -> dict:
-    """Extract (* key=value *) attributes from a Verilog-A module declaration."""
+    """Extract ``(* key="value" ... *)`` attributes from a Verilog-A
+    module declaration.
+
+    The compact-model .va files in the install tree write these in five
+    different shapes — handle them all:
+
+      1. ``module foo(a,b) (* xyceModelGroup="MOSFET" ... *) ;``
+         (Accellera-standard, post-decl, comma-separated)
+      2. ``(* xyceModelGroup="..." *)  module foo(a,b);``
+         (pre-decl — EKV 2.6, toys/capacitor)
+      3. ``module foo(a,b) `ATTR(xyceModelGroup="..." ...);``
+         (HICUM L2 / Diode CMC / MVS / FBH-HBT — macro that expands
+         to ``(* txt *)``)
+      4. Module declaration lives behind a ``\\`include`` — preprocess
+         first and the include's expansion brings the decl into scope
+         (BSIM-CMG 107 / 108).
+      5. Attributes declared in a sibling .include file with no module
+         on the entry-point line (rare; not handled here).
+
+    To handle 3+4 in one shot we run the preprocessor and search the
+    *expanded* source for both pre- and post-decl ``(* ... *)`` blocks.
+    Whichever set contains an ``xyceModelGroup`` wins.
+    """
     attrs = {}
     if not va_path or not os.path.exists(va_path):
         return attrs
     import re
-    with open(va_path, 'r', errors='replace') as f:
-        text = f.read()
-    # Find module ... (* ... *) pattern
-    m = re.search(r'module\s+\w+\s*\([^)]*\)\s*\(\*([^*]*)\*\)', text)
-    if m:
-        attr_str = m.group(1)
-        for am in re.finditer(r'(\w+)\s*=\s*"([^"]*)"', attr_str):
+    try:
+        # Late import so the parser/codegen modules can be imported
+        # without dragging in the preprocessor when callers don't need it.
+        from vae.preprocess import preprocess_file
+        text = preprocess_file(va_path)
+    except Exception:
+        # Fall back to raw source — better to find *some* attrs than
+        # to fail outright if preprocess hits something unexpected.
+        with open(va_path, 'r', errors='replace') as f:
+            text = f.read()
+
+    # Candidate windows: each is a ``(* ... *)`` block adjacent to a
+    # ``module`` keyword (either side). The block can span multiple
+    # lines and may contain comma- or space-separated key=value pairs.
+    candidates = []
+    # Post-decl: ``module name(ports) (* ... *)``
+    for m in re.finditer(
+            r'module\s+\w+\s*\([^)]*\)\s*\(\*(.*?)\*\)', text, re.DOTALL):
+        candidates.append(m.group(1))
+    # Pre-decl: ``(* ... *) module name(ports)``
+    for m in re.finditer(
+            r'\(\*(.*?)\*\)\s*module\s+\w+\s*\(', text, re.DOTALL):
+        candidates.append(m.group(1))
+
+    # Pick the first candidate whose body actually mentions
+    # ``xyceModelGroup`` — generic ``(* desc="..." *)`` blocks on
+    # parameter declarations are not what we want here.
+    for body in candidates:
+        if 'xyceModelGroup' not in body and 'xyceLevelNumber' not in body:
+            continue
+        attrs = {}
+        for am in re.finditer(r'(\w+)\s*=\s*"([^"]*)"', body):
+            attrs[am.group(1)] = am.group(2)
+        if 'xyceModelGroup' in attrs or 'xyceLevelNumber' in attrs:
+            return attrs
+
+    # No xyce* attrs found — return whatever the first generic
+    # candidate yielded (still better than {}).
+    if candidates:
+        for am in re.finditer(r'(\w+)\s*=\s*"([^"]*)"', candidates[0]):
             attrs[am.group(1)] = am.group(2)
     return attrs
 
@@ -64,6 +119,34 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
     n_ext = len(ports)
     n_int = len(internals)
     n_total = n_ext + n_int
+
+    # Xyce's device-letter dispatch counts a fixed number of nodes
+    # on the netlist card based on the SPICE convention for the
+    # device family — M needs 4 (D G S B), Q needs 4 (C B E S),
+    # D needs 2 (A C). Extra ports declared in the .va (thermal,
+    # body-pickup, substrate) are *optional* — Xyce only consumes
+    # them if the netlist supplies them. If we report all declared
+    # ports as required, the parser treats the model name as the
+    # last "node" and everything after that as an unrecognised
+    # parameter, which is the ``Unrecognized parameter X for
+    # device M1`` failure mode that dominates the regression
+    # suite.
+    _GROUP_REQUIRED_TERMINALS = {
+        'MOSFET':    4,
+        'BJT':       4,
+        'Diode':     2,
+        'Resistor':  2,
+        'Capacitor': 2,
+        'Inductor':  2,
+    }
+    if model_group in _GROUP_REQUIRED_TERMINALS:
+        num_nodes_required = min(_GROUP_REQUIRED_TERMINALS[model_group], n_ext)
+        num_nodes_optional = max(0, n_ext - num_nodes_required)
+    else:
+        # Y-devices and unknown groups: every declared port is required,
+        # zero optional — matches what Xyce's generic Y handler expects.
+        num_nodes_required = n_ext
+        num_nodes_optional = 0
 
     # Split scalar vs array params. Scalars go into Model/Instance class
     # members via addPar; arrays are emitted once as namespace-scope static
@@ -128,8 +211,8 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
     h.append('struct Traits : public DeviceTraits<Model, Instance> {')
     h.append(f'  static const char *name() {{ return "{name}"; }}')
     h.append(f'  static const char *deviceTypeName() {{ return "{NAME}"; }}')
-    h.append(f'  static int numNodes() {{ return {n_ext}; }}')
-    h.append(f'  static int numOptionalNodes() {{ return 0; }}')
+    h.append(f'  static int numNodes() {{ return {num_nodes_required}; }}')
+    h.append(f'  static int numOptionalNodes() {{ return {num_nodes_optional}; }}')
     h.append(f'  static bool isLinearDevice() {{ return false; }}')
     h.append(f'  static bool modelRequired() {{ return true; }}')
     h.append('  static const char **nodeNames();')
@@ -645,12 +728,49 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
     return header, impl
 
 
+def resolve_entry_point(va_path: str) -> str:
+    """Prefer ``<name>.va`` over ``<name>_main.va`` when both live in
+    the same directory.
+
+    ADMS-style compact models split the entry point in two: a thin
+    wrapper ``<name>.va`` that defines convention macros (``\\`attr``,
+    ``\\`__XYCE__``, etc.) and then ``\\`include``s ``<name>_main.va``,
+    which carries the actual ``module`` declaration. Xyce's auto-loader
+    grep over .va files lands on the file that contains ``module`` — the
+    body — and hands that to PyMS, which sees the body's ``\\`attr(...)``
+    as an undefined macro and loses the xyceModelGroup attrs.
+
+    When invoked on a ``*_main.va`` (or, for some models like
+    ``bsimcmg_nqsmod3.va``, any file in a code/ dir alongside a sibling
+    wrapper that includes us), reroute to the wrapper so the macros and
+    preprocessor predefines that come with it are picked up. Caller can
+    still bypass via the env var ``PYMS_NO_WRAPPER_REROUTE``."""
+    if os.environ.get('PYMS_NO_WRAPPER_REROUTE'):
+        return va_path
+    if not va_path.endswith('_main.va'):
+        return va_path
+    candidate = va_path[:-len('_main.va')] + '.va'
+    if not os.path.exists(candidate) or os.path.samefile(candidate, va_path):
+        return va_path
+    # Confirm the candidate actually includes us — guards against
+    # picking an unrelated sibling that happens to share a prefix.
+    try:
+        with open(candidate, errors='replace') as f:
+            head = f.read(8192)
+    except OSError:
+        return va_path
+    main_basename = os.path.basename(va_path)
+    if f'"{main_basename}"' in head or f"'{main_basename}'" in head:
+        return candidate
+    return va_path
+
+
 if __name__ == '__main__':
     if len(sys.argv) < 2:
         print("Usage: xyce_device_gen.py <input.va> [--output <dir>]")
         sys.exit(1)
 
-    va_path = sys.argv[1]
+    va_path = resolve_entry_point(sys.argv[1])
     output_dir = '.'
     if '--output' in sys.argv:
         output_dir = sys.argv[sys.argv.index('--output') + 1]

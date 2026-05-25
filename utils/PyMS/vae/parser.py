@@ -314,14 +314,25 @@ class Parser:
                             p.is_instance = True
                     mod.params.append(p)
             elif self.at('branch'):
-                # branch (node) name ; → record name→node mapping
+                # branch (node[, node2]) name [, name2 ...] ;
+                #   Verilog-A allows a comma-separated list of branch
+                #   identifiers sharing the same node binding.
                 self.advance()  # 'branch'
                 if self.at('('):
                     self.advance()
                     node_name = self.consume_ident()
+                    # Some declarations list both ends (`branch (p, n) b`)
+                    # — keep only the first, which is what we use as the
+                    # branch's "primary" node for substitution.
+                    while self.at(','):
+                        self.advance()
+                        self.consume_ident()
                     self.expect(')')
-                    branch_name = self.consume_ident()
-                    mod.branch_map[branch_name] = node_name
+                    while not self.at(';'):
+                        branch_name = self.consume_ident()
+                        mod.branch_map[branch_name] = node_name
+                        if self.at(','):
+                            self.advance()
                     self.expect(';')
                 else:
                     self._skip_to_semi()
@@ -415,17 +426,24 @@ class Parser:
             if t.value == 'endfunction':
                 return
 
-    def _skip_inline_attrs(self):
-        """Skip inline `attr(...) or (* ... *) between tokens."""
+    def _consume_inline_attrs(self) -> dict[str, str]:
+        """Parse all immediately-following inline `attr(...) or
+        (* ... *) blocks, merging their key/value pairs and returning
+        them. Returns {} when nothing follows."""
+        merged: dict[str, str] = {}
         while self.pos < len(self.tokens):
             t = self.peek()
             if t.value == '(*':
-                self._parse_attributes()  # consume and discard
+                merged.update(self._parse_attributes())
             elif t.value.startswith('`'):
                 t2 = self.peek(1)
                 if t2 and t2.value == '(':
-                    # `attr(...) or similar macro call — skip to matching )
-                    self.advance()  # `attr
+                    # `attr(...) or another macro call. If the
+                    # preprocessor already expanded `attr to (* ... *)
+                    # we'd never see this path; if a macro slipped
+                    # through, skip the contents to keep the parser
+                    # advancing.
+                    self.advance()  # `name
                     self.advance()  # (
                     depth = 1
                     while self.pos < len(self.tokens) and depth > 0:
@@ -438,12 +456,28 @@ class Parser:
                     break  # standalone `macro — not an attr
             else:
                 break
+        return merged
+
+    def _skip_inline_attrs(self):
+        """Back-compat wrapper for sites that just want to consume the
+        attrs and don't need to capture them."""
+        self._consume_inline_attrs()
 
     def _parse_attributes(self) -> dict[str, str]:
-        """Parse (* key=value, key=value *) attributes."""
+        """Parse ``(* key=value, key=value *)`` attributes.
+
+        Real-world .va sources mix two separator conventions in this
+        list:
+          - comma-separated (Accellera / GNU make convention)
+          - space-separated (``\\`attr(type="instance" info="...")``
+            after BSIM-CMG/MVS/FBH-HBT macro expansion)
+        Both are accepted; trailing commas are tolerated."""
         attrs = {}
         self.expect('(*')
         while not self.at('*)'):
+            if self.at(','):
+                self.advance()
+                continue
             key = self.consume_ident()
             if self.at('='):
                 self.advance()
@@ -455,8 +489,6 @@ class Parser:
                     attrs[key] = self.advance().value
             else:
                 attrs[key] = "true"
-            if self.at(','):
-                self.advance()
         self.expect('*)')
         return attrs
 
@@ -537,8 +569,13 @@ class Parser:
                 self.advance()
                 self._collect_param_value()  # discard
 
-        # Skip inline `attr(...) or (* ... *) before ;
-        self._skip_inline_attrs()
+        # Capture trailing inline `attr(...) / (* ... *) blocks — this
+        # is where BSIM-CMG / MVS / FBH-HBT put type="instance".
+        trailing = self._consume_inline_attrs()
+        if trailing:
+            # Trailing attrs override leading-attr defaults, matching
+            # the document order a human would read.
+            attrs = {**attrs, **trailing}
 
         self.expect(';')
 
@@ -655,9 +692,22 @@ class Parser:
             self.advance()
             self.consume_ident()  # block label
         block = ASTNode(kind=NodeKind.BLOCK, loc=loc)
-        while not self.at('end'):
+        # Terminate on ``end`` (normal) OR on a higher-level structural
+        # keyword (``endmodule``, ``endcase``, ``endfunction``) — those
+        # mean the source has a missing ``end`` somewhere; bail out
+        # rather than recursing into a statement that would gobble them
+        # and run to EOF.
+        STRUCT_END = ('end', 'endmodule', 'endcase', 'endfunction')
+        while self.pos < len(self.tokens):
+            t = self.peek()
+            if t is None or t.value in STRUCT_END:
+                break
             block.children.append(self._parse_statement())
-        self.expect('end')
+        # Allow ``endmodule``/``endcase`` to act as an implicit ``end``
+        # when the source is missing one — emit the block we have and
+        # leave the keyword for the enclosing parser to consume.
+        if self.at('end'):
+            self.advance()
         return block
 
     def _parse_if(self) -> ASTNode:
@@ -895,13 +945,23 @@ class Parser:
         Depth is clamped at ≥0 so a stray closing bracket (from an earlier
         mis-nested parse) doesn't let the loop swallow the rest of the file
         by making every subsequent `;` appear to be at non-zero depth.
+
+        Structural keywords (``end``, ``endmodule``, ``endcase``,
+        ``endfunction``) also terminate the collector even when not in
+        ``stops`` — they can never appear inside an expression, and
+        without this guard a missing ``;`` at the end of an analog block
+        statement lets us run to ``EOF`` (BSIM-SOI 4.5/4.6.1/4.7).
         """
         parts = []
         depth = 0
+        STRUCT_END = ('end', 'endmodule', 'endcase', 'endfunction')
         while self.pos < len(self.tokens):
             t = self.peek()
-            if depth == 0 and t.value in stops:
-                break
+            if depth == 0:
+                if t.value in stops:
+                    break
+                if t.value in STRUCT_END:
+                    break
             if t.value in ('(', '['):
                 depth += 1
             elif t.value in (')', ']'):
@@ -949,9 +1009,16 @@ def parse_verilog_a(source: str, filename: str = "") -> Module:
 
 
 def parse_file(path: str) -> Module:
-    """Parse a Verilog-A file, return Module AST."""
-    with open(path) as f:
-        source = f.read()
+    """Parse a Verilog-A file, return Module AST.
+
+    Runs the textual preprocessor (`\\`include` follow, `\\`define`
+    expansion, `\\`ifdef`/`\\`ifndef`) before tokenizing — every real
+    compact-model .va in /usr/local/share/xyce/verilog-a defines its
+    parameters via macros (`\\`IPRnb`, `\\`MPRcc`, etc.) and brings them
+    in via `\\`include`, so without preprocessing the parser sees no
+    parameters at all."""
+    from .preprocess import preprocess_file
+    source = preprocess_file(path)
     return parse_verilog_a(source, filename=path)
 
 
