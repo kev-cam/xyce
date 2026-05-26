@@ -164,7 +164,22 @@ Configuration::findConfiguration(
   const int             level)
 {
   ConfigurationMap::const_iterator it = getData().configurationMap_.find(ConfigurationMap::key_type(device_name, level));
-  return it == getData().configurationMap_.end() ? 0 : (*it).second;
+  if (it != getData().configurationMap_.end())
+    return (*it).second;
+
+  // Same PyMS auto-discovery fallback as getModelType: when the
+  // (device_name, level) pair isn't in the static registry, try to
+  // find a .va in the install tree that declares it. The auto-load
+  // path runs codegen + compile + dlopen, which registers the new
+  // (device_name, level) via the .so's __attribute__((constructor)),
+  // so the retry below succeeds.
+  extern bool pyms_try_auto_register(const std::string &name, int level);
+  if (pyms_try_auto_register(device_name, level)) {
+    it = getData().configurationMap_.find(ConfigurationMap::key_type(device_name, level));
+    if (it != getData().configurationMap_.end())
+      return (*it).second;
+  }
+  return 0;
 }
 
 //-----------------------------------------------------------------------------
@@ -194,10 +209,19 @@ EntityTypeId
 Configuration::getModelType(const std::string &model_type_name, const int level)
 {
   NameLevelKeyEntityTypeIdMap::const_iterator it = getData().modelTypeNameLevelModelTypeMap_.find(NameLevelKey(model_type_name, level));
-  if (it == getData().modelTypeNameLevelModelTypeMap_.end())
-    return EntityTypeId();
-  else
+  if (it != getData().modelTypeNameLevelModelTypeMap_.end())
     return (*it).second;
+
+  // PyMS .va auto-discovery: when `.model foo nmos level=110` lands
+  // here without a preceding `.HDL` directive having registered the
+  // device, try to find a matching .va in the install tree.
+  extern bool pyms_try_auto_register(const std::string &name, int level);
+  if (pyms_try_auto_register(model_type_name, level)) {
+    it = getData().modelTypeNameLevelModelTypeMap_.find(NameLevelKey(model_type_name, level));
+    if (it != getData().modelTypeNameLevelModelTypeMap_.end())
+      return (*it).second;
+  }
+  return EntityTypeId();
 }
 
 //-----------------------------------------------------------------------------

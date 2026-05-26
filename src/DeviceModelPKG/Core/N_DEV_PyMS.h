@@ -69,6 +69,15 @@ struct PyMSHandle {
 // Returns true if compilation and registration succeeded.
 bool pyms_register_hdl(const std::string &va_path);
 
+// Auto-discovery fallback: called from Configuration::findConfiguration
+// and Configuration::getModelType when a (device_name, level) lookup
+// misses the static registry. Scans $XYCE_PREFIX/share/xyce/verilog-a
+// for a .va whose module decl advertises that (xyceModelGroup,
+// xyceLevelNumber); on a hit, compiles + registers it via
+// pyms_register_hdl so the caller's retry succeeds. The scan runs once
+// per process and the result is cached.
+bool pyms_try_auto_register(const std::string &name, int level);
+
 void pyms_register_va(const std::string &module_name, const std::string &va_path);
 const std::string &pyms_get_va(const std::string &module_name);
 bool pyms_has_va(const std::string &module_name);

@@ -188,6 +188,17 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
     h.append('#include <N_DEV_DeviceMaster.h>')
     h.append('#include <dlfcn.h>')
     h.append('')
+    # Xyce_config.h (pulled in transitively above) ``#define``s
+    # build-version macros that collide with parameter names from
+    # real compact-model .va files — e.g. BSIM-SOI 4.7 declares
+    # ``parameter real VERSION = 4.7``, but Xyce_config.h has
+    # ``#define VERSION "..."``, so the macro rewrites every
+    # ``Model::VERSION`` member as a string literal. Undef the known
+    # offenders before any class declaration uses them.
+    for offender in ('VERSION', 'PACKAGE_VERSION', 'PACKAGE_NAME',
+                     'PACKAGE_STRING', 'MAJOR', 'MINOR'):
+        h.append(f'#ifdef {offender}\n#undef {offender}\n#endif')
+    h.append('')
     h.append(f'namespace Xyce {{ namespace Device {{ namespace PYMS_{NAME} {{')
     h.append('')
 
@@ -328,6 +339,11 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
     c.append('#include <N_LAS_Matrix.h>')
     c.append('#include <cstring>')
     c.append('#include <cmath>')
+    # See matching block in the .h: Xyce_config.h pulls in macro
+    # definitions that collide with .va parameter names.
+    for offender in ('VERSION', 'PACKAGE_VERSION', 'PACKAGE_NAME',
+                     'PACKAGE_STRING', 'MAJOR', 'MINOR'):
+        c.append(f'#ifdef {offender}\n#undef {offender}\n#endif')
     c.append('#include <cstdlib>')
     c.append('')
     c.append(f'namespace Xyce {{ namespace Device {{ namespace PYMS_{NAME} {{')
