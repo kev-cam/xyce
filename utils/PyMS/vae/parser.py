@@ -113,6 +113,36 @@ class Module:
     attributes: dict[str, str] = field(default_factory=dict)
 
 
+@dataclass
+class Paramset:
+    """Verilog-AMS ``paramset NAME UNDERLYING ... endparamset`` declaration.
+
+    Semantically a paramset is a *defaults override* on the underlying
+    module: it exposes its own instance parameters (typically a subset
+    or with tighter ranges), and via the ``.NAME = expr`` lines it
+    rewrites the default values of named parameters of the underlying.
+    No new analog behaviour, no macromodule expansion — at parse_file
+    time the paramset is resolved into a Module by:
+
+      1. Taking the underlying's Module verbatim (ports, variables,
+         analog block).
+      2. Prepending the paramset's own instance parameters (caller-
+         supplied).
+      3. Prepending the paramset's localparams as variable assignments
+         at the head of the analog block (so the binding expressions
+         can reference them).
+      4. For each ``.X = expr`` binding, replacing the default value
+         of underlying parameter X with ``expr``.
+      5. Renaming the resulting Module to the paramset's name.
+    """
+    name: str
+    underlying_name: str
+    params: list[Param] = field(default_factory=list)
+    localparams: list[tuple[str, str]] = field(default_factory=list)
+    bindings: list[tuple[str, str]] = field(default_factory=list)
+    attributes: dict[str, str] = field(default_factory=dict)
+
+
 # ---------------------------------------------------------------------------
 # Tokenizer
 # ---------------------------------------------------------------------------
@@ -127,7 +157,7 @@ _TOKEN_PATTERNS = [
     ('CONTRIB', r'<\+'),
     ('NUMBER', r'[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?(?:[fpnumkMGT])?'),
     ('IDENT', r'[A-Za-z_\$`][A-Za-z0-9_\$]*'),
-    ('OP', r'[+\-*/(){},;:=<>!&|~\[\]@^?]'),
+    ('OP', r'[+\-*/(){},;:=<>!&|~\[\]@^?.]'),
     ('WS', r'\s+'),
 ]
 
@@ -357,7 +387,7 @@ class Parser:
                 self._skip_directive()
             elif t.value in ('nature', 'discipline'):
                 self._skip_block(t.value, 'end' + t.value)
-            elif t.value == 'module':
+            elif t.value in ('module', 'paramset'):
                 break
             elif t.value == '(*':
                 # Could be attribute on module — check if 'module' follows
@@ -365,6 +395,99 @@ class Parser:
             else:
                 # Skip unknown preamble token
                 self.advance()
+
+    def parse_paramset(self) -> Paramset:
+        """Parse ``paramset NAME UNDERLYING <body> endparamset``.
+
+        Each body statement is one of:
+          * ``parameter [type] N = V [from ...] ;``  paramset-side instance
+            param (the caller-supplied subset of the underlying's params)
+          * ``localparam [type] N = E ;``             paramset-local var,
+            available to subsequent bindings as a sub-expression
+          * ``aliasparam X = Y ;``                    alias (recorded as a
+            zero-default parameter named X)
+          * ``. NAME = expr ;``                       binding — sets the
+            default of underlying parameter NAME to expr
+        """
+        ps_attrs = {}
+        if self.at('(*'):
+            ps_attrs = self._parse_attributes()
+        self.expect('paramset')
+        name = self.consume_ident()
+        underlying = self.consume_ident()
+        ps = Paramset(name=name, underlying_name=underlying, attributes=ps_attrs)
+
+        while not self.at('endparamset'):
+            t = self.peek()
+            if t is None:
+                break
+            # Optional inline attribute on a parameter declaration.
+            attrs = {}
+            if self.at('(*'):
+                attrs = self._parse_attributes()
+            if self.at('parameter') or self.at('localparam'):
+                is_local = (self.peek().value == 'localparam')
+                self.advance()  # parameter / localparam
+                # Optional type token (real/integer)
+                typ = 'real'
+                if self.at('real') or self.at('integer'):
+                    typ = self.advance().value
+                pname = self.consume_ident()
+                # Some gnucap sources put the type AFTER the name:
+                # ``parameter rfmode integer = 0 from [0:1];``
+                if self.at('real') or self.at('integer'):
+                    typ = self.advance().value
+                if not self.at('='):
+                    # paramset parameters always carry a default — skip
+                    self._skip_to_semi()
+                    continue
+                self.advance()  # =
+                default_text = self._collect_param_value()
+                # Discard optional ``from [lo:hi]`` / ``exclude``
+                while self.at('from') or self.at('exclude'):
+                    self.advance()
+                    self._collect_param_value()
+                self._skip_inline_attrs()
+                self.expect(';')
+                if is_local:
+                    ps.localparams.append((pname, default_text))
+                else:
+                    p = Param(name=pname, type=typ,
+                              default=parse_number(default_text))
+                    # Paramset parameters are inherently the
+                    # instance-side overrides the caller supplies, so
+                    # default to is_instance=True unless the source
+                    # explicitly marks them otherwise.
+                    p.is_instance = (attrs.get('type') != 'model')
+                    if 'desc' in attrs:
+                        p.desc = attrs['desc']
+                    ps.params.append(p)
+                continue
+            if self.at('aliasparam'):
+                self.advance()
+                _alias = self.consume_ident()
+                if self.at('='):
+                    self.advance()
+                    self.consume_ident()  # original
+                self._skip_to_semi()
+                continue
+            if self.at('.'):
+                # ``.NAME = expr ;`` binding
+                self.advance()  # .
+                bname = self.consume_ident()
+                self.expect('=')
+                bexpr = self._collect_expr_until(';')
+                self.expect(';')
+                ps.bindings.append((bname, bexpr))
+                continue
+            if t.value.startswith('`'):
+                self._skip_directive()
+                continue
+            # Anything else inside a paramset body is unusual — skip to
+            # the next ``;`` to avoid eating ``endparamset``.
+            self._skip_to_semi()
+        self.expect('endparamset')
+        return ps
 
     def _skip_directive(self):
         """Skip preprocessor directive — consume tokens on the same line."""
@@ -998,14 +1121,162 @@ class Parser:
 # Public API
 # ---------------------------------------------------------------------------
 
-def parse_verilog_a(source: str, filename: str = "") -> Module:
-    """Parse a Verilog-A source string, return Module AST."""
+def _parse_all_entities(source: str, filename: str = ""):
+    """Parse every top-level ``module`` and ``paramset`` in source.
+
+    Returns a list whose items are Module or Paramset instances, in
+    the order they appear. Walks the token stream skipping preamble,
+    parsing one entity, advancing, repeating. The Parser instance is
+    advanced cooperatively (each parse_module / parse_paramset leaves
+    the stream pointed past its ``endmodule`` / ``endparamset``).
+    """
     tokens = tokenize(source)
     parser = Parser(tokens, source=source, filename=filename)
-    mod = parser.parse_module()
-    if mod.analog_block:
-        mod.analog_block = _lower_ternaries(mod.analog_block)
-    return mod
+    entities = []
+    while parser.pos < len(parser.tokens):
+        parser._skip_preamble()
+        if parser.pos >= len(parser.tokens):
+            break
+        t = parser.peek()
+        if t is None:
+            break
+        if t.value == 'paramset' or (t.value == '(*'):
+            # ``(* attrs *) [paramset|module] NAME ...``  Peek past attrs
+            # to decide which.
+            save = parser.pos
+            if t.value == '(*':
+                parser._parse_attributes()
+                tnxt = parser.peek()
+                parser.pos = save
+                if tnxt and tnxt.value == 'paramset':
+                    entities.append(parser.parse_paramset())
+                    continue
+                # else fall through to module
+            else:
+                entities.append(parser.parse_paramset())
+                continue
+        if parser.peek() and parser.peek().value == 'module':
+            mod = parser.parse_module()
+            if mod.analog_block:
+                mod.analog_block = _lower_ternaries(mod.analog_block)
+            entities.append(mod)
+            continue
+        # Unrecognised top-level token — advance to avoid an infinite
+        # loop on garbage between entities.
+        parser.advance()
+    return entities
+
+
+def parse_verilog_a(source: str, filename: str = "") -> Module:
+    """Parse a Verilog-A source string, return the primary Module.
+
+    If the source declares any paramsets, each is resolved against its
+    underlying module (also expected to live in the same compilation
+    unit) by overriding the underlying's parameter defaults — a paramset
+    is conceptually just a defaults-rewrite layer, not a new module.
+
+    When the file has a paramset, the resolved Module is returned. The
+    plain-module case is unchanged: returns the first ``module``.
+    """
+    entities = _parse_all_entities(source, filename=filename)
+    if not entities:
+        raise ParseError("No module found in file (macro/include-only file?)")
+    return _select_primary(entities, filename)
+
+
+def _select_primary(entities, filename):
+    """Pick the "primary" entity and resolve paramsets into Modules.
+
+    Priority:
+      1. The first ``Paramset`` in the file (a paramset_file.va is
+         typically a wrapper that ``\\`include``s its underlying — the
+         paramset is the entry point).
+      2. The first ``Module``.
+    """
+    # Build a name → Module index for paramset resolution
+    modules = {e.name: e for e in entities if isinstance(e, Module)}
+    paramsets = [e for e in entities if isinstance(e, Paramset)]
+    if paramsets:
+        ps = paramsets[0]
+        underlying = modules.get(ps.underlying_name)
+        if underlying is None:
+            raise ParseError(
+                f"paramset {ps.name} references unknown module "
+                f"{ps.underlying_name!r}; expected in same .va or via "
+                f"`include")
+        return _resolve_paramset(ps, underlying)
+    for e in entities:
+        if isinstance(e, Module):
+            return e
+    raise ParseError("No module/paramset found")
+
+
+def _resolve_paramset(ps: Paramset, underlying: Module) -> Module:
+    """Apply paramset defaults-overrides to the underlying Module.
+
+    Returns a NEW Module (does not mutate the underlying):
+      * name        = paramset's name
+      * ports       = underlying's ports
+      * variables   = underlying's variables
+      * branch_map  = underlying's branch_map
+      * internal_nodes = underlying's
+      * analog_block = underlying's analog_block, prefixed with
+        assignment statements for each paramset localparam so the
+        rebound default expressions resolve at evaluation time
+      * params      = paramset.params (instance params, declared
+        first so binding defaults can reference them) + the
+        underlying's params with bindings substituted as defaults
+        + paramset.localparams emitted as derived parameters
+      * attributes  = underlying ∪ paramset (paramset overrides)
+    """
+    # New params list:
+    #   1. paramset's own instance params (visible to binding defaults)
+    #   2. paramset's localparams as derived ``parameter real`` decls
+    #      (Verilog-A allows parameter defaults to reference earlier
+    #      parameters, so this preserves the localparam semantics
+    #      while keeping the AST a plain Module)
+    #   3. underlying's params with any binding rewrites applied
+    new_params = []
+    seen = set()
+    for p in ps.params:
+        if p.name in seen:
+            continue
+        new_params.append(p)
+        seen.add(p.name)
+    for lp_name, lp_expr in ps.localparams:
+        if lp_name in seen:
+            continue
+        new_params.append(Param(name=lp_name, type='real',
+                                default=lp_expr))
+        seen.add(lp_name)
+    binding_map = {b[0]: b[1] for b in ps.bindings}
+    for p in underlying.params:
+        if p.name in seen:
+            continue
+        new_default = binding_map.get(p.name, p.default)
+        new_params.append(Param(
+            name=p.name, type=p.type, default=new_default,
+            from_range=p.from_range,
+            is_instance=p.is_instance,
+            desc=p.desc,
+            array_size=p.array_size,
+            elements=p.elements,
+        ))
+        seen.add(p.name)
+
+    merged_attrs = dict(underlying.attributes)
+    merged_attrs.update(ps.attributes)
+
+    return Module(
+        name=ps.name,
+        ports=list(underlying.ports),
+        params=new_params,
+        variables=list(underlying.variables),
+        internal_nodes=list(underlying.internal_nodes),
+        branch_map=dict(underlying.branch_map),
+        analog_block=underlying.analog_block,
+        attributes=merged_attrs,
+    )
 
 
 def parse_file(path: str) -> Module:
@@ -1016,7 +1287,12 @@ def parse_file(path: str) -> Module:
     compact-model .va in /usr/local/share/xyce/verilog-a defines its
     parameters via macros (`\\`IPRnb`, `\\`MPRcc`, etc.) and brings them
     in via `\\`include`, so without preprocessing the parser sees no
-    parameters at all."""
+    parameters at all.
+
+    Paramsets in the file are resolved by overriding the underlying
+    module's parameter defaults — the returned Module is the paramset
+    name with the underlying's analog body and bindings-as-defaults.
+    """
     from .preprocess import preprocess_file
     source = preprocess_file(path)
     return parse_verilog_a(source, filename=path)

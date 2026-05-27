@@ -191,7 +191,31 @@ class _Preprocessor:
         self.expansions = 0
         self.max_expansions = max_expansions
         # Fallback search dirs (in order)
-        self.search_dirs = list(include_dirs or []) + _DEFAULT_FALLBACKS
+        # Search path: caller-supplied dirs, then PYMS_INCLUDE_PATH
+        # (colon-separated, recurse one level so an "IHP-Open-PDK" root
+        # finds includes under any of its module subdirectories), then
+        # compile-time fallbacks.
+        env_dirs = []
+        env_var = os.environ.get('PYMS_INCLUDE_PATH', '')
+        for entry in env_var.split(os.pathsep):
+            entry = entry.strip()
+            if not entry:
+                continue
+            env_dirs.append(entry)
+            # Auto-expand subdirectories one level deep so a single
+            # ``PYMS_INCLUDE_PATH=/foo/IHP-Open-PDK`` picks up
+            # IHP-Open-PDK/ihp-sg13g2/libs.tech/verilog-a/r3_cmc/, etc.
+            if os.path.isdir(entry):
+                for root, dirs, _ in os.walk(entry):
+                    for d in dirs:
+                        env_dirs.append(os.path.join(root, d))
+                    # Cap depth to avoid scanning all of /usr — 4
+                    # levels covers IHP's deepest nest.
+                    cur_depth = root[len(entry):].count(os.sep)
+                    if cur_depth >= 4:
+                        dirs.clear()
+        self.search_dirs = (list(include_dirs or [])
+                            + env_dirs + _DEFAULT_FALLBACKS)
         self.missing_includes: set[str] = set()
 
     def _emitting(self) -> bool:
