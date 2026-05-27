@@ -151,13 +151,33 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
     # Split scalar vs array params. Scalars go into Model/Instance class
     # members via addPar; arrays are emitted once as namespace-scope static
     # const double[].
-    params = []            # (name, default, is_instance) — scalars only
+    #
+    # Mangle parameter names that collide with C++ reserved words. The
+    # netlist sees the original name (via addPar's first arg, which we
+    # uppercase); only the C++ member changes. This is how IHP's
+    # ``parameter real short = 0.0;`` survives codegen.
+    _CXX_RESERVED = {
+        'short', 'long', 'int', 'char', 'float', 'double', 'void', 'bool',
+        'auto', 'const', 'static', 'extern', 'register', 'volatile',
+        'class', 'struct', 'union', 'enum', 'template', 'typename',
+        'new', 'delete', 'this', 'return', 'if', 'else', 'for', 'while',
+        'do', 'switch', 'case', 'default', 'break', 'continue', 'goto',
+        'try', 'catch', 'throw', 'namespace', 'using', 'public', 'private',
+        'protected', 'virtual', 'friend', 'inline', 'operator', 'sizeof',
+        'typeid', 'true', 'false', 'nullptr',
+    }
+    def _cxx_safe(nm):
+        return f'pyms_{nm}' if nm.lower() in _CXX_RESERVED else nm
+
+    params = []            # (name, default, is_instance, cxx_name) — scalars only
     array_params = []      # (name, array_size, elements)
     for p in mod.params:
         if getattr(p, 'array_size', None):
             array_params.append((p.name, p.array_size, p.elements or []))
         else:
-            params.append((p.name, p.default, getattr(p, 'is_instance', False)))
+            params.append((p.name, p.default,
+                           getattr(p, 'is_instance', False),
+                           _cxx_safe(p.name)))
 
     # Find contributions
     contribs = []
@@ -265,9 +285,9 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
     h.append('private:')
     h.append('  Model &model_;')
     # Instance parameters
-    for pname, pdefault, is_inst in params:
+    for pname, pdefault, is_inst, _cxx in params:
         if is_inst:
-            h.append(f'  double {pname};')
+            h.append(f'  double {_cxx};')
     h.append('')
     # LID storage
     for n in all_nodes:
@@ -309,9 +329,9 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
     h.append('private:')
     h.append('  std::vector<Instance*> instanceContainer;')
     # Model parameters
-    for pname, pdefault, is_inst in params:
+    for pname, pdefault, is_inst, _cxx in params:
         if not is_inst:
-            h.append(f'  double {pname};')
+            h.append(f'  double {_cxx};')
     h.append('  std::string vaFile_;')
     h.append('};')
     h.append('')
@@ -371,26 +391,26 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
 
     # Parameter registration
     c.append('void Traits::loadInstanceParameters(ParametricData<Instance> &p) {')
-    for pname, pdefault, is_inst in params:
+    for pname, pdefault, is_inst, _cxx in params:
         if is_inst:
             try:
                 dval = float(pdefault)
             except:
                 dval = 0.0
-            c.append(f'  p.addPar("{pname.upper()}", {dval}, &Instance::{pname})')
+            c.append(f'  p.addPar("{pname.upper()}", {dval}, &Instance::{_cxx})')
             c.append(f'    .setUnit(U_NONE)')
             c.append(f'    .setDescription("{pname}");')
     c.append('}')
     c.append('')
 
     c.append('void Traits::loadModelParameters(ParametricData<Model> &p) {')
-    for pname, pdefault, is_inst in params:
+    for pname, pdefault, is_inst, _cxx in params:
         if not is_inst:
             try:
                 dval = float(pdefault)
             except:
                 dval = 0.0
-            c.append(f'  p.addPar("{pname.upper()}", {dval}, &Model::{pname})')
+            c.append(f'  p.addPar("{pname.upper()}", {dval}, &Model::{_cxx})')
             c.append(f'    .setUnit(U_NONE)')
             c.append(f'    .setDescription("{pname}");')
     c.append('}')
@@ -418,13 +438,13 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
     c.append(f'  }}')
     c.append('')
     c.append('  // Set default instance param values')
-    for pname, pdefault, is_inst in params:
+    for pname, pdefault, is_inst, _cxx in params:
         if is_inst:
             try:
                 dval = float(pdefault)
             except:
                 dval = 0.0
-            c.append(f'  {pname} = {dval};')
+            c.append(f'  {_cxx} = {dval};')
     c.append('')
     c.append('  processParams();')
     c.append('}')
@@ -675,13 +695,13 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
     c.append('             const FactoryBlock &fb)')
     c.append('  : DeviceModel(mb, config.getModelParameters(), fb)')
     c.append('{')
-    for pname, pdefault, is_inst in params:
+    for pname, pdefault, is_inst, _cxx in params:
         if not is_inst:
             try:
                 dval = float(pdefault)
             except:
                 dval = 0.0
-            c.append(f'  {pname} = {dval};')
+            c.append(f'  {_cxx} = {dval};')
     c.append('  processParams();')
     c.append('}')
     c.append('')
@@ -724,6 +744,21 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
         c.append(f'    .registerDevice("q", {level_number})')
         c.append(f'    .registerModelType("npn", {level_number})')
         c.append(f'    .registerModelType("pnp", {level_number});')
+    elif model_group.upper() == 'RESISTOR' and level_number:
+        c.append(f'  Config<Traits>::addConfiguration()')
+        c.append(f'    .registerDevice("r", {level_number})')
+        c.append(f'    .registerModelType("r", {level_number})')
+        c.append(f'    .registerModelType("res", {level_number});')
+    elif model_group.upper() == 'CAPACITOR' and level_number:
+        c.append(f'  Config<Traits>::addConfiguration()')
+        c.append(f'    .registerDevice("c", {level_number})')
+        c.append(f'    .registerModelType("c", {level_number})')
+        c.append(f'    .registerModelType("cap", {level_number});')
+    elif model_group.upper() == 'INDUCTOR' and level_number:
+        c.append(f'  Config<Traits>::addConfiguration()')
+        c.append(f'    .registerDevice("l", {level_number})')
+        c.append(f'    .registerModelType("l", {level_number})')
+        c.append(f'    .registerModelType("ind", {level_number});')
     else:
         # Generic Y device — register with module name
         c.append(f'  Config<Traits>::addConfiguration()')

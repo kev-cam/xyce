@@ -49,12 +49,30 @@ my $opt_output  = '';
 my $opt_inplace = 0;
 my $opt_verbose = 0;
 my $opt_keep_gnd = 0;
+my $opt_paramset_lib = '';
 GetOptions(
-    'o=s'        => \$opt_output,
-    'inplace'    => \$opt_inplace,
-    'v|verbose'  => \$opt_verbose,
-    'keep-gnd'   => \$opt_keep_gnd,
+    'o=s'                => \$opt_output,
+    'inplace'            => \$opt_inplace,
+    'v|verbose'          => \$opt_verbose,
+    'keep-gnd'           => \$opt_keep_gnd,
+    'paramset-library=s' => \$opt_paramset_lib,
 ) or usage();
+
+# Load the optional paramset library produced by paramset2xyce.pl
+# --library. When set, instance lines whose type matches a known
+# paramset are inlined at the call site (the "macromodule" approach):
+# emit a per-instance .MODEL card and a device-letter card with the
+# bindings + localparams substituted in. No .SUBCKT wrapping, no
+# .SUBCKT-side instance/model split — each call resolves to one
+# native Xyce device card.
+our $PARAMSETS = {};
+if ($opt_paramset_lib) {
+    my $rc = do $opt_paramset_lib;
+    die "gnucap2xyce: can't load paramset library $opt_paramset_lib: $@$!\n"
+        unless $rc;
+    verbose(scalar(keys %$PARAMSETS) . " paramsets loaded from "
+          . $opt_paramset_lib);
+}
 
 usage() unless @ARGV;
 my $gc_input = $ARGV[0];
@@ -262,6 +280,16 @@ sub emit_instance {
         return sprintf("%s %s %s %s",
                        $with_letter->('R', $name), $nodes[0], $nodes[1], $r);
     }
+    # Paramset inline expansion (macromodule-style flattening). If
+    # the instance's type matches a paramset loaded from the
+    # --paramset-library, we emit a per-instance .MODEL + device
+    # card with all localparam computations and bindings substituted
+    # in at the call site — no .SUBCKT, no instance/model param
+    # splitting indirection.
+    if (exists $PARAMSETS->{$type}) {
+        return expand_paramset_inline($PARAMSETS->{$type}, $inst, $gnd);
+    }
+
     # Generic: X-subckt instance. Param list goes through verbatim;
     # PyMS-auto-loaded modules accept ``key=val`` instance params,
     # subcircuits accept them via PARAMS:.
@@ -273,6 +301,119 @@ sub emit_instance {
     }
     return sprintf("%s %s %s",
                    $iname, join(' ', @nodes), $type);
+}
+
+# Inline-expand a paramset call. Produces one or more netlist lines
+# (joined with \n by the caller).
+sub expand_paramset_inline {
+    my ($ps, $inst, $gnd) = @_;
+    my $iname = $inst->{inst};
+
+    # Resolve the call-site value for each paramset-declared instance
+    # parameter: testbench overrides win, otherwise the paramset's
+    # default.
+    my %callvals;
+    for my $p (@{$ps->{params}}) {
+        $callvals{$p->[0]} = $p->[1];
+    }
+    for my $cp (@{$inst->{params}}) {
+        $callvals{$cp->{name}} = $cp->{val};
+    }
+
+    # Substitute paramset params (with their call-site values) into
+    # an expression. Word-boundary so ``w`` doesn't eat into ``weff``.
+    my $subst_params = sub {
+        my ($e) = @_;
+        for my $k (keys %callvals) {
+            my $v = $callvals{$k};
+            $e =~ s/\b\Q$k\E\b/($v)/g;
+        }
+        return $e;
+    };
+
+    # Substitute the paramset's localparam names with the
+    # instance-prefixed names that the per-instance .PARAM lines emit.
+    # Localparams reference earlier localparams; prefixing keeps them
+    # disambiguated across multiple paramset instances in one netlist.
+    my $subst_locals = sub {
+        my ($e) = @_;
+        for my $lp (@{$ps->{localparams}}) {
+            my $n = $lp->[0];
+            $e =~ s/\b\Q$n\E\b/${iname}_$n/g;
+        }
+        return $e;
+    };
+
+    my @lines;
+    # Localparams: emit each as a .PARAM with paramset-param values
+    # substituted and PRIOR localparams renamed to <inst>_<name>.
+    # (For the current localparam being defined, we don't rename
+    # references to itself — they only appear via earlier locals.)
+    for my $lp (@{$ps->{localparams}}) {
+        my $expr = $subst_params->($lp->[1]);
+        # Replace references to *other* localparams (skip self).
+        for my $other (@{$ps->{localparams}}) {
+            next if $other->[0] eq $lp->[0];
+            $expr =~ s/\b\Q$other->[0]\E\b/${iname}_$other->[0]/g;
+        }
+        push @lines, sprintf(".PARAM %s_%s={%s}",
+                             $iname, $lp->[0], $expr);
+    }
+
+    # Map testbench nodes onto the underlying's full port list,
+    # padding any missing tail ports with 0 (gnucap behaviour: a
+    # paramset called with N nodes ties any remaining ports to 0).
+    my @device_nodes = @{$ps->{device_nodes}};
+    my @passed = map { xyce_node($_, $gnd) } @{$inst->{nodes}};
+    my @final_nodes;
+    for (my $i = 0; $i < @device_nodes; $i++) {
+        if ($i < @passed) {
+            push @final_nodes, $passed[$i];
+        } else {
+            # Use whatever the paramset's device_nodes carried as the
+            # default (typically '0' for the trailing thermal port).
+            push @final_nodes, $device_nodes[$i];
+        }
+    }
+
+    if (defined $ps->{level} && $ps->{letter} ne 'X') {
+        my $mname = "m_" . $iname;
+        my @mbinds;
+        for my $b (@{$ps->{model_bindings}}) {
+            my $e = $subst_locals->($subst_params->($b->[1]));
+            push @mbinds, sprintf("%s={%s}", $b->[0], $e);
+        }
+        my $mcard = sprintf(".MODEL %s %s level=%d",
+                            $mname, $ps->{type}, $ps->{level});
+        $mcard .= "\n+ " . join(" ", @mbinds) if @mbinds;
+        push @lines, $mcard;
+
+        my @ibinds;
+        for my $b (@{$ps->{inst_bindings}}) {
+            my $e = $subst_locals->($subst_params->($b->[1]));
+            push @ibinds, sprintf("%s={%s}", $b->[0], $e);
+        }
+        my $dev_line = sprintf("%s%s %s %s",
+                               $ps->{letter}, $iname,
+                               join(' ', @final_nodes), $mname);
+        $dev_line .= ' ' . join(' ', @ibinds) if @ibinds;
+        push @lines, $dev_line;
+    } else {
+        # Fallback when no device family is known — emit an X-call
+        # to a .SUBCKT named after the paramset (caller must
+        # .INCLUDE a paramset2xyce.pl -o .cir for this to resolve).
+        push @lines, sprintf("* paramset %s: no device-family mapping; "
+                           . "X-call to a .SUBCKT", $ps->{underlying});
+        my @ibinds;
+        for my $b ((@{$ps->{inst_bindings}}, @{$ps->{model_bindings}})) {
+            my $e = $subst_locals->($subst_params->($b->[1]));
+            push @ibinds, sprintf("%s={%s}", $b->[0], $e);
+        }
+        push @lines, sprintf("X%s %s %s%s",
+                             $iname, join(' ', @final_nodes), $ps->{name},
+                             @ibinds ? " " . join(' ', @ibinds) : '');
+    }
+    return join("\n", @lines);
 }
 
 # ---------------------------------------------------------------------------
@@ -426,13 +567,20 @@ sub parse_print_exprs {
 # ``I(Vvdd_src)`` since the vsource was emitted as ``V<name>``.
 # ``iter(0)`` is gnucap-specific — silently drop.
 sub xlate_probe_expr {
-    my ($e, $vsrcs, $isrcs) = @_;
+    my ($e, $vsrcs, $isrcs, $dev_first_node) = @_;
     return undef if $e =~ /^iter\(/i;
     if ($e =~ /^([vi])\(\s*(.+?)\s*\)$/i) {
         my ($kind, $arg) = (lc $1, $2);
         # Strip ``tb.`` prefix — testbench is inlined at top level
         $arg =~ s/^tb\.//;
         if ($kind eq 'v') {
+            # gnucap convention: ``v(<device>)`` is the voltage at the
+            # device's first non-ground terminal. Xyce's V() takes a
+            # NODE name, not a device name, so look up the device-to-
+            # first-node map and substitute.
+            if (defined $dev_first_node && exists $dev_first_node->{$arg}) {
+                return "V($dev_first_node->{$arg})";
+            }
             # Multiple comma-separated nodes inside V(): keep as-is
             return "V($arg)";
         } else {
@@ -520,8 +668,9 @@ sub emit {
     }
 
     # Testbench inlining
-    my %vsrcs;  # name => 1 (for I() probe rewriting)
+    my %vsrcs;  # name => emitted-name (for I() probe rewriting)
     my %isrcs;
+    my %dev_first_node;   # gnucap inst name → first non-gnd node, for V() probes
     if ($tb) {
         my $gnd = $opt_keep_gnd ? '' : ($tb->{ground_node} // '');
 
@@ -556,6 +705,14 @@ sub emit {
             if ($i->{type} eq 'idc') {
                 $isrcs{$i->{inst}} = $i->{emitted_name} // ('I' . $i->{inst});
             }
+            # Record the first non-ground node for V() probe rewriting.
+            # gnucap's ``v(r1)`` = voltage at r1's first non-gnd terminal.
+            my $first_nongnd;
+            for my $n (@{$i->{nodes}}) {
+                my $xn = xyce_node($n, $gnd);
+                if ($xn ne '0') { $first_nongnd = $xn; last }
+            }
+            $dev_first_node{$i->{inst}} = $first_nongnd if defined $first_nongnd;
         }
     }
     push @out, "";
@@ -577,7 +734,7 @@ sub emit {
         my $k = uc $pr->{kind};
         my @e;
         for my $x (@{$pr->{exprs}}) {
-            my $t = xlate_probe_expr($x, \%vsrcs, \%isrcs);
+            my $t = xlate_probe_expr($x, \%vsrcs, \%isrcs, \%dev_first_node);
             push @e, $t if defined $t;
         }
         push @out, ".PRINT $k " . join(' ', @e) if @e;
@@ -594,6 +751,53 @@ sub emit {
     }
 
     push @out, ".END";
+
+    # Sanity pass: any identifier referenced inside ``{ ... }``
+    # braced expressions OR as a bare value of a ``param=value`` token
+    # that hasn't been defined as a ``.PARAM`` gets a 0-default
+    # emitted near the top. Most common cause: paramset bindings that
+    # reference a statistical-corner module the testbench doesn't
+    # instantiate (e.g. ``res_stat_param.drsh_rsil`` flattens to
+    # ``drsh_rsil`` but only the typical corner is included).
+    my %defined;
+    for my $ln (@out) {
+        while ($ln =~ /^\s*\.PARAM\s+(\w+)\s*=/gmi) { $defined{lc $1} = 1 }
+    }
+    my %referenced;
+    for my $ln (@out) {
+        # ``{ expr }`` blocks
+        while ($ln =~ /\{([^{}]*)\}/g) {
+            my $expr = $1;
+            while ($expr =~ /\b([A-Za-z_][A-Za-z0-9_]*)\b/g) {
+                $referenced{lc $1} = 1;
+            }
+        }
+    }
+    # Known Xyce reserved/built-in identifiers — don't fallback-default
+    # these even if they appear in expressions.
+    my %reserved = map { $_ => 1 } qw(
+        time temp tnom v i sqrt exp log ln pow abs min max
+        sin cos tan atan asin acos sinh cosh tanh atan2
+        if else inf
+    );
+    my @missing;
+    for my $r (sort keys %referenced) {
+        next if $defined{$r} || $reserved{$r};
+        # Numeric constants picked up by the regex (rare — already
+        # filtered by the leading letter, but ``e6`` etc. could slip
+        # through after a digit).
+        next if $r =~ /^\d/;
+        push @missing, $r;
+    }
+    if (@missing) {
+        my @prologue = ("* gnucap2xyce: 0-defaults for params referenced "
+                      . "but not defined (probably statistical-corner "
+                      . "bindings; typical-corner sim drops the variance):");
+        push @prologue, ".PARAM $_=0" for @missing;
+        # Insert just after the header comments (line 2) so PARAMs
+        # are defined before any usage.
+        splice @out, 2, 0, @prologue;
+    }
     return join("\n", @out) . "\n";
 }
 
