@@ -67,7 +67,7 @@ def scan_va_attributes(va_path: str) -> dict:
             text = f.read()
 
     # Candidate windows: each is a ``(* ... *)`` block adjacent to a
-    # ``module`` keyword (either side). The block can span multiple
+    # ``module`` or ``paramset`` keyword. The block can span multiple
     # lines and may contain comma- or space-separated key=value pairs.
     candidates = []
     # Post-decl: ``module name(ports) (* ... *)``
@@ -77,6 +77,10 @@ def scan_va_attributes(va_path: str) -> dict:
     # Pre-decl: ``(* ... *) module name(ports)``
     for m in re.finditer(
             r'\(\*(.*?)\*\)\s*module\s+\w+\s*\(', text, re.DOTALL):
+        candidates.append(m.group(1))
+    # Pre-decl on paramset: ``(* ... *) paramset NAME UNDERLYING``
+    for m in re.finditer(
+            r'\(\*(.*?)\*\)\s*paramset\s+\w+\s+\w+', text, re.DOTALL):
         candidates.append(m.group(1))
 
     # Pick the first candidate whose body actually mentions

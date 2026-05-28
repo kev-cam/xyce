@@ -50,21 +50,27 @@ my $opt_inplace = 0;
 my $opt_verbose = 0;
 my $opt_keep_gnd = 0;
 my $opt_paramset_lib = '';
+my @opt_paramset_va;
+my $opt_paramset_dir = '';
+my @opt_corner_search;
 GetOptions(
     'o=s'                => \$opt_output,
     'inplace'            => \$opt_inplace,
     'v|verbose'          => \$opt_verbose,
     'keep-gnd'           => \$opt_keep_gnd,
     'paramset-library=s' => \$opt_paramset_lib,
+    'paramset-va=s'      => \@opt_paramset_va,
+    'paramset-dir=s'     => \$opt_paramset_dir,
+    'corner-search=s'    => \@opt_corner_search,
 ) or usage();
 
 # Load the optional paramset library produced by paramset2xyce.pl
-# --library. When set, instance lines whose type matches a known
-# paramset are inlined at the call site (the "macromodule" approach):
-# emit a per-instance .MODEL card and a device-letter card with the
-# bindings + localparams substituted in. No .SUBCKT wrapping, no
-# .SUBCKT-side instance/model split — each call resolves to one
-# native Xyce device card.
+# --library — legacy inline-expansion mode kept for back-compat. The
+# new default path is pass-through: paramsets get emitted as
+# per-paramset .va files that PyMS parses (it knows ``paramset`` syntax
+# now and resolves bindings into the underlying module's parameter
+# defaults). The .cir emits .HDL for each and .MODEL/device cards at
+# the instance sites.
 our $PARAMSETS = {};
 if ($opt_paramset_lib) {
     my $rc = do $opt_paramset_lib;
@@ -74,12 +80,279 @@ if ($opt_paramset_lib) {
           . $opt_paramset_lib);
 }
 
+# Pass-through mode bookkeeping. ``%PARAMSET_TBL`` indexes paramsets
+# parsed from any --paramset-va inputs OR auto-discovered from the
+# testbench's ``load`` directives: { name => { ... } }. Filled by
+# discover_paramsets().
+our %PARAMSET_TBL;
+# Per-conversion auto-assigned device-level numbers (paramsets need
+# UNIQUE xyceLevelNumbers so PyMS auto-discovery keys (R,9101) ≠
+# (R,9102)). Counter advances from 9100 to keep clear of compact-
+# model levels (BSIM-CMG 107..111, PSP 102/103, BSIM-SOI 70.., etc.).
+our $LEVEL_COUNTER = 9100;
+# Built-in defaults for the IHP gnucap-stats catalog. Override via
+# the underlying-aware ``%UNDERLYING_INFO`` below if a paramset
+# wants a different mapping.
+our %UNDERLYING_INFO = (
+    sp_resistor  => { letter => 'R', model_type => 'R'    },
+    sp_capacitor => { letter => 'C', model_type => 'C'    },
+    r3_cmc       => { letter => 'R', model_type => 'R'    },
+    PSP103VA     => { letter => 'M', model_type => 'NMOS' },
+    PSP103TVA    => { letter => 'M', model_type => 'NMOS' },
+    psp103va     => { letter => 'M', model_type => 'NMOS' },
+    PSP103_VA    => { letter => 'M', model_type => 'NMOS' },
+    BSIM6        => { letter => 'M', model_type => 'NMOS' },
+    bsim6        => { letter => 'M', model_type => 'NMOS' },
+    bsimcmg_108  => { letter => 'M', model_type => 'NMOS' },
+    bsimcmg_110  => { letter => 'M', model_type => 'NMOS' },
+    bsimcmg_111  => { letter => 'M', model_type => 'NMOS' },
+    sg13_hv_nmos => { letter => 'M', model_type => 'NMOS' },
+    sg13_hv_pmos => { letter => 'M', model_type => 'PMOS' },
+    sg13_lv_nmos => { letter => 'M', model_type => 'NMOS' },
+    sg13_lv_pmos => { letter => 'M', model_type => 'PMOS' },
+    cap_cmim     => { letter => 'C', model_type => 'C'    },
+    cap_rfcmim   => { letter => 'C', model_type => 'C'    },
+);
+
 usage() unless @ARGV;
 my $gc_input = $ARGV[0];
 my $gc_dir   = dirname($gc_input);
 
 sub verbose { print STDERR "gnucap2xyce: @_\n" if $opt_verbose }
-sub usage   { die "Usage: $0 [-o out.cir] [--inplace] [-v] <input.gc> [input.va]\n" }
+sub usage {
+    die "Usage: $0 [options] <input.gc> [input.va]\n"
+      . "Options:\n"
+      . "  -o FILE                 write .cir to FILE (default: <input>.cir)\n"
+      . "  --inplace               write next to the .gc\n"
+      . "  --paramset-va FILE      paramset .va to scan (repeatable)\n"
+      . "  --paramset-dir DIR      write generated per-paramset .va files here\n"
+      . "                          (default: same dir as the .cir output)\n"
+      . "  --corner-search PATH    extra dirs to search for cornerXXX.va files\n"
+      . "  --paramset-library FILE  legacy inline-expansion mode\n"
+      . "  -v|--verbose            chatter to stderr\n"
+      . "  --keep-gnd              don't rewrite the ``ground`` node to 0\n";
+}
+
+# ---------------------------------------------------------------------------
+# Paramset pass-through helpers
+# ---------------------------------------------------------------------------
+
+# Parse every ``paramset NAME UNDERLYING ... endparamset`` declaration in
+# a .va file. Comments are stripped first (matching the parser's order)
+# so a trailing ``//`` doesn't eat the following statement.
+sub parse_paramset_file {
+    my ($path) = @_;
+    my @lines  = slurp_file($path);
+    my $text   = join("\n", map { strip_line_comment($_) } @lines);
+    # /* ... */ block comments removed too — IHP sources use them.
+    $text =~ s{/\*.*?\*/}{ }gs;
+    my @out;
+    while ($text =~ /\bparamset\s+(\w+)\s+(\w+)(.*?)endparamset/sg) {
+        my ($name, $under, $body) = ($1, $2, $3);
+        push @out, {
+            name       => $name,
+            underlying => $under,
+            body_text  => $body,
+            src_path   => $path,
+        };
+    }
+    return @out;
+}
+
+# Build the global %PARAMSET_TBL from the explicit --paramset-va files
+# and any auto-discovered paramset .va sitting next to the testbench
+# (the gnucap testbenches do ``load …paramset.so`` to bring them in;
+# the .so doesn't exist for us, but the .va alongside does).
+sub discover_paramsets {
+    my ($gc_path, $tb_va_path) = @_;
+    my @files = @opt_paramset_va;
+    my $base_dir = dirname($gc_path);
+
+    # Auto-discovery: peek at the testbench .va's ``load`` directives.
+    my @candidates;
+    if ($tb_va_path && -f $tb_va_path) {
+        open my $f, '<', $tb_va_path or last;
+        while (my $line = <$f>) {
+            $line = strip_line_comment($line);
+            if ($line =~ m{^\s*load\s+(\S+)}i) {
+                my $rel = $1;
+                $rel =~ s/\.so$/.va/;     # ``foo_paramset.so`` → ``foo_paramset.va``
+                # plugins/models/X.va → models/X.va (gnucap build layout)
+                (my $fallback = $rel) =~ s{plugins/models/}{models/};
+                push @candidates, $rel, $fallback;
+            }
+        }
+        close $f;
+    }
+    for my $c (@candidates) {
+        my $abs = File::Spec->file_name_is_absolute($c)
+                ? $c : File::Spec->rel2abs($c, $base_dir);
+        if (-f $abs) {
+            push @files, $abs;
+            verbose("auto-discovered paramset .va: $abs");
+        }
+    }
+
+    # Plus walk the ../../../models/ tree relative to the .gc if the
+    # IHP layout is detected (gnucap/tests/gnucap/<dut>/<test>.gc).
+    my $auto_models = File::Spec->rel2abs("$base_dir/../../../models",
+                                          $base_dir);
+    if (-d $auto_models) {
+        opendir my $d, $auto_models or last;
+        for my $f (readdir $d) {
+            if ($f =~ /_paramset\.va$/) {
+                my $abs = "$auto_models/$f";
+                push @files, $abs unless grep { $_ eq $abs } @files;
+            }
+        }
+        closedir $d;
+    }
+
+    my %seen;
+    for my $f (@files) {
+        next if $seen{$f}++;
+        next unless -f $f;
+        for my $ps (parse_paramset_file($f)) {
+            next if exists $PARAMSET_TBL{$ps->{name}};
+            $PARAMSET_TBL{$ps->{name}} = $ps;
+        }
+    }
+    verbose(scalar(keys %PARAMSET_TBL) . " paramsets known");
+}
+
+# Lookup chain: explicit --paramset-vas → testbench load directives →
+# IHP convention. Returns the path of an underlying compact-model .va
+# we can `\\`include from a generated paramset .va, or empty string.
+sub locate_underlying_va {
+    my ($name, $gc_path) = @_;
+    my $base_dir = dirname($gc_path);
+
+    # Common IHP layouts to try:
+    my @search;
+    push @search, "$base_dir/../../../models";              # gnucap/models/
+    push @search, "$base_dir/../../../../verilog-a/$name"; # verilog-a/<name>/
+    push @search, "$base_dir/../../../../verilog-a/$name"; # same with -1 level
+    push @search, "/usr/local/share/xyce/verilog-a";        # install tree
+    push @search, "/usr/local/src/IHP-Open-PDK/ihp-sg13g2/libs.tech/verilog-a";
+    push @search, "/usr/local/src/IHP-Open-PDK/ihp-sg13g2/libs.tech/gnucap/models";
+    for my $d (@search) {
+        next unless -d $d;
+        # Standard cases — file named directly after the module
+        for my $f ("$d/$name.va", "$d/$name/$name.va") {
+            return $f if -f $f;
+        }
+        # IHP layout: sp_resistor lives in resistor.va, sp_capacitor in
+        # capacitor.va; map module-name → file-name when the obvious
+        # name doesn't exist.
+        my %alias = (
+            sp_resistor  => 'resistor.va',
+            sp_capacitor => 'capacitor.va',
+        );
+        if ($alias{$name} && -f "$d/$alias{$name}") {
+            return "$d/$alias{$name}";
+        }
+    }
+    return '';
+}
+
+# Extract a corner module's localparams as { name => value-expr }.
+# When the .gc driver instantiates ``moshv_tt corner_moshv()``, the
+# bindings inside the paramset refer to that corner's localparams
+# through ``corner_moshv.foo``. We pull them out so we can either
+# bake values into the generated paramset .va or emit them as
+# top-level .PARAMs in the .cir.
+sub extract_corner_localparams {
+    my ($corner_va_path, $module_name) = @_;
+    return () unless -f $corner_va_path;
+    my @lines = slurp_file($corner_va_path);
+    my %out;
+    my $in_target = 0;
+    for my $raw (@lines) {
+        my $line = strip_line_comment($raw);
+        if ($line =~ /^\s*module\s+(\w+)\s*\(/) {
+            $in_target = ($1 eq $module_name);
+            next;
+        }
+        if ($line =~ /^\s*endmodule\b/ && $in_target) { $in_target = 0; next }
+        next unless $in_target;
+        if ($line =~ /^\s*localparam\s+(?:(?:real|integer)\s+)?(\w+)\s*=\s*([^;]+?)\s*;/) {
+            $out{$1} = $2;
+        }
+    }
+    return %out;
+}
+
+# Generate a per-paramset .va file. The file:
+#   - `\`include`s the underlying compact-model .va
+#   - declares any corner-derived parameters needed by the paramset
+#     bindings (so ``corner_res.foo`` references resolve to values
+#     visible to PyMS inside the paramset's scope)
+#   - re-emits the original paramset body with the ``corner_X.`` prefix
+#     stripped from identifier references
+#   - tags the paramset with xyceModelGroup + xyceLevelNumber so the
+#     C++ auto-loader registers it under the right device family
+sub emit_paramset_va {
+    my ($ps, $info, $level, $out_path, $underlying_va,
+        $corner_vals_ref) = @_;
+    my %cv = %$corner_vals_ref;
+    my $body = $ps->{body_text};
+
+    # Strip ``corner_<x>.name`` hierarchical refs in the body, and
+    # collect the set of distinct simple-name references they map to.
+    my %needed_corner;
+    $body =~ s{\b(\w+)\.(\w+)\b}{
+        if (defined $cv{$2}) {
+            $needed_corner{$2} = $cv{$2};
+            $2;                   # rewrite to bare identifier
+        } else {
+            "$1.$2";              # leave alone (might be a real hierarchical ref)
+        }
+    }ge;
+
+    # Strip aliasparam — PyMS doesn't model aliases and the binding
+    # path doesn't need them.
+    $body =~ s/^\s*aliasparam\s+\w+\s*=\s*\w+\s*;\s*$//mg;
+
+    open my $fh, '>', $out_path
+        or die "gnucap2xyce: cannot write $out_path: $!\n";
+    print $fh "// Generated by gnucap2xyce.pl from paramset $ps->{name}\n";
+    print $fh "// Original source: $ps->{src_path}\n";
+    print $fh "// Underlying compact model: $ps->{underlying}\n\n";
+    if ($underlying_va) {
+        print $fh "`include \"$underlying_va\"\n\n";
+    }
+    # Emit corner-derived params as Verilog-A parameter decls so the
+    # paramset body's references resolve.
+    if (%needed_corner) {
+        print $fh "// Corner-derived constants (from cornerXXX.va):\n";
+        for my $k (sort keys %needed_corner) {
+            print $fh "parameter real $k = $needed_corner{$k};\n";
+        }
+        print $fh "\n";
+    }
+    # Xyce attribute tag for auto-discovery.
+    my $devname = "IHP $ps->{name} paramset";
+    print $fh "(* xyceModelGroup=\""
+            . _group_for_letter($info->{letter})
+            . "\" xyceLevelNumber=\"$level\" "
+            . "xyceDeviceName=\"$devname\" *)\n";
+    print $fh "paramset $ps->{name} $ps->{underlying}\n";
+    print $fh $body;
+    print $fh "\nendparamset\n";
+    close $fh;
+    verbose("wrote $out_path (level=$level)");
+}
+
+sub _group_for_letter {
+    my ($l) = @_;
+    return 'MOSFET'    if $l eq 'M';
+    return 'BJT'       if $l eq 'Q';
+    return 'Diode'     if $l eq 'D';
+    return 'Resistor'  if $l eq 'R';
+    return 'Capacitor' if $l eq 'C';
+    return 'Inductor'  if $l eq 'L';
+    return '';
+}
 
 # ---------------------------------------------------------------------------
 # Read a file with comment-aware line joining. Gnucap uses // for comments
@@ -238,7 +511,7 @@ sub xyce_node {
 # or has a matching .SUBCKT/.MODEL elsewhere).
 # ---------------------------------------------------------------------------
 sub emit_instance {
-    my ($inst, $gnd) = @_;
+    my ($inst, $gnd, $paramset_resolved) = @_;
     my $type = $inst->{type};
     my $name = $inst->{inst};
     my @nodes = map { xyce_node($_, $gnd) } @{$inst->{nodes}};
@@ -280,12 +553,33 @@ sub emit_instance {
         return sprintf("%s %s %s %s",
                        $with_letter->('R', $name), $nodes[0], $nodes[1], $r);
     }
-    # Paramset inline expansion (macromodule-style flattening). If
-    # the instance's type matches a paramset loaded from the
-    # --paramset-library, we emit a per-instance .MODEL + device
-    # card with all localparam computations and bindings substituted
-    # in at the call site — no .SUBCKT, no instance/model param
-    # splitting indirection.
+    # Paramset pass-through. If a per-paramset .va was generated
+    # for this type, just emit a device-letter card referencing the
+    # already-emitted .MODEL. PyMS' paramset resolver handles the
+    # bindings; here we only stamp instance params from the call.
+    if ($paramset_resolved && exists $paramset_resolved->{$type}) {
+        my $r = $paramset_resolved->{$type};
+        my $letter = $r->{info}{letter};
+        my $iname = $with_letter->($letter, $name);
+        # Pad the node list to the underlying's full port count
+        # before the model name. The PyMS wrapper's registerLIDs
+        # indexes extLIDVec[0..n_ext-1] unconditionally, so missing
+        # optional ports must be supplied as ``0`` (ground) rather
+        # than omitted. Without padding, the underlying-thermal /
+        # body-pickup index is past-end → uninitialised LID →
+        # segfault during matrixGlobalToLocal.
+        my $n_underlying = $r->{n_underlying_ports} // scalar @nodes;
+        my @padded = @nodes;
+        while (@padded < $n_underlying) { push @padded, '0' }
+        my @inst_kvs = map { "$_->{name}=$_->{val}" } @{$inst->{params}};
+        my $line = sprintf("%s %s %s",
+                           $iname, join(' ', @padded), $r->{model_name});
+        $line .= ' ' . join(' ', @inst_kvs) if @inst_kvs;
+        return $line;
+    }
+
+    # Legacy inline-expansion path (kept for back-compat with
+    # --paramset-library mode).
     if (exists $PARAMSETS->{$type}) {
         return expand_paramset_inline($PARAMSETS->{$type}, $inst, $gnd);
     }
@@ -634,6 +928,97 @@ sub emit {
 
     my $tb = $tb_va_path ? parse_tb_va($tb_va_path) : undef;
 
+    # --- Paramset pass-through pre-pass ---
+    # Discover paramset .va files referenced by the testbench (or
+    # supplied explicitly), then for each paramset the testbench
+    # actually instantiates, generate a per-paramset .va next to the
+    # output .cir. Each gets a unique xyceLevelNumber so PyMS auto-
+    # discovery registers (R/C/M/Q/D, <level>) → that paramset's .va.
+    discover_paramsets($gc_path, $tb_va_path)
+        unless $opt_paramset_lib;
+    # Map: gnucap-instance-type → { level, info, va_path } for the
+    # generated .va. Populated as we see paramset instances referenced.
+    my %paramset_resolved;
+    my $paramset_dir = $opt_paramset_dir;
+    if (!$paramset_dir) {
+        $paramset_dir = $opt_output ? dirname($opt_output) : $gc_dir;
+    }
+    # Extract corner localparams for substitution into paramset bodies.
+    # ``corner_<x>.foo`` references inside paramsets are rewritten to
+    # bare ``foo`` and the value is emitted as a parameter declaration
+    # at the head of the generated paramset .va.
+    my %corner_vals;
+    for my $corner_inst (@corner_insts) {
+        my $cmod_name = $corner_inst->{type};
+        # Look up the corner module's .va by searching the include list.
+        my $cpath;
+        for my $inc (@{$gc->{includes}}) {
+            next unless $inc =~ /\.va$/ && -f $inc;
+            my @ls = slurp_file($inc);
+            for my $l (@ls) {
+                if ($l =~ /^\s*module\s+\Q$cmod_name\E\s*\(/) {
+                    $cpath = $inc; last;
+                }
+            }
+            last if $cpath;
+        }
+        if ($cpath) {
+            my %vals = extract_corner_localparams($cpath, $cmod_name);
+            for my $k (keys %vals) { $corner_vals{$k} //= $vals{$k} }
+        }
+    }
+
+    # Pre-resolve every paramset the testbench instantiates so we
+    # know the levels + paths when emitting the .HDL and .MODEL lines
+    # below.
+    if ($tb) {
+        for my $i (@{$tb->{instances}}) {
+            my $t = $i->{type};
+            next unless $PARAMSET_TBL{$t};
+            next if $paramset_resolved{$t};
+            my $ps = $PARAMSET_TBL{$t};
+            my $info = $UNDERLYING_INFO{$ps->{underlying}};
+            unless ($info) {
+                verbose("WARNING: no UNDERLYING_INFO for "
+                      . "$ps->{underlying} (paramset $t); "
+                      . "defaulting to letter=X");
+                $info = { letter => 'X', model_type => $ps->{underlying} };
+            }
+            $LEVEL_COUNTER++;
+            my $level = $LEVEL_COUNTER;
+            my $out_file = File::Spec->catfile(
+                $paramset_dir, "_ps_$ps->{name}.va");
+            my $underlying_va = locate_underlying_va(
+                $ps->{underlying}, $gc_path);
+            emit_paramset_va($ps, $info, $level, $out_file,
+                             $underlying_va, \%corner_vals);
+            # Count the underlying's port list so we can pad missing
+            # nodes on the device card. Cheap-and-cheerful: parse the
+            # paramset body's ``\`include`` target for ``module
+            # UNDERLYING(...)`` and count commas + 1.
+            my $n_under_ports = 0;
+            if ($underlying_va && -f $underlying_va) {
+                open my $f, '<', $underlying_va or next;
+                while (my $l = <$f>) {
+                    if ($l =~ /^\s*module\s+\Q$ps->{underlying}\E\s*\(([^)]*)\)/) {
+                        my $pl = $1;
+                        $pl =~ s/\s+//g;
+                        $n_under_ports = scalar(split /,/, $pl);
+                        last;
+                    }
+                }
+                close $f;
+            }
+            $paramset_resolved{$t} = {
+                level     => $level,
+                info      => $info,
+                va_path   => $out_file,
+                model_name => "m_$ps->{name}",
+                n_underlying_ports => $n_under_ports,
+            };
+        }
+    }
+
     my @out;
     push @out, "* Generated by gnucap2xyce.pl from " . basename($gc_path);
     push @out, "* Source testbench: " . basename($tb_va_path)
@@ -642,8 +1027,7 @@ sub emit {
 
     # Module include files (compact-model wrappers): emit as .HDL so
     # PyMS picks them up. Corner .va files contain only localparam
-    # declarations — translate to .PARAM lines for now (TODO: support
-    # corner selection via the gc driver's ``moshv_ff corner_moshv();``).
+    # declarations — translate to .PARAM lines.
     my %seen_inc;
     for my $inc (@{$gc->{includes}}) {
         next if $seen_inc{$inc}++;
@@ -652,11 +1036,22 @@ sub emit {
         my $base = basename($inc);
         if ($base =~ /^corner/i) {
             push @out, emit_corner_params($inc, $gc);
+        } elsif ($inc =~ /_paramset\.va$/) {
+            # Paramset files don't get .HDL'd directly — we emit
+            # per-paramset split files below. The original file is just
+            # informational here.
+            push @out, "* original paramset source: $inc";
         } elsif ($inc =~ /\.va$/) {
             push @out, qq{.HDL "$inc"};
         } else {
             push @out, qq{.INCLUDE "$inc"};
         }
+    }
+
+    # .HDL the generated per-paramset .va files.
+    for my $t (sort keys %paramset_resolved) {
+        my $r = $paramset_resolved{$t};
+        push @out, qq{.HDL "$r->{va_path}"};
     }
     push @out, "";
 
@@ -694,11 +1089,25 @@ sub emit {
         }
         push @out, "" if @{$tb->{params}};
 
+        # .MODEL cards for every paramset the testbench instantiates.
+        # All instances of a given paramset share its .MODEL — Xyce
+        # then dispatches to the PyMS-compiled wrapper registered at
+        # (letter, level) by the auto-loader scanning the per-paramset
+        # .va files we emitted above.
+        for my $t (sort keys %paramset_resolved) {
+            my $r = $paramset_resolved{$t};
+            push @out, sprintf(".MODEL %s %s level=%d",
+                               $r->{model_name},
+                               $r->{info}{model_type},
+                               $r->{level});
+        }
+        push @out, "" if %paramset_resolved;
+
         # Instance emission. emit_instance stashes the final
         # device-letter-prefixed name on the instance hash so the
         # .PRINT rewriter can target it.
         for my $i (@{$tb->{instances}}) {
-            push @out, emit_instance($i, $gnd);
+            push @out, emit_instance($i, $gnd, \%paramset_resolved);
             if ($i->{type} =~ /^vs(?:ource|ine)$/) {
                 $vsrcs{$i->{inst}} = $i->{emitted_name} // ('V' . $i->{inst});
             }
