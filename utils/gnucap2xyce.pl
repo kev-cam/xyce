@@ -631,6 +631,47 @@ sub emit_instance {
         return sprintf("%s %s %s %s",
                        $with_letter->('R', $name), $nodes[0], $nodes[1], $r);
     }
+    if ($type eq 'capacitor') {
+        my $c = $p{c} // '1p';
+        return sprintf("%s %s %s %s",
+                       $with_letter->('C', $name), $nodes[0], $nodes[1], $c);
+    }
+    if ($type eq 'vpulse') {
+        # Verilog-A vpulse plugin → SPICE PULSE source.
+        # PULSE(v0 v1 td tr tf pw per).
+        my $v0  = $p{val0} // 0;
+        my $v1  = $p{val1} // 1;
+        my $td  = $p{td}   // 0;
+        my $tr  = $p{rise} // '1n';
+        my $tf  = $p{fall} // '1n';
+        my $pw  = $p{width}// '1u';
+        my $per = $p{period}//'2u';
+        my $dc  = $p{dc}   // 0;
+        return sprintf("%s %s %s DC %s PULSE(%s %s %s %s %s %s %s)",
+                       $with_letter->('V', $name),
+                       $nodes[0], $nodes[1],
+                       $dc, $v0, $v1, $td, $tr, $tf, $pw, $per);
+    }
+    # cap_cmim / cap_rfcmim / cap_*: behavioral MIM-capacitor stand-in.
+    # The full Verilog-A module (capacitor_module.va) is structural —
+    # a body capacitor plus parasitic R, internal nodes, optional
+    # mismatch. For functional translation, treat as a plain SPICE
+    # capacitor with C = w * l * <area density> using a 1 fF/um^2
+    # rule-of-thumb (cmim typical). cap_rfcmim has a third (body)
+    # node we drop. Without this, gnucap2xyce falls through to the
+    # X-subckt path and Xyce errors out trying to elaborate.
+    if ($type eq 'cap_cmim' || $type eq 'cap_rfcmim'
+            || $type =~ /^cmim_core$/) {
+        my $w = $p{w} // '1u';
+        my $l = $p{l} // '1u';
+        # 1 fF/um^2 baseline; both w and l are in metres so we get
+        # area in m^2, then convert to capacitance via 1e-3 F/m^2
+        # which equals 1 fF/um^2.
+        my $cexpr = "{($w)*($l)*1e-3}";
+        return sprintf("%s %s %s %s",
+                       $with_letter->('C', $name),
+                       $nodes[0], $nodes[1], $cexpr);
+    }
     # Paramset pass-through. If a per-paramset .va was generated
     # for this type, just emit a device-letter card referencing the
     # already-emitted .MODEL. PyMS' paramset resolver handles the
@@ -930,22 +971,49 @@ sub parse_gc {
         if ($line =~ /^\s*store\s+/) {
             next;
         }
-        # Monte Carlo sweep: ``dc $seed <start> <stop> <step> [basic]``.
-        # Translate to a parameter step over an arbitrary SEED parameter
-        # (gnucap's $seed is just a loop variable; nothing in the
-        # wrapper consumes it, so each iteration produces the same OP).
-        # The accompanying ``measure sample_mean/std`` lines turn into
-        # .MEASURE DC statements that aggregate across the sweep.
+        # Monte Carlo sweep: ``dc $seed <start> <stop> <step> [basic]``
+        # (single-OP form), or
+        # ``ac $seed <start> <stop> <step> dec <pts> <fstart> <fstop> [basic]``
+        # (MC-over-AC form, capacitor cutoff tests). Both translate to
+        # a parameter step over an arbitrary SEED variable; gnucap's
+        # $seed is just a loop counter and nothing in the wrapper
+        # consumes it, so each iteration produces an identical inner
+        # analysis. The ``measure sample_mean/std`` lines turn into
+        # .MEASURE statements that aggregate across the sweep.
         if ($line =~ /^\s*dc\s+\$(\w+)\s+(\S+)\s+(\S+)\s+(\S+)(?:\s+\w+)?\s*$/) {
             push @{$g{analyses}}, {
-                kind => 'mc_sweep', sweep_var => $1,
+                kind => 'mc_sweep', inner => 'op', sweep_var => $1,
                 start => $2, stop => $3, step => $4,
+            };
+            next;
+        }
+        if ($line =~ /^\s*ac\s+\$(\w+)\s+(\S+)\s+(\S+)\s+(\S+)\s+
+                        (dec|oct|lin)\s+(\S+)\s+(\S+)\s+(\S+)
+                        (?:\s+\w+)?\s*$/x) {
+            push @{$g{analyses}}, {
+                kind => 'mc_sweep', inner => 'ac', sweep_var => $1,
+                start => $2, stop => $3, step => $4,
+                ac_type => $5, ac_args => "$6 $7 $8",
+            };
+            next;
+        }
+        # Transient: ``transient <start> <stop> <step> [basic]`` →
+        # ``.TRAN <step> <stop>`` (Xyce ignores tstart). gnucap also
+        # accepts the short ``tran`` keyword; both routed here.
+        if ($line =~ /^\s*(?:transient|tran)\s+(\S+)\s+(\S+)\s+(\S+)(?:\s+\w+)?\s*$/) {
+            my ($start, $stop, $step) = ($1, $2, $3);
+            push @{$g{analyses}}, {
+                kind => 'tran', args => "$step $stop",
             };
             next;
         }
         # Analyses: ``dc <var> <lo> <hi> <step> [basic]``
         if ($line =~ /^\s*(dc|ac|tran|op)\b\s*(.*)$/) {
-            push @{$g{analyses}}, { kind => $1, args => $2 };
+            my ($k, $args) = ($1, $2);
+            # gnucap's trailing ``basic`` sweep-method tag is gnucap-
+            # specific and Xyce can't parse it.
+            $args =~ s/\s+basic\s*$//;
+            push @{$g{analyses}}, { kind => $k, args => $args };
             next;
         }
         verbose("skipping unrecognised .gc line: $line");
@@ -1225,6 +1293,23 @@ sub emit {
             push @out, "* original paramset source: $inc";
         } elsif ($inc =~ /\.va$/) {
             push @out, qq{.HDL "$inc"};
+        } elsif ($inc =~ /\.params$/) {
+            # gnucap ``.params`` files use ``parameter NAME=VAL;``
+            # which Xyce's parser rejects (it wants ``.PARAM``).
+            # Inline-translate rather than .INCLUDE.
+            push @out, "* inlined from $inc";
+            if (open my $fh, '<', $inc) {
+                while (my $l = <$fh>) {
+                    chomp $l;
+                    $l = strip_line_comment($l);
+                    next if $l =~ /^\s*$/;
+                    if ($l =~ /^\s*parameter\s+(?:real\s+|integer\s+)?
+                                (\w+)\s*=\s*(.+?)\s*;?\s*$/x) {
+                        push @out, ".PARAM $1=$2";
+                    }
+                }
+                close $fh;
+            }
         } else {
             push @out, qq{.INCLUDE "$inc"};
         }
@@ -1319,16 +1404,16 @@ sub emit {
         # with a degenerate single-point .DC.
         if ($a->{kind} eq 'mc_sweep') {
             my $var = uc $a->{sweep_var};
-            # Xyce .STEP LIN syntax: ``.STEP <name> <start> <stop>
-            # <step>`` (no PARAM keyword — that confuses the parser
-            # at extractSTEPData's numFields modulo-4 check). The
-            # parameter has to be .PARAM-declared first so the
-            # expression engine can reference it. .STEP needs an
-            # underlying analysis to drive — .OP per step is what
-            # the gnucap ``dc $seed start stop step`` does.
             push @out, ".PARAM $var=$a->{start}";
             push @out, ".STEP $var $a->{start} $a->{stop} $a->{step}";
-            push @out, ".OP";
+            my $inner = $a->{inner} // 'op';
+            if ($inner eq 'ac') {
+                # MC-over-AC sweep (capacitor cutoff tests).
+                push @out, sprintf('.AC %s %s', uc $a->{ac_type},
+                                                $a->{ac_args});
+            } else {
+                push @out, ".OP";
+            }
             $has_mc_sweep = 1;
             next;
         }
