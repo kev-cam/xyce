@@ -276,7 +276,19 @@ sub extract_corner_localparams {
         if ($line =~ /^\s*endmodule\b/ && $in_target) { $in_target = 0; next }
         next unless $in_target;
         if ($line =~ /^\s*localparam\s+(?:(?:real|integer)\s+)?(\w+)\s*=\s*([^;]+?)\s*;/) {
-            $out{$1} = $2;
+            my ($name, $val) = ($1, $2);
+            # gnucap statistical-corner files use ``$rdist_normal(...)``
+            # and similar distribution functions for process variation.
+            # Xyce's expression parser can't ingest these (they contain
+            # string literals, and there's no Xyce equivalent for the
+            # global/local correlation flag anyway). For functional
+            # MC translation, replace them with their nominal value
+            # (zero deviation from spec) so the corner .PARAM lines
+            # parse cleanly.
+            if ($val =~ /\$rdist_\w+\b/) {
+                $val = '0.0';
+            }
+            $out{$name} = $val;
         }
     }
     return %out;
@@ -842,6 +854,7 @@ sub parse_gc {
         options   => [],     # raw option strings
         tb_inst   => undef,  # { type, inst, nodes, params }
         prints    => [],     # { kind => dc/ac/tran, exprs => [...] }
+        measures  => [],     # { name, kind, op, expr }
         analyses  => [],     # { kind, args }
         params    => [],     # top-level sweep params
         corners   => [],     # ``moshv_ff corner_moshv();`` etc.
@@ -893,6 +906,41 @@ sub parse_gc {
             # split exprs on whitespace but respect (...)
             my @exprs = parse_print_exprs($exprs_str);
             push @{$g{prints}}, { kind => $kind, exprs => \@exprs };
+            next;
+        }
+        # ``measure NAME = sample_mean("v(node)")``
+        #   → .MEASURE DC NAME AVG V(node)
+        # ``measure NAME = sample_std("v(node)")``
+        #   → .MEASURE DC NAME RMS V(node)  (close enough for
+        #     functional MC; not a true std-dev)
+        if ($line =~ /^\s*measure\s+(\w+)\s*=\s*(\w+)\s*\(\s*"([^"]+)"\s*\)\s*$/) {
+            my ($mname, $fn, $expr) = ($1, $2, $3);
+            my $op;
+            if    ($fn eq 'sample_mean') { $op = 'AVG' }
+            elsif ($fn eq 'sample_std')  { $op = 'RMS' }
+            else { verbose("unknown measure fn $fn"); next }
+            push @{$g{measures}}, {
+                name => $mname, kind => 'dc', op => $op, expr => $expr,
+            };
+            next;
+        }
+        # ``store dc v(...)`` — gnucap-internal sample storage. No
+        # direct Xyce analog; the per-step .PRINT already retains
+        # the values. Drop silently.
+        if ($line =~ /^\s*store\s+/) {
+            next;
+        }
+        # Monte Carlo sweep: ``dc $seed <start> <stop> <step> [basic]``.
+        # Translate to a parameter step over an arbitrary SEED parameter
+        # (gnucap's $seed is just a loop variable; nothing in the
+        # wrapper consumes it, so each iteration produces the same OP).
+        # The accompanying ``measure sample_mean/std`` lines turn into
+        # .MEASURE DC statements that aggregate across the sweep.
+        if ($line =~ /^\s*dc\s+\$(\w+)\s+(\S+)\s+(\S+)\s+(\S+)(?:\s+\w+)?\s*$/) {
+            push @{$g{analyses}}, {
+                kind => 'mc_sweep', sweep_var => $1,
+                start => $2, stop => $3, step => $4,
+            };
             next;
         }
         # Analyses: ``dc <var> <lo> <hi> <step> [basic]``
@@ -988,6 +1036,23 @@ sub xlate_probe_expr {
             # first-node map and substitute.
             if (defined $dev_first_node && exists $dev_first_node->{$arg}) {
                 return "V($dev_first_node->{$arg})";
+            }
+            # Wildcard ``v(r*)`` — gnucap glob over device names.
+            # Expand against $dev_first_node and emit one V(node)
+            # per match. Xyce's own wildcard ``V(R*)`` would
+            # otherwise pick up auto-allocated nodes like ``R1_P0``
+            # (per-instance floating dt pads from gnucap2xyce
+            # padding), which isn't what the .gc author wanted.
+            if ($arg =~ /[\*\?]/ && defined $dev_first_node) {
+                my $re = $arg;
+                $re =~ s/\*/.*/g;
+                $re =~ s/\?/./g;
+                my @nodes;
+                for my $dev (sort keys %$dev_first_node) {
+                    next unless $dev =~ /^$re$/i;
+                    push @nodes, "V($dev_first_node->{$dev})";
+                }
+                return join(' ', @nodes) if @nodes;
             }
             # Multiple comma-separated nodes inside V(): keep as-is
             return "V($arg)";
@@ -1245,7 +1310,28 @@ sub emit {
 
     # Analyses + .PRINT directives. Xyce wants .PRINT to come with the
     # analysis kind, so emit one .PRINT per kind seen in ``print``.
+    my $has_mc_sweep = 0;
     for my $a (@{$gc->{analyses}}) {
+        # gnucap MC sweep ``dc $var start stop step basic``. Translate
+        # to ``.STEP PARAM <VAR> <start> <stop> <step>`` + ``.DC <var>
+        # <start> <start> 1`` so Xyce runs the OP per step. ``.STEP``
+        # alone needs an analysis to step *across*, so we pair it
+        # with a degenerate single-point .DC.
+        if ($a->{kind} eq 'mc_sweep') {
+            my $var = uc $a->{sweep_var};
+            # Xyce .STEP LIN syntax: ``.STEP <name> <start> <stop>
+            # <step>`` (no PARAM keyword — that confuses the parser
+            # at extractSTEPData's numFields modulo-4 check). The
+            # parameter has to be .PARAM-declared first so the
+            # expression engine can reference it. .STEP needs an
+            # underlying analysis to drive — .OP per step is what
+            # the gnucap ``dc $seed start stop step`` does.
+            push @out, ".PARAM $var=$a->{start}";
+            push @out, ".STEP $var $a->{start} $a->{stop} $a->{step}";
+            push @out, ".OP";
+            $has_mc_sweep = 1;
+            next;
+        }
         my $k = uc $a->{kind};
         my $args = $a->{args} // '';
         # ``dc`` with no sweep is an operating-point analysis, which
@@ -1264,6 +1350,17 @@ sub emit {
             push @e, $t if defined $t;
         }
         push @out, ".PRINT $k " . join(' ', @e) if @e;
+    }
+    # gnucap ``measure NAME = sample_mean/std("v(...)")`` →
+    # ``.MEASURE DC NAME AVG/RMS V(...)``. .MEASURE only makes sense
+    # under a sweep — emit a warning comment if there's no MC step,
+    # but still emit the directives.
+    for my $m (@{$gc->{measures}}) {
+        my $expr = xlate_probe_expr($m->{expr}, \%vsrcs, \%isrcs,
+                                    \%dev_first_node);
+        next unless defined $expr;
+        my $k = uc $m->{kind};
+        push @out, ".MEASURE $k $m->{name} $m->{op} $expr";
     }
 
     # Carry over gnucap options as Xyce options where there's an
@@ -1358,7 +1455,13 @@ sub emit_corner_params {
         }
         next unless $in_target;
         if ($line =~ /^\s*localparam\s+(?:\w+\s+)?(\w+)\s*=\s*([^;]+?)\s*;/) {
-            push @out, ".PARAM $1=$2";
+            my ($n, $v) = ($1, $2);
+            # gnucap statistical-corner $rdist_normal(...) etc. don't
+            # translate to Xyce expression syntax. Functional MC: pin
+            # to nominal. See extract_corner_localparams for the
+            # other call site that needs the same treatment.
+            $v = '0.0' if $v =~ /\$rdist_\w+\b/;
+            push @out, ".PARAM $n=$v";
         }
     }
     return @out;
