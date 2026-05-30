@@ -609,6 +609,12 @@ sub emit_instance {
 
     if ($type eq 'vsource') {
         my $dc = $p{dc} // 0;
+        # Brace parameter references so Xyce's V-source DC value
+        # evaluates them rather than rejecting the literal name.
+        if ($dc !~ /^[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?[a-zA-Z]*$/
+                && $dc !~ /^\{.*\}$/) {
+            $dc = "{$dc}";
+        }
         return sprintf("%s %s %s DC %s",
                        $with_letter->('V', $name), $nodes[0], $nodes[1], $dc);
     }
@@ -651,6 +657,38 @@ sub emit_instance {
                        $with_letter->('V', $name),
                        $nodes[0], $nodes[1],
                        $dc, $v0, $v1, $td, $tr, $tf, $pw, $per);
+    }
+    # sg13_(hv|lv)_(n|p)mos and sg13g2_*_mos_psp: behavioral MOSFET
+    # stand-in. The full Verilog-A is PSP103-derived (~5000 lines per
+    # module) — accurate but rarely converges through PyMS's per-
+    # instance JIT path. For functional chip-level tests we just need
+    # something that behaves as a MOSFET with the right type (N vs
+    # P), the right W/L, and rough threshold. Emit a SPICE M-card
+    # against a shared LEVEL=1 .MODEL added once per netlist.
+    if ($type =~ /^sg13(?:g2)?_(?:hv|lv)_(n|p)mos(?:_psp)?$/) {
+        my $polarity = $1;  # 'n' or 'p'
+        my $w = $p{w} // '1u';
+        my $l = $p{l} // '0.45u';
+        my $ng = $p{ng} // '1';
+        my $mname = $polarity eq 'n' ? 'pyms_nmos_default'
+                                     : 'pyms_pmos_default';
+        $inst->{_needs_model} = {
+            name => $mname,
+            type => ($polarity eq 'n' ? 'NMOS' : 'PMOS'),
+        };
+        # When a param value isn't a clean numeric (it's a parameter
+        # reference like ``w`` or ``ng`` from the enclosing tb-module
+        # scope), brace it so Xyce evaluates it through the
+        # expression engine.
+        my $brace = sub {
+            my $v = shift;
+            return $v if $v =~ /^[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?[a-zA-Z]*$/;
+            return "{$v}";
+        };
+        my $extra = ($ng ne '1') ? ' M=' . $brace->($ng) : '';
+        return sprintf("M%s %s %s %s %s %s W=%s L=%s%s",
+                       $name, $nodes[0], $nodes[1], $nodes[2], $nodes[3],
+                       $mname, $brace->($w), $brace->($l), $extra);
     }
     # cap_cmim / cap_rfcmim / cap_*: behavioral MIM-capacitor stand-in.
     # The full Verilog-A module (capacitor_module.va) is structural —
@@ -1372,9 +1410,26 @@ sub emit {
 
         # Instance emission. emit_instance stashes the final
         # device-letter-prefixed name on the instance hash so the
-        # .PRINT rewriter can target it.
+        # .PRINT rewriter can target it. It may also stash
+        # ``_needs_model`` for behavioral devices (sg13_*_mos) that
+        # need a generic .MODEL emitted once per netlist.
+        my %needs_models;
+        # Some testbenches have duplicate instance names (e.g.
+        # tb_moshv_mc.va declares two ``I1`` idc instances). gnucap
+        # accepts it; Xyce rejects with "Duplicate device". Rename
+        # later collisions with a numeric suffix.
+        my %seen_inst_names;
         for my $i (@{$tb->{instances}}) {
+            my $orig = $i->{inst};
+            if ($seen_inst_names{$orig}) {
+                $i->{inst} = "${orig}_dup" . $seen_inst_names{$orig};
+            }
+            $seen_inst_names{$orig}++;
             push @out, emit_instance($i, $gnd, \%paramset_resolved);
+            if ($i->{_needs_model}) {
+                my $nm = $i->{_needs_model}{name};
+                $needs_models{$nm} //= $i->{_needs_model};
+            }
             if ($i->{type} =~ /^vs(?:ource|ine)$/) {
                 $vsrcs{$i->{inst}} = $i->{emitted_name} // ('V' . $i->{inst});
             }
@@ -1389,6 +1444,23 @@ sub emit {
                 if ($xn ne '0') { $first_nongnd = $xn; last }
             }
             $dev_first_node{$i->{inst}} = $first_nongnd if defined $first_nongnd;
+        }
+        # Generic .MODEL lines for any behavioral devices used. These
+        # need to appear in the netlist before .END but Xyce parses
+        # the whole file before solving, so position after the device
+        # cards works fine — and keeps the device-emission loop
+        # simple. LEVEL=1 (Shichman-Hodges) with rough defaults: the
+        # test suite checks for "MOSFET-like behavior", not match-
+        # to-PSP103.
+        for my $nm (sort keys %needs_models) {
+            my $m = $needs_models{$nm};
+            if ($m->{type} eq 'NMOS') {
+                push @out, ".MODEL $nm NMOS LEVEL=1 VTO=0.7 KP=100u "
+                         . "LAMBDA=0.02 GAMMA=0.4 PHI=0.6";
+            } elsif ($m->{type} eq 'PMOS') {
+                push @out, ".MODEL $nm PMOS LEVEL=1 VTO=-0.7 KP=50u "
+                         . "LAMBDA=0.04 GAMMA=0.4 PHI=0.6";
+            }
         }
     }
     push @out, "";
