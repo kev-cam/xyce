@@ -95,6 +95,47 @@ def scan_va_attributes(va_path: str) -> dict:
         if 'xyceModelGroup' in attrs or 'xyceLevelNumber' in attrs:
             return attrs
 
+    # Sibling-directory fallback. Several entry-point .va files in
+    # the install tree are variants of a base model that lack the
+    # xyceModelGroup/xyceLevelNumber attributes outright:
+    #   - psp102/psp102b.va, psp102e.va are binning/local-model
+    #     variants of psp102/psp102.va
+    #   - fbh_hbt-2.1/fbhhbt-2.1.va is the plain variant; the
+    #     attributes live in fbhhbt-2.1_nonoise_limited_inductors_typed.va
+    # The variants share the same device family as the sibling, so
+    # if we found nothing on the entry-point itself, scan adjacent
+    # .va files and reuse the first xyce* attrs we find.
+    sibling_attrs = {}
+    try:
+        d = os.path.dirname(va_path)
+        if d and os.path.isdir(d):
+            entry_name = os.path.basename(va_path)
+            for sib in sorted(os.listdir(d)):
+                if not sib.endswith('.va') or sib == entry_name:
+                    continue
+                sib_path = os.path.join(d, sib)
+                # Quick raw-text peek: avoid recursive preprocess on
+                # every sibling, just grep for the attribute name in
+                # source. Good enough — false positives get filtered
+                # by the regex below.
+                try:
+                    with open(sib_path, 'r', errors='replace') as f:
+                        sib_text = f.read()
+                except OSError:
+                    continue
+                if 'xyceModelGroup' not in sib_text \
+                        and 'xyceLevelNumber' not in sib_text:
+                    continue
+                # Reuse our own logic to extract — recurse once.
+                got = scan_va_attributes(sib_path)
+                if got.get('xyceModelGroup') or got.get('xyceLevelNumber'):
+                    sibling_attrs = got
+                    break
+    except Exception:
+        pass
+    if sibling_attrs:
+        return sibling_attrs
+
     # No xyce* attrs found — return whatever the first generic
     # candidate yielded (still better than {}).
     if candidates:
