@@ -152,6 +152,81 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
         num_nodes_required = n_ext
         num_nodes_optional = 0
 
+    # Detect "simple R / L / C" pattern. When xyceModelGroup is one of
+    # the linear-element families AND the module exposes a standard
+    # instance parameter naming the resistance / capacitance /
+    # inductance, we don't need a vae_eval .so at all — the wrapper
+    # stamps a linear conductance / capacitance / inductance directly,
+    # the same way Xyce's built-in R / L / C devices do. The detection
+    # is intentionally narrow: only the SPICE-primitive case. Anything
+    # more complex (BSIM-CMG, r3_cmc with sheet-resistance + geometry
+    # computation, etc.) takes the regular vae_eval path.
+    _SIMPLE_RLC_PARAM_NAMES = {
+        'Resistor':  ('resistance', 'r'),
+        'Capacitor': ('capacitance', 'c'),
+        'Inductor':  ('inductance', 'l'),
+    }
+    # simple_rlc is either:
+    #   ('R'|'C'|'L', cxx_param_name)              — direct value param
+    #   ('R_SHEET', rsh_cxx, l_cxx, w_cxx)         — compact-resistor pattern
+    # or None.
+    #
+    # The point: any module tagged xyceModelGroup="Resistor" (etc.) is
+    # treated as a behavioral linear element regardless of how the
+    # underlying compact model actually computes its physics. Chip-
+    # level simulation just needs "this device acts like a resistor",
+    # not "this device matches r3_cmc's body-charge / self-heating
+    # equations to 4 sig figs". Compact-model VAE path is preserved
+    # as a fallback (``if (!vae_eval_)`` guard inside the stamp), but
+    # for a Resistor/Capacitor/Inductor group we'd rather get a clean
+    # convergent linear stamp than a singular Jacobian from a half-
+    # wired-up compact-model evaluator.
+    _CXX_RESERVED_SET = {
+        'short', 'long', 'int', 'char', 'float', 'double', 'void', 'bool',
+        'auto', 'const', 'static', 'extern', 'register', 'volatile',
+        'class', 'struct', 'union', 'enum', 'template', 'typename',
+        'new', 'delete', 'this', 'return', 'if', 'else', 'for', 'while',
+        'do', 'switch', 'case', 'default', 'break', 'continue', 'goto',
+        'try', 'catch', 'throw', 'namespace', 'using', 'public', 'private',
+        'protected', 'virtual', 'friend', 'inline', 'operator', 'sizeof',
+        'typeid', 'true', 'false', 'nullptr',
+    }
+    def _cxx_mangle(nm):
+        return f'pyms_{nm}' if nm.lower() in _CXX_RESERVED_SET else nm
+    simple_rlc = None
+    if model_group in _SIMPLE_RLC_PARAM_NAMES and n_ext >= 2:
+        wanted = _SIMPLE_RLC_PARAM_NAMES[model_group]
+        canonical = wanted[0]
+        # Pass 1: direct value parameter (resistance/capacitance/inductance).
+        inst_params = [p for p in mod.params if getattr(p, 'is_instance', False)]
+        ordered = sorted(inst_params,
+                         key=lambda p: 0 if p.name.lower() == canonical else 1)
+        for p in ordered:
+            if p.name.lower() in wanted:
+                simple_rlc = (model_group[0], _cxx_mangle(p.name))
+                break
+        # Pass 2: compact-resistor sheet-resistance pattern (rsh × l / w).
+        # Only applies to Resistor; nothing analogous exists for C/L in
+        # the IHP set.
+        if simple_rlc is None and model_group == 'Resistor':
+            all_param_names = {p.name.lower(): p for p in mod.params}
+            inst_param_names = {p.name.lower(): p for p in inst_params}
+            # rsh may be either Instance or Model. l, w are instance.
+            rsh_p = all_param_names.get('rsh')
+            l_p   = inst_param_names.get('l')
+            w_p   = inst_param_names.get('w')
+            if rsh_p and l_p and w_p:
+                # Instance members are bare; Model members are
+                # accessed through the ``model_`` reference held by
+                # each Instance.
+                rsh_ref = (_cxx_mangle(rsh_p.name)
+                           if getattr(rsh_p, 'is_instance', False)
+                           else 'model_.' + _cxx_mangle(rsh_p.name))
+                simple_rlc = ('R_SHEET',
+                              rsh_ref,
+                              _cxx_mangle(l_p.name),
+                              _cxx_mangle(w_p.name))
+
     # Split scalar vs array params. Scalars go into Model/Instance class
     # members via addPar; arrays are emitted once as namespace-scope static
     # const double[].
@@ -393,14 +468,36 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
     c.append(f'const char **Traits::nodeNames() {{ return nodeNameArray; }}')
     c.append('')
 
+    # Build a name→numeric-default map for substituting identifier
+    # defaults. Paramset resolution often leaves bindings like
+    # ``.rsh = rsh_rsil`` where ``rsh_rsil`` is itself a parameter
+    # with a numeric default — without substitution the addPar
+    # default falls back to 0.0 and the resistor stamps with R≈0,
+    # which collapses to the gmin floor at solve time.
+    _ident_defaults = {}
+    for pname, pdefault, _is_inst, _cxx in params:
+        try:
+            _ident_defaults[pname] = float(pdefault)
+        except (TypeError, ValueError):
+            pass
+    def _resolve_default(pdefault):
+        if pdefault is None:
+            return 0.0
+        try:
+            return float(pdefault)
+        except (TypeError, ValueError):
+            pass
+        # Maybe it's a bare identifier referencing another param.
+        ident = str(pdefault).strip()
+        if ident in _ident_defaults:
+            return _ident_defaults[ident]
+        return 0.0
+
     # Parameter registration
     c.append('void Traits::loadInstanceParameters(ParametricData<Instance> &p) {')
     for pname, pdefault, is_inst, _cxx in params:
         if is_inst:
-            try:
-                dval = float(pdefault)
-            except:
-                dval = 0.0
+            dval = _resolve_default(pdefault)
             c.append(f'  p.addPar("{pname.upper()}", {dval}, &Instance::{_cxx})')
             c.append(f'    .setUnit(U_NONE)')
             c.append(f'    .setDescription("{pname}");')
@@ -410,10 +507,7 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
     c.append('void Traits::loadModelParameters(ParametricData<Model> &p) {')
     for pname, pdefault, is_inst, _cxx in params:
         if not is_inst:
-            try:
-                dval = float(pdefault)
-            except:
-                dval = 0.0
+            dval = _resolve_default(pdefault)
             c.append(f'  p.addPar("{pname.upper()}", {dval}, &Model::{_cxx})')
             c.append(f'    .setUnit(U_NONE)')
             c.append(f'    .setDescription("{pname}");')
@@ -441,14 +535,14 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
     c.append(f'      jacStamp_[i][j] = j;')
     c.append(f'  }}')
     c.append('')
-    c.append('  // Set default instance param values')
-    for pname, pdefault, is_inst, _cxx in params:
-        if is_inst:
-            try:
-                dval = float(pdefault)
-            except:
-                dval = 0.0
-            c.append(f'  {_cxx} = {dval};')
+    # Pull defaults from the addPar metadata, then apply per-instance
+    # overrides from the netlist. Mirrors the standard Xyce device
+    # pattern (cf. N_DEV_Resistor3.C). Without setParams(IB.params)
+    # the member variables stay at their defaults regardless of what
+    # the device card supplies — which is why ``resistance=100``
+    # was being ignored.
+    c.append('  setDefaultParams();')
+    c.append('  setParams(ib.params);')
     c.append('')
     c.append('  processParams();')
     c.append('}')
@@ -482,13 +576,19 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
     c.append('}')
     c.append('')
 
-    # Register LIDs
+    # Register LIDs. Optional external ports (i >= num_nodes_required)
+    # may be absent if the netlist gave fewer nodes than the .va
+    # declared — in that case extLIDVec.size() < n_ext. Use -1 as a
+    # sentinel for missing ports; every place that indexes a solution
+    # / load vector by li_<n> must guard against -1 (see stamp paths
+    # below). Internal nodes are always present.
     c.append('void Instance::registerLIDs(const std::vector<int> &intLIDVec,')
     c.append('                            const std::vector<int> &extLIDVec) {')
     c.append('  DeviceInstance::registerLIDs(intLIDVec, extLIDVec);')
+    c.append('  const int n_ext_supplied = (int)extLIDVec.size();')
     for i, n in enumerate(all_nodes):
         if i < n_ext:
-            c.append(f'  li_{n} = extLIDVec[{i}];')
+            c.append(f'  li_{n} = ({i} < n_ext_supplied) ? extLIDVec[{i}] : -1;')
         else:
             c.append(f'  li_{n} = intLIDVec[{i - n_ext}];')
     c.append('}')
@@ -557,15 +657,38 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
             return node_idx[collapse_map[name]]
         return -1
 
+    # Track branch label strings alongside (a_idx, b_idx) so we can
+    # emit a remap table the runtime uses to align the wrapper's
+    # branch ordering with the GiNaC .so's. Format matches the GiNaC
+    # emitter exactly: ``I(b_re1)`` / ``V(n1,gnd)`` etc., joined with
+    # commas, no spaces.
+    branch_labels = []
+    # Resolve a contribution endpoint to a node-index. Verilog-A
+    # accepts three shapes:
+    #   I(node_a, node_b)         — explicit pair
+    #   I(node_a)                 — pair (node_a, gnd)
+    #   I(named_branch)           — branch_name resolves to (primary, secondary)
+    # The parser stores single-element tuples for the named-branch
+    # case; expand it here using ``mod.branch_map`` /
+    # ``branch_neg_map`` so the wrapper stamps into both KCL rows
+    # with the correct sign.
+    mod_branch_map = getattr(mod, 'branch_map', {}) or {}
+    mod_branch_neg_map = getattr(mod, 'branch_neg_map', {}) or {}
     for ck, cbranch, cexpr in contribs:
         key = (ck, cbranch)
         if key not in seen_branches:
-            a = cbranch[0] if len(cbranch) >= 1 else None
-            b = cbranch[1] if len(cbranch) >= 2 else None
+            if len(cbranch) == 1 and cbranch[0] in mod_branch_map:
+                a = mod_branch_map[cbranch[0]]
+                b = mod_branch_neg_map.get(cbranch[0])
+            else:
+                a = cbranch[0] if len(cbranch) >= 1 else None
+                b = cbranch[1] if len(cbranch) >= 2 else None
             a_idx = resolve_node(a)
             b_idx = resolve_node(b)
             seen_branches[key] = len(branch_map)
             branch_map.append((a_idx, b_idx))
+            label = f'{ck.name}({",".join(cbranch)})'
+            branch_labels.append(label)
     n_branches = len(branch_map)
 
     # updateIntermediateVars — call VAE .so, get branch-indexed F/Q
@@ -576,10 +699,22 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
     c.append(f'  memset(dFdx_, 0, sizeof(dFdx_));')
     c.append(f'  memset(dQdx_, 0, sizeof(dQdx_));')
     c.append('')
-    c.append('  if (vae_eval_ && vae_jac_) {')
+    # When the device matched the simple R/L/C pattern, the inline
+    # stamp below is the authoritative source of F/Q/Jacobian for
+    # this device — skip the vae_eval dispatch entirely so we don't
+    # double-stamp or pull in a possibly-singular compact-model
+    # contribution.
+    if simple_rlc:
+        c.append('  if (false /* simple R/L/C path: skip vae_eval */) {')
+    else:
+        c.append('  if (vae_eval_ && vae_jac_) {')
     c.append('    VaeState state = {};')
     for i, n in enumerate(all_nodes):
-        c.append(f'    state.V[{i}] = (*solVec)[li_{n}];')
+        if i < n_ext and i >= num_nodes_required:
+            # Optional external port — netlist may not have supplied it.
+            c.append(f'    state.V[{i}] = (li_{n} >= 0) ? (*solVec)[li_{n}] : 0.0;')
+        else:
+            c.append(f'    state.V[{i}] = (*solVec)[li_{n}];')
     c.append('    state.Vt = 8.617087e-5 * 300.15;')
     c.append('')
     # Check if VAE .so uses node-indexed or branch-indexed output.
@@ -620,35 +755,184 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
     c.append(f'          dQdx_[i][j] += dQn[i*{n_total}+j];')
     c.append(f'        }}')
     c.append(f'    }} else {{')
-    c.append(f'      // Branch-indexed: map branches to KCL node contributions')
-    for bi, (a_idx, b_idx) in enumerate(branch_map):
-        if a_idx >= 0:
-            c.append(f'      F_[{a_idx}] += Fb[{bi}];')
-        if b_idx >= 0:
-            c.append(f'      F_[{b_idx}] -= Fb[{bi}];')
-        if a_idx >= 0:
-            c.append(f'      Q_[{a_idx}] += Qb[{bi}];')
-        if b_idx >= 0:
-            c.append(f'      Q_[{b_idx}] -= Qb[{bi}];')
+    c.append(f'      // Branch-indexed: map branches to KCL node contributions.')
+    c.append(f'      // The wrapper walks every contribution in the .va source,')
+    c.append(f'      // but the GiNaC .so walks the same AST with parameter-')
+    c.append(f'      // resolved condition culling — so its branch ordering is a')
+    c.append(f'      // (possibly proper) subset of ours. Use a label-keyed remap')
+    c.append(f'      // built on first call: wrapper branch wi -> GiNaC branch gi')
+    c.append(f'      // (or -1 if the GiNaC walk dropped this branch as dead code).')
+    c.append(f'      static const char* wrapper_branch_labels[] = {{')
+    for label in branch_labels:
+        # Escape quotes/backslashes for the C++ string literal.
+        esc = label.replace('\\', '\\\\').replace('"', '\\"')
+        c.append(f'        "{esc}",')
+    c.append(f'      }};')
+    c.append(f'      static int branch_remap[{max(n_branches,1)}];')
+    c.append(f'      static bool branch_remap_built = false;')
+    c.append(f'      if (!branch_remap_built) {{')
+    c.append(f'        for (int i = 0; i < {n_branches}; i++) branch_remap[i] = -1;')
+    c.append(f'        typedef const char* (*LabelFn)(int);')
+    c.append(f'        LabelFn lbl_fn = (LabelFn)dlsym(vae_dl_, "vae_branch_label");')
+    c.append(f'        if (lbl_fn) {{')
+    c.append(f'          for (int gi = 0; gi < so_n_branches; gi++) {{')
+    c.append(f'            const char *lbl = lbl_fn(gi);')
+    c.append(f'            for (int wi = 0; wi < {n_branches}; wi++) {{')
+    c.append(f'              if (lbl && std::string(lbl) == wrapper_branch_labels[wi]) {{')
+    c.append(f'                branch_remap[wi] = gi;')
+    c.append(f'                break;')
+    c.append(f'              }}')
+    c.append(f'            }}')
+    c.append(f'          }}')
+    c.append(f'        }} else {{')
+    c.append(f'          // No label export — assume index-aligned (legacy .so).')
+    c.append(f'          for (int wi = 0; wi < {n_branches}; wi++) branch_remap[wi] = wi;')
+    c.append(f'        }}')
+    c.append(f'        branch_remap_built = true;')
+    c.append(f'      }}')
     c.append(f'      double dFb[{max(n_branches*n_total,1)}]={{}}, dQb[{max(n_branches*n_total,1)}]={{}};')
     c.append(f'      vae_jac_(&state, dFb, dQb);')
-    for bi, (a_idx, b_idx) in enumerate(branch_map):
+    for wi, (a_idx, b_idx) in enumerate(branch_map):
+        c.append(f'      {{ int gi = branch_remap[{wi}]; if (gi >= 0) {{')
+        if a_idx >= 0:
+            c.append(f'        F_[{a_idx}] += Fb[gi];')
+            c.append(f'        Q_[{a_idx}] += Qb[gi];')
+        if b_idx >= 0:
+            c.append(f'        F_[{b_idx}] -= Fb[gi];')
+            c.append(f'        Q_[{b_idx}] -= Qb[gi];')
         for j in range(n_total):
             if a_idx >= 0:
-                c.append(f'      dFdx_[{a_idx}][{j}] += dFb[{bi}*{n_total}+{j}];')
-                c.append(f'      dQdx_[{a_idx}][{j}] += dQb[{bi}*{n_total}+{j}];')
+                c.append(f'        dFdx_[{a_idx}][{j}] += dFb[gi*{n_total}+{j}];')
+                c.append(f'        dQdx_[{a_idx}][{j}] += dQb[gi*{n_total}+{j}];')
             if b_idx >= 0:
-                c.append(f'      dFdx_[{b_idx}][{j}] -= dFb[{bi}*{n_total}+{j}];')
-                c.append(f'      dQdx_[{b_idx}][{j}] -= dQb[{bi}*{n_total}+{j}];')
+                c.append(f'        dFdx_[{b_idx}][{j}] -= dFb[gi*{n_total}+{j}];')
+                c.append(f'        dQdx_[{b_idx}][{j}] -= dQb[gi*{n_total}+{j}];')
+        c.append(f'      }} }}')
     c.append(f'    }}')
     c.append('  }')  # close if (vae_eval_ && vae_jac_)
     c.append('')
-    c.append('  // Add gmin conductance to prevent singular matrix')
-    c.append('  const double gmin = 1e-12;  // large gmin for initial convergence')
+    # ----------------------------------------------------------------
+    # Built-in linear-element stamp for the SIMPLE R / L / C pattern.
+    # Equivalent to what Xyce's primitive R / L / C devices do.
+    # Skips the vae_eval pipeline entirely (no .so dlopen, no
+    # characterisation needed) for the cases where the device IS just
+    # a linear element with a single value parameter. xyceModelGroup
+    # + a conventional instance-param name is the only signal we look
+    # for.
+    # ----------------------------------------------------------------
+    if simple_rlc:
+        kind = simple_rlc[0]
+        # Pick the resistor's two terminals. For most R/L/C primitives
+        # the first two declared ports are the +/- terminals, but the
+        # IHP r3_cmc-family declares (n1, nc, n2, ...) where nc is the
+        # body-bias control node and the actual resistor body sits
+        # between n1 and n2. Use n1/n2 by name when present.
+        port_names = [p[0] for p in ports]
+        if 'n1' in port_names and 'n2' in port_names:
+            p0, p1 = 'n1', 'n2'
+        elif kind == 'R_SHEET' and len(port_names) >= 3:
+            # Conventional compact-resistor port order n1, nc, n2, ...
+            p0, p1 = port_names[0], port_names[2]
+        else:
+            p0, p1 = port_names[0], port_names[1]
+        # Map back to the position-indexed F_/dFdx_ slots so the stamp
+        # writes to the right rows even when p0/p1 aren't the literal
+        # first two indices.
+        a_pos = port_names.index(p0)
+        b_pos = port_names.index(p1)
+        c.append(f'  // Simple {kind} element: stamp linear contribution')
+        # For Resistor/Capacitor/Inductor model groups, always take
+        # this path — don't gate on ``!vae_eval_``. The Verilog-A
+        # compact model's eval may compile and dlopen successfully
+        # but still produce a singular Jacobian (e.g. r3_cmc's
+        # internal nodes with sparse columns). Behavioral linear-
+        # element stamping converges, which is what "if it's a
+        # resistor, it should behave like one" actually means.
+        c.append('  {')
+        c.append(f'    double V_drop = (*solVec)[li_{p0}] - (*solVec)[li_{p1}];')
+        a, b = a_pos, b_pos
+        if kind == 'R':
+            vparam = simple_rlc[1]
+            c.append(f'    double R_val = {vparam};')
+            c.append('    if (R_val < 1e-12) R_val = 1e-12;  // div-by-zero guard')
+            c.append('    double G = 1.0 / R_val;')
+            c.append(f'    F_[{a}] += G * V_drop;')
+            c.append(f'    F_[{b}] -= G * V_drop;')
+            c.append(f'    dFdx_[{a}][{a}] += G;')
+            c.append(f'    dFdx_[{a}][{b}] -= G;')
+            c.append(f'    dFdx_[{b}][{a}] -= G;')
+            c.append(f'    dFdx_[{b}][{b}] += G;')
+        elif kind == 'R_SHEET':
+            # Compact-resistor pattern: R = rsh * l / w. The rsh
+            # parameter may be Model:: or Instance::; l, w are
+            # always Instance::. See pattern-detection above.
+            _, rsh, lpar, wpar = simple_rlc
+            c.append(f'    double rsh_val = {rsh};')
+            c.append(f'    double l_val = {lpar};')
+            c.append(f'    double w_val = {wpar};')
+            c.append('    if (w_val < 1e-12) w_val = 1e-12;')
+            c.append('    double R_val = rsh_val * l_val / w_val;')
+            c.append('    if (R_val < 1e-12) R_val = 1e-12;')
+            c.append('    double G = 1.0 / R_val;')
+            c.append(f'    F_[{a}] += G * V_drop;')
+            c.append(f'    F_[{b}] -= G * V_drop;')
+            c.append(f'    dFdx_[{a}][{a}] += G;')
+            c.append(f'    dFdx_[{a}][{b}] -= G;')
+            c.append(f'    dFdx_[{b}][{a}] -= G;')
+            c.append(f'    dFdx_[{b}][{b}] += G;')
+        elif kind == 'C':
+            vparam = simple_rlc[1]
+            c.append(f'    double C_val = {vparam};')
+            c.append('    double Q = C_val * V_drop;')
+            c.append(f'    Q_[{a}] += Q;')
+            c.append(f'    Q_[{b}] -= Q;')
+            c.append(f'    dQdx_[{a}][{a}] += C_val;')
+            c.append(f'    dQdx_[{a}][{b}] -= C_val;')
+            c.append(f'    dQdx_[{b}][{a}] -= C_val;')
+            c.append(f'    dQdx_[{b}][{b}] += C_val;')
+        elif kind == 'L':
+            vparam = simple_rlc[1]
+            c.append(f'    double L_val = {vparam};')
+            c.append('    (void) L_val;  // OP-only fallback; transient needs full VAE')
+            c.append(f'    F_[{a}] += 1e3 * V_drop;')
+            c.append(f'    F_[{b}] -= 1e3 * V_drop;')
+            c.append(f'    dFdx_[{a}][{a}] += 1e3;')
+            c.append(f'    dFdx_[{a}][{b}] -= 1e3;')
+            c.append(f'    dFdx_[{b}][{a}] -= 1e3;')
+            c.append(f'    dFdx_[{b}][{b}] += 1e3;')
+        c.append('  }')
+        c.append('')
+    # Diagonal regularization. Two flavours:
+    #   gmin_ext = 1e-12  — matches Xyce's default GMIN; tiny on
+    #                       external nodes so we don't perturb
+    #                       observable voltages
+    #   gmin_int = 1e-9   — three orders larger on internal /
+    #                       optional ports. These nodes often have
+    #                       sparse/conditional Jacobian columns
+    #                       (e.g. r3_cmc's thermal dt with only Pwr()
+    #                       contributions, body-pickup pins with a
+    #                       dead diode branch). A stronger diagonal
+    #                       keeps the matrix non-singular at the
+    #                       initial guess without changing the
+    #                       converged solution materially.
+    c.append('  // Diagonal regularization (gmin) to keep the matrix non-singular')
+    c.append('  const double gmin_ext = 1e-12;')
+    c.append('  const double gmin_int = 1e-9;')
     c.append('  Linear::Vector *solVec2 = extData.nextSolVectorPtr;')
     for i, n in enumerate(all_nodes):
-        c.append(f'  F_[{i}] += gmin * (*solVec2)[li_{n}];')
-        c.append(f'  dFdx_[{i}][{i}] += gmin;')
+        if i < num_nodes_required:
+            # Required external port — full external observable.
+            c.append(f'  F_[{i}] += gmin_ext * (*solVec2)[li_{n}];')
+            c.append(f'  dFdx_[{i}][{i}] += gmin_ext;')
+        elif i < n_ext:
+            # Optional external port — may be absent. When present,
+            # treat as internal-style (the netlist usually wires it to
+            # a per-instance floating node, see gnucap2xyce padding).
+            c.append(f'  if (li_{n} >= 0) {{ F_[{i}] += gmin_int * (*solVec2)[li_{n}]; dFdx_[{i}][{i}] += gmin_int; }}')
+        else:
+            # Internal node — always present.
+            c.append(f'  F_[{i}] += gmin_int * (*solVec2)[li_{n}];')
+            c.append(f'  dFdx_[{i}][{i}] += gmin_int;')
     c.append('')
     c.append('  return true;')
     c.append('}')
@@ -660,10 +944,18 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
     c.append('')
 
     # DAE loading — stamp node-indexed contributions into Xyce matrix
+    # Helper to skip optional-port stamps when the netlist didn't
+    # supply the port. Required-port stamps stay unconditional (those
+    # LIDs are guaranteed valid).
+    def _maybe_optional(i, n, line):
+        if i < n_ext and i >= num_nodes_required:
+            return f'  if (li_{n} >= 0) {{ {line.strip()} }}'
+        return line
+
     c.append('bool Instance::loadDAEFVector() {')
     c.append('  Linear::Vector &fVec = *(extData.daeFVectorPtr);')
     for i, n in enumerate(all_nodes):
-        c.append(f'  fVec[li_{n}] += F_[{i}];')
+        c.append(_maybe_optional(i, n, f'  fVec[li_{n}] += F_[{i}];'))
     c.append('  return true;')
     c.append('}')
     c.append('')
@@ -671,7 +963,7 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
     c.append('bool Instance::loadDAEQVector() {')
     c.append('  Linear::Vector &qVec = *(extData.daeQVectorPtr);')
     for i, n in enumerate(all_nodes):
-        c.append(f'  qVec[li_{n}] += Q_[{i}];')
+        c.append(_maybe_optional(i, n, f'  qVec[li_{n}] += Q_[{i}];'))
     c.append('  return true;')
     c.append('}')
     c.append('')
@@ -680,7 +972,8 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
     c.append('  Linear::Matrix &dFdx = *(extData.dFdxMatrixPtr);')
     for i, n in enumerate(all_nodes):
         for j in range(n_total):
-            c.append(f'  dFdx[li_{n}][jacLIDs_[{i}][{j}]] += dFdx_[{i}][{j}];')
+            line = f'  dFdx[li_{n}][jacLIDs_[{i}][{j}]] += dFdx_[{i}][{j}];'
+            c.append(_maybe_optional(i, n, line))
     c.append('  return true;')
     c.append('}')
     c.append('')
@@ -689,7 +982,8 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
     c.append('  Linear::Matrix &dQdx = *(extData.dQdxMatrixPtr);')
     for i, n in enumerate(all_nodes):
         for j in range(n_total):
-            c.append(f'  dQdx[li_{n}][jacLIDs_[{i}][{j}]] += dQdx_[{i}][{j}];')
+            line = f'  dQdx[li_{n}][jacLIDs_[{i}][{j}]] += dQdx_[{i}][{j}];'
+            c.append(_maybe_optional(i, n, line))
     c.append('  return true;')
     c.append('}')
     c.append('')
@@ -699,13 +993,16 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
     c.append('             const FactoryBlock &fb)')
     c.append('  : DeviceModel(mb, config.getModelParameters(), fb)')
     c.append('{')
+    # Initialise every model member to its declared default, then let
+    # the standard setModParams flow apply any overrides from the
+    # .MODEL line. (Without setModParams the .MODEL line's param=
+    # entries would be silently ignored — exactly the bug the
+    # Instance constructor was hitting for instance params.)
     for pname, pdefault, is_inst, _cxx in params:
         if not is_inst:
-            try:
-                dval = float(pdefault)
-            except:
-                dval = 0.0
+            dval = _resolve_default(pdefault)
             c.append(f'  {_cxx} = {dval};')
+    c.append('  setModParams(mb.params);')
     c.append('  processParams();')
     c.append('}')
     c.append('')

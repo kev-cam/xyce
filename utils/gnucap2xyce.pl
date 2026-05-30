@@ -354,6 +354,72 @@ sub _group_for_letter {
     return '';
 }
 
+# Extract instance-side bindings (``.foo = expr;``) and own parameter
+# declarations from a paramset body. The bindings are what the simple
+# R/L/C path needs to emit a ``resistance=...`` (or capacitance, etc.)
+# attribute on the device card, with the call-site's value substituted
+# for paramset-declared parameter names.
+#
+# Returns { bindings => [[lhs, rhs], ...],
+#           own_params => { name => default_expr, ... } }.
+# Default-aware: own-param defaults are used when the call site doesn't
+# override the parameter.
+sub parse_paramset_bindings {
+    my ($body_text) = @_;
+    # Strip comments first so ``// .resistance = ...`` lines aren't
+    # captured as bindings.
+    my $text = $body_text;
+    $text =~ s{/\*.*?\*/}{ }gs;
+    $text =~ s{//[^\n]*}{ }g;
+    my @bindings;
+    my %own;
+    for my $stmt (split /;/, $text) {
+        $stmt =~ s/^\s+|\s+$//g;
+        next unless length $stmt;
+        # parameter <type>? NAME = EXPR
+        if ($stmt =~ /^parameter\s+(?:real|integer)?\s*(\w+)\s*=\s*(.+?)$/s) {
+            $own{$1} = $2;
+            next;
+        }
+        # .lhs = expr  (instance-side binding into the underlying)
+        if ($stmt =~ /^\.\s*(\w+)\s*=\s*(.+?)$/s) {
+            push @bindings, [$1, $2];
+            next;
+        }
+    }
+    return { bindings => \@bindings, own_params => \%own };
+}
+
+# Substitute call-site instance-param values into a binding RHS. Words
+# that don't have a call-site value fall back to the paramset's own
+# default (if any), otherwise stay verbatim (Xyce's expression parser
+# will resolve them against .PARAM names like ``res_rpara``).
+#
+# Also strips hierarchical corner-module prefixes (``corner_res.foo``
+# → ``foo``): the per-corner localparams are emitted at the top of the
+# generated .cir as flat .PARAM lines, so the dot path doesn't exist
+# at solve time.
+sub _subst_binding_expr {
+    my ($expr, $callvals, $own_defaults) = @_;
+    # Drop corner-module prefixes. Matches IHP's ``corner_<dut>.<name>``
+    # convention (see extract_corner_localparams + emit_paramset_va,
+    # which do the same flattening for the .va emit path).
+    $expr =~ s/\bcorner_\w+\.(\w+)\b/$1/g;
+    my %vals = %$callvals;
+    # Fill in paramset-declared defaults for params the call site
+    # didn't override.
+    for my $k (keys %$own_defaults) {
+        $vals{$k} = $own_defaults->{$k} unless exists $vals{$k};
+    }
+    # Word-boundary substitution. Longer names first so ``weff``
+    # doesn't get its ``w`` chewed up before the full match runs.
+    for my $k (sort { length($b) <=> length($a) } keys %vals) {
+        my $v = $vals{$k};
+        $expr =~ s/\b\Q$k\E\b/($v)/g;
+    }
+    return $expr;
+}
+
 # ---------------------------------------------------------------------------
 # Read a file with comment-aware line joining. Gnucap uses // for comments
 # but no \-continuation (one logical statement per line).
@@ -563,15 +629,63 @@ sub emit_instance {
         my $iname = $with_letter->($letter, $name);
         # Pad the node list to the underlying's full port count
         # before the model name. The PyMS wrapper's registerLIDs
-        # indexes extLIDVec[0..n_ext-1] unconditionally, so missing
-        # optional ports must be supplied as ``0`` (ground) rather
-        # than omitted. Without padding, the underlying-thermal /
-        # body-pickup index is past-end → uninitialised LID →
-        # segfault during matrixGlobalToLocal.
+        # indexes extLIDVec[0..n_ext-1] up to numNodes()+numOptional;
+        # missing ports must be supplied as a node name (the
+        # registerLIDs bounds-check now handles fewer-than-declared,
+        # but Xyce's MOSFET parser still wants positional model
+        # naming, so we always supply a node).
+        #
+        # For padded slots use a unique floating node per instance
+        # (``<instance>_p<i>``) rather than ground (``0``). The
+        # padded ports are typically the underlying's thermal /
+        # body-pickup pins (e.g. r3_cmc's ``dt``). Tying them to
+        # ground forces V_dt=0, which collapses the small-signal
+        # conductance of any term that depends on a temperature
+        # derivative and yields a singular Jacobian.
         my $n_underlying = $r->{n_underlying_ports} // scalar @nodes;
         my @padded = @nodes;
-        while (@padded < $n_underlying) { push @padded, '0' }
-        my @inst_kvs = map { "$_->{name}=$_->{val}" } @{$inst->{params}};
+        my $pad_idx = 0;
+        while (@padded < $n_underlying) {
+            push @padded, "${name}_p${pad_idx}";
+            $pad_idx++;
+        }
+        # The simple-R/L/C wrapper path expects the linear value
+        # parameter on the device card (``resistance=...``, etc.) —
+        # not the paramset's call-side identifier (``R``). Resolve the
+        # paramset's ``.resistance = <expr>`` binding by substituting
+        # the call-site param values, then emit the resulting
+        # expression on the card. This is what makes the inline
+        # conductance stamp see the right value at solve time.
+        my @inst_kvs;
+        my %callvals = map { $_->{name} => $_->{val} } @{$inst->{params}};
+        my $linear_targets = {
+            R => 'resistance',
+            C => 'capacitance',
+            L => 'inductance',
+        };
+        my $linear_target = $linear_targets->{$letter};
+        my $linear_emitted = 0;
+        if ($linear_target && $r->{bindings}) {
+            for my $bnd (@{$r->{bindings}}) {
+                my ($lhs, $rhs) = @$bnd;
+                next unless lc($lhs) eq $linear_target;
+                my $expr = _subst_binding_expr($rhs, \%callvals,
+                                               $r->{own_params} || {});
+                # Brace the expression so Xyce treats it as an
+                # arithmetic expression rather than a literal.
+                push @inst_kvs, "$linear_target={$expr}";
+                $linear_emitted = 1;
+                last;
+            }
+        }
+        # Pass through any other instance params verbatim, but skip
+        # ones whose names are paramset-declared (they're already
+        # folded into the binding expression we just emitted).
+        my %ps_own = %{ $r->{own_params} || {} };
+        for my $p (@{$inst->{params}}) {
+            next if $linear_emitted && exists $ps_own{$p->{name}};
+            push @inst_kvs, "$p->{name}=$p->{val}";
+        }
         my $line = sprintf("%s %s %s",
                            $iname, join(' ', @padded), $r->{model_name});
         $line .= ' ' . join(' ', @inst_kvs) if @inst_kvs;
@@ -1009,12 +1123,15 @@ sub emit {
                 }
                 close $f;
             }
+            my $b = parse_paramset_bindings($ps->{body_text});
             $paramset_resolved{$t} = {
                 level     => $level,
                 info      => $info,
                 va_path   => $out_file,
                 model_name => "m_$ps->{name}",
                 n_underlying_ports => $n_under_ports,
+                bindings   => $b->{bindings},
+                own_params => $b->{own_params},
             };
         }
     }

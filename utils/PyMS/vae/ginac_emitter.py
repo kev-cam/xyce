@@ -628,6 +628,34 @@ class GiNaCEmitter:
         lines.append(f'{I}}}')
         lines.append(f'{I}cout << "}}" << endl << endl;')
 
+        # Branch / node label exports — let the Xyce-side wrapper match
+        # its own contribution walk against the GiNaC walk's branch
+        # ordering. Without this, the wrapper's index-i for branch I
+        # may not be the GiNaC's index-i (the GiNaC walk does
+        # parameter-resolution to skip dead conditional branches; the
+        # wrapper's walk doesn't). Mismatch → F-values stamp into the
+        # wrong KCL row.
+        lines.append(f'{I}cout << "extern \\"C\\" int vae_n_branches() {{ return " << n_branches << "; }}" << endl;')
+        lines.append(f'{I}cout << "extern \\"C\\" int vae_n_nodes() {{ return " << n_nodes << "; }}" << endl;')
+        lines.append(f'{I}cout << "extern \\"C\\" const char* vae_branch_label(int i) {{" << endl;')
+        lines.append(f'{I}cout << "    static const char* labels[] = {{";')
+        lines.append(f'{I}for (int i = 0; i < n_branches; i++) {{')
+        lines.append(f'{I}    if (i) cout << ", ";')
+        lines.append(f'{I}    cout << "\\"" << branch_labels[i] << "\\"";')
+        lines.append(f'{I}}}')
+        lines.append(f'{I}cout << "}};" << endl;')
+        lines.append(f'{I}cout << "    return (i >= 0 && i < " << n_branches << ") ? labels[i] : \\"\\";" << endl;')
+        lines.append(f'{I}cout << "}}" << endl;')
+        lines.append(f'{I}cout << "extern \\"C\\" const char* vae_node_label(int i) {{" << endl;')
+        lines.append(f'{I}cout << "    static const char* labels[] = {{";')
+        lines.append(f'{I}for (int i = 0; i < (int)node_names.size(); i++) {{')
+        lines.append(f'{I}    if (i) cout << ", ";')
+        lines.append(f'{I}    cout << "\\"" << node_names[i] << "\\"";')
+        lines.append(f'{I}}}')
+        lines.append(f'{I}cout << "}};" << endl;')
+        lines.append(f'{I}cout << "    return (i >= 0 && i < " << n_nodes << ") ? labels[i] : \\"\\";" << endl;')
+        lines.append(f'{I}cout << "}}" << endl;')
+
         # Metadata
         lines.append(f'{I}cout << "// n_nodes = " << n_nodes << endl;')
         lines.append(f'{I}cout << "// n_branches = " << n_branches << endl;')
@@ -918,6 +946,14 @@ class GiNaCEmitter:
         br_p = node.branch[0]
         br_n = node.branch[1] if len(node.branch) > 1 else 'gnd'
 
+        # If the contribution targets a named branch with a known
+        # second endpoint (``branch (a, b) name;``), pick that up
+        # from branch_neg_map instead of defaulting to 'gnd' — same
+        # rationale as the V() rewriter below.
+        branch_neg = getattr(self.mod, 'branch_neg_map', {}) or {}
+        if len(node.branch) == 1 and br_p in branch_neg:
+            br_n = branch_neg[br_p]
+
         # Resolve branch names to their node
         if br_p in self.branch_map:
             br_p = self.branch_map[br_p]
@@ -1095,11 +1131,23 @@ class GiNaCEmitter:
         result = result.replace('& &', '&&')
         result = result.replace('| |', '||')
 
-        # V(a,b) → (V_a - V_b), V(a) → V_a, grounded nodes → 0
+        # V(a,b) → (V_a - V_b), V(a) → V_a, grounded nodes → 0.
+        # Verilog-A also allows V(named_branch) for a branch declared
+        # with two endpoints (``branch (a, b) name;``). The parser
+        # stores those endpoints in branch_map (primary) +
+        # branch_neg_map (secondary); fold both in so the contribution
+        # actually depends on the differential voltage rather than
+        # just the primary node — the singular-Jacobian symptom on
+        # internal nodes traces back to this drop.
+        branch_neg = getattr(self.mod, 'branch_neg_map', {}) or {}
         def repl_v(m):
             p1 = m.group(1).strip()
             p2 = m.group(2).strip() if m.group(2) else None
-            # Resolve branch names to their node
+            # Resolve branch names to their nodes. If a single-arg V()
+            # references a named branch with a secondary endpoint,
+            # synthesize the second argument from branch_neg_map.
+            if p2 is None and p1 in self.branch_map and p1 in branch_neg:
+                p2 = branch_neg[p1]
             if p1 in self.branch_map:
                 p1 = self.branch_map[p1]
             if p2 and p2 in self.branch_map:
@@ -1122,13 +1170,41 @@ class GiNaCEmitter:
         # $limit(expr, ...) → just expr
         result = re.sub(r'\$limit\s*\(\s*([^,]+),.*?\)', r'\1', result)
 
-        # Temp(node) → V_node (thermal node temperature access)
-        result = re.sub(r'Temp\s*\(\s*(\w+)\s*\)', lambda m: f'V_{m.group(1)}', result)
+        # Temp(node-or-branch) → V_<resolved-node>. Verilog-A allows
+        # passing a branch label here (e.g. ``Temp(b_rth)`` where
+        # ``branch (dt) b_rth;``); resolve via branch_map first so we
+        # don't emit an undefined ``V_b_rth`` symbol.
+        def _repl_temp(m):
+            name = m.group(1)
+            if name in self.branch_map:
+                name = self.branch_map[name]
+            return f'V_{name}'
+        result = re.sub(r'Temp\s*\(\s*(\w+)\s*\)', _repl_temp, result)
+
+        # Pwr(branch) → 0 in eval context (thermal-power contribution
+        # acts as an internal source the wrapper doesn't model
+        # directly). Same shape as the I(branch) probe rule above.
+        result = re.sub(r'Pwr\s*\(\s*\w+\s*\)', 'ex(0)', result)
 
         # $vt(expr) → (8.617087e-5 * (expr)), $vt → Vt, $temperature → temperature
         result = re.sub(r'\$vt\s*\(\s*([^)]+)\s*\)', r'(8.617087e-5 * (\1))', result)
         result = re.sub(r'\$vt\b', 'Vt', result)
         result = re.sub(r'\$temperature\b', 'temperature', result)
+
+        # $mfactor — Verilog-A parallel-multiplier system parameter.
+        # Default to 1.0 (single device); multi-instance scaling would
+        # need a runtime hook the wrapper doesn't expose.
+        result = re.sub(r'\$mfactor\b', '1.0', result)
+
+        # $port_connected(x) / $param_given(x) in expression context.
+        # Conditions handle these via _preprocess_sys_funcs; the same
+        # rewrite has to apply when they appear inside ordinary
+        # expressions (some compact models gate scaling math on
+        # ``$param_given(W) ? ... : ...``).
+        result = re.sub(r'\$port_connected\s*\(\s*\w+\s*\)', '1', result)
+        def _pg_expr(m):
+            return '1' if m.group(1) in self._given_params else '0'
+        result = re.sub(r'\$param_given\s*\(\s*(\w+)\s*\)', _pg_expr, result)
 
         # $simparam("name", default) → default value
         result = re.sub(r'\$simparam\s*\(\s*"[^"]*"\s*,\s*([^)]+)\)', r'\1', result)
@@ -1824,10 +1900,18 @@ class GiNaCEmitter:
         result = result.replace('> =', '>=').replace('< =', '<=')
         result = result.replace('& &', '&&').replace('| |', '||')
 
-        # V(a,b) → (V_a - V_b), V(a) → V_a, grounded nodes → 0.0
+        # V(a,b) → (V_a - V_b), V(a) → V_a, V(named_branch) → both
+        # endpoints when the branch was declared with two nodes.
+        branch_neg = getattr(self.mod, 'branch_neg_map', {}) or {}
         def repl_v(m):
             p1 = m.group(1).strip()
             p2 = m.group(2).strip() if m.group(2) else None
+            if p2 is None and p1 in self.branch_map and p1 in branch_neg:
+                p2 = branch_neg[p1]
+            if p1 in self.branch_map:
+                p1 = self.branch_map[p1]
+            if p2 and p2 in self.branch_map:
+                p2 = self.branch_map[p2]
             if p1 not in active_nodes and p1 in self.internal_nodes:
                 p1 = self._resolve_shorted_node(p1, active_nodes)
             if p2 and p2 not in active_nodes and p2 in self.internal_nodes:
@@ -1961,10 +2045,18 @@ class GiNaCEmitter:
         c = c.replace('> =', '>=').replace('< =', '<=')
         c = c.replace('& &', '&&').replace('| |', '||')
 
-        # V(a,b) → (V_a - V_b), V(a) → V_a
+        # V(a,b) → (V_a - V_b), V(a) → V_a, V(named_branch) using both
+        # endpoints when the branch declaration named two nodes.
+        branch_neg = getattr(self.mod, 'branch_neg_map', {}) or {}
         def repl_v(m):
             p1 = m.group(1).strip()
             p2 = m.group(2).strip() if m.group(2) else None
+            if p2 is None and p1 in self.branch_map and p1 in branch_neg:
+                p2 = branch_neg[p1]
+            if p1 in self.branch_map:
+                p1 = self.branch_map[p1]
+            if p2 and p2 in self.branch_map:
+                p2 = self.branch_map[p2]
             if p1 not in active_nodes and p1 in self.internal_nodes:
                 p1 = self._resolve_shorted_node(p1, active_nodes)
             if p2 and p2 not in active_nodes and p2 in self.internal_nodes:

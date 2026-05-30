@@ -108,7 +108,11 @@ class Module:
     params: list[Param] = field(default_factory=list)
     variables: list[Var] = field(default_factory=list)
     internal_nodes: list[str] = field(default_factory=list)
-    branch_map: dict[str, str] = field(default_factory=dict)  # branch_name → node_name
+    branch_map: dict[str, str] = field(default_factory=dict)  # branch_name → primary node
+    # Secondary endpoint, when the branch is declared with two nodes
+    # (e.g. ``branch (i2, i1) b_rb;``). The wrapper needs this to stamp
+    # the branch current into both KCL rows with the correct sign.
+    branch_neg_map: dict[str, str] = field(default_factory=dict)
     analog_block: Optional[ASTNode] = None
     attributes: dict[str, str] = field(default_factory=dict)
 
@@ -351,16 +355,21 @@ class Parser:
                 if self.at('('):
                     self.advance()
                     node_name = self.consume_ident()
-                    # Some declarations list both ends (`branch (p, n) b`)
-                    # — keep only the first, which is what we use as the
-                    # branch's "primary" node for substitution.
+                    # Some declarations list both ends (`branch (p, n) b`).
+                    # Keep the second one in branch_neg_map so the
+                    # wrapper can stamp the branch current into both
+                    # KCL rows; the GiNaC emitter uses the primary
+                    # (branch_map[name]) for V(branch_name) lookups.
+                    second_name = None
                     while self.at(','):
                         self.advance()
-                        self.consume_ident()
+                        second_name = self.consume_ident()
                     self.expect(')')
                     while not self.at(';'):
                         branch_name = self.consume_ident()
                         mod.branch_map[branch_name] = node_name
+                        if second_name is not None:
+                            mod.branch_neg_map[branch_name] = second_name
                         if self.at(','):
                             self.advance()
                     self.expect(';')
@@ -387,7 +396,10 @@ class Parser:
                 self._skip_directive()
             elif t.value in ('nature', 'discipline'):
                 self._skip_block(t.value, 'end' + t.value)
-            elif t.value in ('module', 'paramset'):
+            elif t.value in ('module', 'paramset', 'parameter'):
+                # ``parameter`` here is a top-level decl between
+                # entities (see _parse_all_entities) — let that loop
+                # capture it rather than blindly skipping past.
                 break
             elif t.value == '(*':
                 # Could be attribute on module — check if 'module' follows
@@ -1129,10 +1141,21 @@ def _parse_all_entities(source: str, filename: str = ""):
     parsing one entity, advancing, repeating. The Parser instance is
     advanced cooperatively (each parse_module / parse_paramset leaves
     the stream pointed past its ``endmodule`` / ``endparamset``).
+
+    Also collects file-level ``parameter NAME = VALUE;`` declarations
+    that sit between entities. gnucap2xyce.pl emits corner-derived
+    constants this way at the head of each per-paramset .va file
+    (e.g. ``parameter real rsh_rsil = 7.0;``). Without picking these
+    up, paramset bindings that reference them by name resolve to 0
+    at codegen time and break the simple-R stamp's R value. The
+    collected dict is attached to the LAST paramset / module as
+    ``_file_level_params`` so downstream code can use it for
+    identifier-default substitution.
     """
     tokens = tokenize(source)
     parser = Parser(tokens, source=source, filename=filename)
     entities = []
+    file_level_params = {}
     while parser.pos < len(parser.tokens):
         parser._skip_preamble()
         if parser.pos >= len(parser.tokens):
@@ -1140,6 +1163,35 @@ def _parse_all_entities(source: str, filename: str = ""):
         t = parser.peek()
         if t is None:
             break
+        # Top-level ``parameter [real|integer] NAME = VALUE;``.
+        if t.value == 'parameter':
+            parser.advance()
+            # optional type keyword
+            tt = parser.peek()
+            if tt and tt.value in ('real', 'integer'):
+                parser.advance()
+            name_tok = parser.peek()
+            if name_tok and name_tok.type == 'IDENT':
+                pname = name_tok.value
+                parser.advance()
+                if parser.at('='):
+                    parser.advance()
+                    val_tokens = []
+                    while parser.peek() and parser.peek().value != ';':
+                        val_tokens.append(parser.peek().value)
+                        parser.advance()
+                    if parser.at(';'):
+                        parser.advance()
+                    file_level_params[pname] = ' '.join(val_tokens).strip()
+                else:
+                    # Malformed; skip until semicolon.
+                    while parser.peek() and parser.peek().value != ';':
+                        parser.advance()
+                    if parser.at(';'):
+                        parser.advance()
+            else:
+                parser.advance()
+            continue
         if t.value == 'paramset' or (t.value == '(*'):
             # ``(* attrs *) [paramset|module] NAME ...``  Peek past attrs
             # to decide which.
@@ -1164,6 +1216,8 @@ def _parse_all_entities(source: str, filename: str = ""):
         # Unrecognised top-level token — advance to avoid an infinite
         # loop on garbage between entities.
         parser.advance()
+    if file_level_params and entities:
+        entities[-1]._file_level_params = file_level_params
     return entities
 
 
@@ -1250,10 +1304,23 @@ def _resolve_paramset(ps: Paramset, underlying: Module) -> Module:
                                 default=lp_expr))
         seen.add(lp_name)
     binding_map = {b[0]: b[1] for b in ps.bindings}
+    # File-level parameter declarations sitting between modules
+    # (typical for gnucap2xyce-generated paramset .va files: a list
+    # of corner-derived constants). Used to resolve binding RHS
+    # identifiers that don't refer to the paramset's own params.
+    file_level = getattr(ps, '_file_level_params', None) or {}
     for p in underlying.params:
         if p.name in seen:
             continue
         new_default = binding_map.get(p.name, p.default)
+        # If the binding RHS is a bare identifier we know the
+        # numeric default for (from file-level decls), substitute
+        # it. Without this, the wrapper's addPar default for the
+        # underlying param falls back to 0.
+        if isinstance(new_default, str):
+            stripped = new_default.strip()
+            if stripped in file_level:
+                new_default = file_level[stripped]
         new_params.append(Param(
             name=p.name, type=p.type, default=new_default,
             from_range=p.from_range,
@@ -1274,6 +1341,7 @@ def _resolve_paramset(ps: Paramset, underlying: Module) -> Module:
         variables=list(underlying.variables),
         internal_nodes=list(underlying.internal_nodes),
         branch_map=dict(underlying.branch_map),
+        branch_neg_map=dict(underlying.branch_neg_map),
         analog_block=underlying.analog_block,
         attributes=merged_attrs,
     )
