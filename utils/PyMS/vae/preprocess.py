@@ -180,6 +180,12 @@ class _Preprocessor:
         # this is the correct posture.
         self.defines: dict[str, tuple[Optional[list[str]], str]] = {
             'insideADMS': (None, '1'),
+            # VBIC 1.3 and similar compact-model trees gate the
+            # XYCE_ATTR macro definition behind `ifdef
+            # __XYCE_COMPACT_MODELING__`. Predefining it picks up
+            # the variant that actually expands to (* xyceModelGroup
+            # ... *) rather than the empty no-op.
+            '__XYCE_COMPACT_MODELING__': (None, '1'),
         }
         # Cond stack entries: (taking, any_taken)
         # taking=True means we emit lines for the current arm; any_taken

@@ -86,7 +86,7 @@ DIR_TO_ENTRIES = {
     'MVS2':          ['MVS 2.0'],
     'VERILOG_MODEL_BINNING': ['BSIM6', 'BSIM-CMG 107', 'BSIM-CMG 108',
                               'BSIM-CMG 110', 'BSIM-CMG 111'],
-    'Verilog_LEAD_CURRENTS': ['BSIM6', 'BSIM-CMG 107', 'PSP 103'],
+    'Verilog_LEAD_CURRENTS': ['BSIM6', 'BSIM-CMG 107', 'PSP 103', 'VBIC 1.3'],
 }
 
 # Directories whose PARAM_M failures are on devices NOT backed by any
@@ -124,6 +124,12 @@ def _compute_bug_classes():
       'b' terminal_split_wrong
       'c' parser_raises
       'd' parser_yields_zero_instance_params
+      'e' wrapper_structurally_correct_but_xyce_auto_register_missing
+          (the regression .cir uses ``.MODEL ... level=N`` with no
+          ``.HDL`` line, expecting Xyce's auto-loader to pick up the
+          model by level number — that path isn't wired up for every
+          compact-model family, so the netlist falls through to a
+          built-in BJT/MOSFET whose param/node convention differs.)
     """
     result = {}
     for desc, va_path, want_group, want_level, want_req in ENTRY_POINTS:
@@ -158,8 +164,28 @@ def _compute_bug_classes():
         except Exception:
             # Codegen blew up — count as 'c' (parser/codegen pipeline failed)
             classes.add('c')
+        # If the wrapper passes every structural check but the
+        # entry is one that Xyce currently doesn't pick up via the
+        # ``.MODEL level=N`` → .HDL auto-loader (no ``.HDL`` line in
+        # the regression .cir, no built-in registration of that
+        # level), flag as 'e'. See AUTO_REGISTER_MISSING below.
+        if not classes and desc in AUTO_REGISTER_MISSING:
+            classes.add('e')
         result[desc] = classes
     return result
+
+
+# Entries whose wrapper is structurally clean but currently fail the
+# regression test because the model level isn't reached via Xyce's
+# .HDL auto-loader (the regression .cir doesn't carry a .HDL line).
+# Distinct from OUT_OF_SCOPE because the wrapper IS in catalog and
+# would work once auto-registration is wired through; the test still
+# wants the failure attributed so a future fix removes the entry
+# here rather than discovers it via a fresh "unattributed" report.
+AUTO_REGISTER_MISSING = {
+    'HICUM L0',
+    'VBIC 1.3',
+}
 
 
 BUG_CLASSES = _compute_bug_classes()
@@ -262,7 +288,7 @@ class TestParamMAttribution(unittest.TestCase):
                 cls_set = BUG_CLASSES.get(d, set())
                 per_entry_count[d] += 1
                 per_entry_classes[d] = cls_set
-                if cls_set & {'a', 'b', 'c', 'd'}:
+                if cls_set & {'a', 'b', 'c', 'd', 'e'}:
                     attributable_to.append((d, sorted(cls_set)))
             if not attributable_to:
                 unattributed.append(

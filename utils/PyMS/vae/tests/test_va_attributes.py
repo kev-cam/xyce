@@ -100,6 +100,8 @@ ENTRY_POINTS = [
         'BJT', '230', 4),
     ('FBH HBT 2.1',   f'{INSTALL}/fbh_hbt-2.1/fbhhbt-2.1.va',
         'BJT', '23', 4),
+    ('VBIC 1.3',      f'{INSTALL}/vbic_r1.3_prerelease/vbic_1p3.va',
+        'BJT', '12', 4),
     # Diodes.
     ('Diode CMC 2.0', f'{INSTALL}/DIODE_CMC_2/diode_cmc_2.0.0/diode_cmc.va',
         'Diode', '2002', 2),

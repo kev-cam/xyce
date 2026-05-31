@@ -614,6 +614,12 @@ class Parser:
                 self.advance()
                 continue
             key = self.consume_ident()
+            # IEEE 1364-2005 namespaced attribute keys: ``ns:name``
+            # (e.g. HICUM L0's ``(* spice:name="is" ... *)``). Treat
+            # the namespace and local name as one key for storage.
+            if self.at(':'):
+                self.advance()
+                key = key + ':' + self.consume_ident()
             if self.at('='):
                 self.advance()
                 t = self.peek()

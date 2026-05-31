@@ -185,8 +185,48 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
         'Inductor':  2,
     }
     if model_group in _GROUP_REQUIRED_TERMINALS:
-        num_nodes_required = min(_GROUP_REQUIRED_TERMINALS[model_group], n_ext)
-        num_nodes_optional = max(0, n_ext - num_nodes_required)
+        conv = _GROUP_REQUIRED_TERMINALS[model_group]
+        # If the .va declares FEWER ports than the SPICE-letter
+        # convention (e.g. MVS 2.0 declares only ``d, g, s`` for a
+        # MOSFET, no body), we still tell Xyce ``numNodes() = conv``
+        # so the netlist's standard M / Q / D card parses correctly.
+        # The extra ports beyond what the .va declared are virtual:
+        # registerLIDs will accept their LIDs but no contribution
+        # references them, equivalent to the SPICE 3-terminal-MOSFET
+        # convention of tying body to source.
+        num_nodes_required = conv
+        num_nodes_optional = max(0, n_ext - conv)
+        if n_ext < conv:
+            # Synthesize virtual port names so the rest of the
+            # codegen (li_<n>, registerLIDs) has something to bind
+            # the extra extLIDVec entries to. Conventional spelling
+            # per group keeps stamps and printouts readable.
+            _VIRTUAL_PORTS = {
+                'MOSFET': ['_b', '_t'],
+                'BJT':    ['_s', '_t'],
+                'Diode':  ['_t'],
+            }
+            extras = _VIRTUAL_PORTS.get(model_group, [])
+            existing = {p[0].lower() for p in ports}
+            i = 0
+            while n_ext < conv and i < len(extras):
+                vn = 'vp' + extras[i]
+                while vn.lower() in existing:
+                    vn = vn + '_'
+                ports = ports + [(vn, 'INOUT')]
+                existing.add(vn.lower())
+                n_ext += 1
+                i += 1
+            while n_ext < conv:
+                vn = f'vp_extra{n_ext}'
+                ports = ports + [(vn, 'INOUT')]
+                n_ext += 1
+            # Recompute all_nodes / n_total — downstream code uses
+            # both heavily for stamp indices and for the registerLIDs
+            # loop. Keeping ports as the prefix of all_nodes is the
+            # invariant the rest of the generator expects.
+            all_nodes = [p[0] for p in ports] + internals
+            n_total = n_ext + n_int
     else:
         # Y-devices and unknown groups: every declared port is required,
         # zero optional — matches what Xyce's generic Y handler expects.
