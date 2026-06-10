@@ -138,6 +138,21 @@ sub _take_param_value {
 }
 
 
+# Decide whether a .PRINT/.PLOT body's leading analysis-type token matches an
+# analysis actually present in the deck. LTspice decks sometimes carry a
+# `.PRINT TRAN` alongside an AC-only analysis (and vice-versa); Xyce aborts with
+# "Analysis type X and print type Y are inconsistent". Returns true to keep the
+# line, false to drop it (its type has no matching analysis). A .PRINT with no
+# leading type token, or when no analyses were detected, is always kept.
+sub _print_type_matches {
+    my ($body, $analyses) = @_;
+    return 1 unless %$analyses;
+    if ($body =~ /^\s*(TRAN|AC|DC|NOISE|HB|SENS|TRANADJOINT)\b/i) {
+        return 0 unless $analyses->{ uc $1 };
+    }
+    return 1;
+}
+
 sub cir_to_xyce {
     my ($lines_ref, $lib_path) = @_;
     my @output;
@@ -146,6 +161,7 @@ sub cir_to_xyce {
     my $has_end   = 0;
     my $has_print = 0;
     my $analysis_type;
+    my %analyses;              # set of analysis types present (TRAN/AC/DC/NOISE)
     my %diode_models_used;     # model names referenced by D devices
     my %models_defined;        # model names defined by .model statements
 
@@ -157,6 +173,12 @@ sub cir_to_xyce {
         elsif ($u =~ /^\s*\.DC\b/)   { $analysis_type = 'DC' }
         elsif ($u =~ /^\s*\.OP\b/)   { $analysis_type = 'DC' }
         elsif ($u =~ /^\s*\.TF\b/)   { $analysis_type = 'DC' }
+
+        # Set of analysis types present, to reconcile .PRINT/.PLOT types against.
+        $analyses{TRAN}  = 1 if $u =~ /^\s*\.TRAN\b/;
+        $analyses{AC}    = 1 if $u =~ /^\s*\.AC\b/;
+        $analyses{DC}    = 1 if $u =~ /^\s*\.(?:DC|OP|TF)\b/;
+        $analyses{NOISE} = 1 if $u =~ /^\s*\.NOISE\b/;
 
         # Track diode instance model references: D<name> <n+> <n-> <model>
         if ($line =~ /^\s*D\S*\s+\S+\s+\S+\s+(\S+)/i) {
@@ -269,6 +291,11 @@ sub cir_to_xyce {
         # .PLOT with args -> .PRINT
         if ($stripped =~ /^\.PLOT\s+(.+)/i) {
             my $args = $1;
+            if (!_print_type_matches($args, \%analyses)) {
+                push @changes, "L$lineno: dropped .PLOT (print type has no matching analysis)";
+                push @output, "* [ltz] dropped (no matching analysis): $stripped\n";
+                next;
+            }
             push @changes, "L$lineno: .PLOT -> .PRINT";
             push @output, ".PRINT $args\n";
             $has_print = 1;
@@ -337,8 +364,28 @@ sub cir_to_xyce {
             next;
         }
 
+        # .STEP: LTspice writes ".step [oct|dec|lin] param <name> <args>"; Xyce's
+        # .STEP takes no 'param' keyword (".STEP [LIN|DEC|OCT] <name> <args>").
+        # Strip the keyword so the parameter sweep is recognized.
+        if ($upper =~ /^\.STEP\b/) {
+            if ($stripped =~ /^\.step\s+(?:(oct|dec|lin)\s+)?param\s+(.+)/i) {
+                my $mode = $1 ? uc($1) . ' ' : '';
+                push @changes, "L$lineno: .step param -> .STEP (dropped LTspice 'param' keyword)";
+                push @output, ".STEP $mode$2\n";
+                next;
+            }
+            push @output, $line;
+            next;
+        }
+
         # Track .PRINT
         if ($upper =~ /^\.PRINT/) {
+            my ($body) = $stripped =~ /^\.PRINT\s*(.*)/i;
+            if (defined $body && !_print_type_matches($body, \%analyses)) {
+                push @changes, "L$lineno: dropped .PRINT (print type has no matching analysis)";
+                push @output, "* [ltz] dropped (no matching analysis): $stripped\n";
+                next;
+            }
             $has_print = 1;
             push @output, $line;
             next;
