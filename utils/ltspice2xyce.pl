@@ -435,6 +435,18 @@ sub cir_to_xyce {
         push @changes, "Added missing .END";
     }
 
+    # Keep only the LAST .END: LTspice files sometimes concatenate several
+    # circuit blocks, each terminated by its own .END. Xyce treats the first
+    # .END as end-of-netlist and errors on the trailing blocks, so comment out
+    # every .END but the final one.
+    {
+        my @ends = grep { $output[$_] =~ /^\s*\.END\s*$/i } 0 .. $#output;
+        if (@ends > 1) {
+            $output[$_] = "* [ltz] intermediate .END removed\n" for @ends[0 .. $#ends - 1];
+            push @changes, "Removed " . (@ends - 1) . " intermediate .END statement(s)";
+        }
+    }
+
     return (\@output, \@changes, \@warnings);
 }
 
