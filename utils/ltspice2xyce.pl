@@ -209,6 +209,25 @@ sub cir_to_xyce {
             next;
         }
 
+        # .LIB <file>  (sectionless whole-file include): LTspice/PSpice mean
+        # "include the file", but Xyce reads a one-arg .LIB <file> as a sectioned
+        # library and aborts ("Could not find .ENDL ... '.INC' was intended").
+        # Rewrite to .INCLUDE so the recursive include-translator picks it up.
+        # Keep ".LIB <section>" (section open, paired with .ENDL) and the
+        # sectioned ".LIB <file> <section>" form untouched.
+        if ($upper =~ /^\.LIB\b/) {
+            my @t = split /\s+/, $stripped;     # .LIB  arg  [section]
+            shift @t;
+            if (@t == 1 && $t[0] =~ m{[./]} ) {  # single arg that looks like a file
+                (my $file = $t[0]) =~ s/^["']|["']$//g;
+                push @changes, "L$lineno: .LIB $file -> .INCLUDE (sectionless file)";
+                push @output, ".INCLUDE $file\n";
+                next;
+            }
+            push @output, $line;                 # section open / sectioned include
+            next;
+        }
+
         # .INCLUDE/.INC handling
         if ($upper =~ /^\.(?:INCLUDE|INC)\b/) {
             my ($inc_file) = $stripped =~ /^\S+\s+(.*)/;
