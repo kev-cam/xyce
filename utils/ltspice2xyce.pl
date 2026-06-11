@@ -391,6 +391,16 @@ sub cir_to_xyce {
             next;
         }
 
+        # .END <name>: a subcircuit terminator mis-written as ".END <subckt>"
+        # (LTspice tolerates it). Xyce treats a bare .END as end-of-netlist and
+        # would drop every following block, so rewrite to ".ENDS <subckt>".
+        if ($upper =~ /^\.END\s+\S/) {
+            my ($name) = $stripped =~ /^\.END\s+(.*)$/i;
+            push @changes, "L$lineno: .END $name -> .ENDS $name (subckt terminator)";
+            push @output, ".ENDS $name\n";
+            next;
+        }
+
         # Track .END
         if ($upper eq '.END') {
             $has_end = 1;
