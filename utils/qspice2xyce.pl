@@ -123,6 +123,15 @@ sub qcir_to_xyce {
         # Comments pass through
         if ($stripped =~ /^\*/) { push @output, "$stripped\n"; next; }
 
+        # micro sign -> u, up front: every branch below may emit the line
+        # directly, so the conversion must happen before any of them
+        if ($stripped =~ /\xb5|\xc2\xb5/) {
+            $stripped =~ s/\xc2\xb5/u/g;
+            $stripped =~ s/\xb5/u/g;
+            $upper = uc($stripped);
+            push @changes, "L$lineno: micro sign -> u";
+        }
+
         # .meas: QSPICE op-point measures don't map onto Xyce .MEASURE; they are
         # post-processing and not needed for the waveform comparison.
         if ($upper =~ /^\.MEAS\b/) {
@@ -249,22 +258,55 @@ sub qcir_to_xyce {
             }
         }
 
-        # Device value that's a bare parameter name: Xyce requires braces
-        # ("V1 G 0 VGS" -> {VGS}; "R1 N01 0 R" -> {R}) when it's a .param/.step
-        # name. Sources scan all value positions; R/C/L just the value token.
-        if ($stripped =~ /^[VIRCLvircl]\S*\s/ && %params_defined) {
+        # V/I source fixups, applied together:
+        #  - QSPICE's netlister writes transient specs as bare keywords
+        #    ("V3 IN SGND sine 0 100m 1K"); Xyce needs SIN(0 100m 1K).
+        #  - a bare (possibly negated) .param/.step name as a value needs
+        #    braces: "V1 POS 0 X" -> {X}, "V2 NEG 0 -X" -> {-X}.
+        if ($stripped =~ /^[VIvi]\S*\s/) {
             my @tok = split /\s+/, $stripped;
             my $chg = 0;
             for my $i (3 .. $#tok) {
-                if ($tok[$i] =~ /^\w+$/ && $params_defined{ uc $tok[$i] }) {
+                if ($tok[$i] =~ /^(sine|sin|pulse|exp|sffm|pwl)$/i) {
+                    my @args = splice @tok, $i + 1;
+                    my @tail;
+                    while (@args && $args[-1] =~ /^\w+=/) { unshift @tail, pop @args; }
+                    (my $kw = uc $tok[$i]) =~ s/^SINE$/SIN/;
+                    $tok[$i] = "$kw(@args)";
+                    push @tok, @tail;
+                    push @changes, "L$lineno: bare $kw source spec -> $kw(...)";
+                    $chg = 1;
+                    last;
+                }
+            }
+            if (%params_defined) {
+                for my $i (3 .. $#tok) {
+                    if ($tok[$i] =~ /^-?(\w+)$/ && $params_defined{ uc $1 }) {
+                        $tok[$i] = "{$tok[$i]}";
+                        $chg = 1;
+                    }
+                }
+            }
+            if ($chg) {
+                push @changes, "L$lineno: source line normalized";
+                push @output, join(' ', @tok) . "\n";
+                next;
+            }
+        }
+
+        # R/C/L value that's a bare parameter name -> braces ("R1 N01 0 R")
+        if ($stripped =~ /^[RCLrcl]\S*\s/ && %params_defined) {
+            my @tok = split /\s+/, $stripped;
+            my $chg = 0;
+            for my $i (3 .. $#tok) {
+                if ($tok[$i] =~ /^-?(\w+)$/ && $params_defined{ uc $1 }) {
                     $tok[$i] = "{$tok[$i]}";
                     $chg = 1;
                 }
             }
             if ($chg) {
-                my $l = join ' ', @tok;
                 push @changes, "L$lineno: braced bare param reference(s)";
-                push @output, "$l\n";
+                push @output, join(' ', @tok) . "\n";
                 next;
             }
         }
@@ -318,6 +360,19 @@ sub qcir_to_xyce {
             next;
         }
 
+        # Device instance names may carry QSPICE glyph bytes (e.g. R<0xB4>F2 in
+        # the AudioAmp example): sanitize the NAME token only and continue
+        # processing the line normally. (0xC3/0xA5 builtins handled above.)
+        if ($stripped !~ /^[.*]/) {
+            my ($name) = $stripped =~ /^(\S+)/;
+            if (defined $name && $name =~ /[\x80-\xff]/) {
+                (my $clean = $name) =~ s/[\x80-\xff]/_/g;
+                $stripped =~ s/^\Q$name\E/$clean/;
+                $upper = uc($stripped);
+                push @changes, "L$lineno: device name glyph byte(s) -> _ ($clean)";
+            }
+        }
+
         # Inline-parameter S switch (QSPICE/LTspice style): Xyce needs a .model.
         #   S1 a b c d Ron=10 Roff=1G Vt=2 Vh=-1  ->  S1 a b c d QTZ_SW_S1
         # Vh<0 means smooth (non-hysteretic): use a 1V transition window.
@@ -338,13 +393,29 @@ sub qcir_to_xyce {
             next;
         }
 
-        # Capacitor with Rpar= (QSPICE parallel-loss shorthand): emit a real
-        # parallel resistor. (Rser similarly has no Xyce equivalent on C.)
-        if ($stripped =~ /^([Cc]\S*)\s+(\S+)\s+(\S+)\s+(\S+)(.*)\bRpar=(\S+)(.*)$/) {
-            my ($cn, $n1, $n2, $val, $pre, $rv, $post) = ($1, $2, $3, $4, $5, $6, $7);
-            push @changes, "L$lineno: C Rpar= -> companion resistor";
-            push @output, "$cn $n1 $n2 $val$pre$post\n";
-            push @output, "Rqtzpar_$cn $n1 $n2 $rv\n";
+        # Capacitor with Rpar=/Rser= (QSPICE loss shorthands Xyce's C lacks):
+        # Rpar -> companion parallel resistor; Rser -> series resistor through
+        # an internal node.
+        if ($stripped =~ /^[Cc]\S*\s/ && $stripped =~ /\bR(?:par|ser)=/i) {
+            my @tok = split /\s+/, $stripped;
+            my ($cn, $n1, $n2, $val) = @tok[0 .. 3];
+            my ($rpar, $rser, @keep);
+            for my $t (@tok[4 .. $#tok]) {
+                if    ($t =~ /^Rpar=(\S+)$/i) { $rpar = $1; }
+                elsif ($t =~ /^Rser=(\S+)$/i) { $rser = $1; }
+                else                          { push @keep, $t; }
+            }
+            my $bot = $n2;
+            if (defined $rser) {
+                $bot = "qtzser_$cn";
+                push @output, "Rqtzser_$cn $bot $n2 $rser\n";
+                push @changes, "L$lineno: C Rser= -> series resistor";
+            }
+            push @output, "$cn $n1 $bot $val @keep\n";
+            if (defined $rpar) {
+                push @output, "Rqtzpar_$cn $n1 $n2 $rpar\n";
+                push @changes, "L$lineno: C Rpar= -> companion resistor";
+            }
             next;
         }
 
@@ -371,13 +442,6 @@ sub qcir_to_xyce {
             push @output, "$c\n";
             next;
         }
-        if ($stripped =~ /\xb5|\xc2\xb5/) {
-            (my $c = $stripped) =~ s/\xc2\xb5/u/g; $c =~ s/\xb5/u/g;
-            push @changes, "L$lineno: micro sign -> u";
-            push @output, "$c\n";
-            next;
-        }
-
         push @output, "$stripped\n";
     }
 
