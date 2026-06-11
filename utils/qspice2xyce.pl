@@ -83,6 +83,8 @@ sub qcir_to_xyce {
     my @extract_libs;          # QSPICE-install libs queued for model extraction
     my %models_inline;         # model names defined inline in the deck
     my %params_defined;        # .param/.step param names (for bare-ref bracing)
+    my %param_cards;           # names that have an actual .param card
+    my %stepped;               # .step param names -> start value
     my %need_builtin;          # QTZ_* subckt definitions to emit
     my @appendix_models;       # generated .model cards (switches etc.)
 
@@ -99,9 +101,15 @@ sub qcir_to_xyce {
         $models_inline{ uc $1 } = 1 if $line =~ /^\s*\.model\s+(\S+)/i;
         if ($line =~ /^\s*\.param\s+(.*)$/i) {
             my $body = $1;
-            $params_defined{ uc $1 } = 1 while $body =~ /(\w+)\s*=/g;
+            while ($body =~ /(\w+)\s*=/g) {
+                $params_defined{ uc $1 } = 1;
+                $param_cards{ uc $1 } = 1;
+            }
         }
-        $params_defined{ uc $1 } = 1 if $line =~ /^\s*\.step\s+(?:(?:oct|dec|lin)\s+)?param\s+(\w+)/i;
+        if ($line =~ /^\s*\.step\s+(?:(?:oct|dec|lin)\s+)?param\s+(\w+)\s+(\S+)/i) {
+            $params_defined{ uc $1 } = 1;
+            $stepped{ uc $1 } = $2;   # start value, for the .param card Xyce needs
+        }
     }
 
     for my $line (@$lines_ref) {
@@ -374,6 +382,7 @@ sub qcir_to_xyce {
     }
 
     my @appendix;              # lines to splice in before the final .END
+    my %vdmos_models;          # VDMOS model names synthesized as subckts
 
     # Post-pass: extract referenced models from the queued QSPICE-install libs.
     # A model is "referenced" if its name appears as a word in the deck and is
@@ -395,8 +404,16 @@ sub qcir_to_xyce {
                 next if $seen{ uc $name } || $models_inline{ uc $name };
                 next unless $deck_text =~ /\b\Q$name\E\b/i;
                 $seen{ uc $name } = 1;
-                if ($type =~ /^VDMOS$/i || $params =~ /\blevel\s*=\s*(?:20\d\d)\b/i) {
-                    push @warnings, "model $name ($type) uses a QSPICE/VDMOS level Xyce lacks -- needs a macromodel";
+                if ($type =~ /^VDMOS$/i) {
+                    # synthesize a behavioral subckt; M instances referencing
+                    # this model are rewritten to X instances below
+                    push @extracted, _vdmos_subckt($name, $params, \@warnings);
+                    $vdmos_models{ uc $name } = 1;
+                    push @changes, "synthesized VDMOS macromodel QTZ_VDMOS_\U$name\E from " . basename($lib);
+                    next;
+                }
+                if ($params =~ /\blevel\s*=\s*(?:20\d\d)\b/i) {
+                    push @warnings, "model $name ($type) uses a QSPICE proprietary level Xyce lacks -- needs a macromodel";
                     push @extracted, "* [qtz] UNSUPPORTED model skipped (needs macromodel): .model $name $type\n";
                     next;
                 }
@@ -408,6 +425,35 @@ sub qcir_to_xyce {
         }
         push @appendix, "* [qtz] models extracted from QSPICE libraries:\n", @extracted
             if @extracted;
+
+        # Rewrite M instances of synthesized VDMOS models to X instances of the
+        # 3-terminal macromodel subckt (M<name> d g s b <model> -> X... d g s),
+        # and retarget .PRINT items that referenced the M device.
+        if (%vdmos_models) {
+            my %renamed;
+            for my $l (@output) {
+                next unless $l =~ /^([Mm]\S*)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s*(.*)$/;
+                my ($mn, $nd, $ng, $ns, $nb, $mdl, $extra) = ($1, $2, $3, $4, $5, $6, $7);
+                next unless $vdmos_models{ uc $mdl };
+                push @warnings, "VDMOS $mn: bulk node $nb != source $ns (3-terminal macromodel ties them)"
+                    if uc($nb) ne uc($ns);
+                push @warnings, "VDMOS $mn: instance params dropped: $extra" if length $extra;
+                push @changes, "$mn -> Xqtzvd_$mn (VDMOS macromodel QTZ_VDMOS_\U$mdl\E)";
+                $renamed{ uc $mn } = "Xqtzvd_$mn";
+                $l = "Xqtzvd_$mn $nd $ng $ns QTZ_VDMOS_\U$mdl\E\n";
+            }
+            for my $l (grep { /^\.PRINT\b/i } @output) {
+                # Id(M1)/I(M1) -> drain current = current through the macromodel's Rdd
+                $l =~ s/\bI[dD]?\(\s*(\w+)\s*\)/exists $renamed{uc $1} ? "I($renamed{uc $1}:RDD)" : $&/ge;
+            }
+        }
+    }
+
+    # Xyce requires a .param card for every .STEP-swept parameter; QSPICE
+    # decks often carry only the .step line. Supply the missing cards.
+    for my $sname (sort grep { !$param_cards{$_} } keys %stepped) {
+        push @appendix, ".param $sname=$stepped{$sname}\n";
+        push @changes, "added .param $sname=$stepped{$sname} (required by Xyce for .STEP)";
     }
 
     # A synthesized latch makes the DC operating point ambiguous (Xyce DCOP
@@ -528,6 +574,92 @@ Rb ob outb 10
 Cb outb rn 10n
 .ENDS QTZ_SRFLOP
 EOS
+}
+
+# Engineering-notation value -> plain number (for baking into expressions,
+# where Xyce suffix parsing can't be relied on). Returns undef if not numeric.
+sub _eng2num {
+    my ($v) = @_;
+    return undef unless defined $v;
+    $v =~ s/\xc2\xb5/u/; $v =~ s/\xb5/u/;
+    return $1 * 1 if $v =~ /^([-+]?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?)$/i;
+    if ($v =~ /^([-+]?(?:\d+\.?\d*|\.\d+))(meg|mil|[tgkmunpf])[a-z]*$/i) {
+        my %m = (t=>1e12, g=>1e9, meg=>1e6, k=>1e3, mil=>25.4e-6,
+                 m=>1e-3, u=>1e-6, n=>1e-9, p=>1e-12, f=>1e-15);
+        return $1 * $m{ lc $2 };
+    }
+    return undef;
+}
+
+# Synthesize a behavioral subckt for an LTspice/QSPICE VDMOS power-MOSFET
+# model (Xyce has no VDMOS device). DC equations follow the LTspice VDMOS
+# model (same analytical form devchar.py validated against LTspice): smooth
+# subthreshold via Kp*Ks^2*ln(1+exp(Vov/Ks))^2, Mtriode-shaped triode region,
+# Lambda channel-length modulation, body diode with Rb/Cjo, fixed Cgs and
+# Cgdmin (the nonlinear Cgd and QSPICE extensions RonX/eta/tempcos are not
+# modeled -- DC characteristics first).
+sub _vdmos_subckt {
+    my ($name, $params, $warnings) = @_;
+    my %p;
+    $p{ lc $1 } = $2 while $params =~ /(\w+)\s*=\s*(\S+)/g;
+    my $pchan = ($params =~ /\bpchan\b/i) ? 1 : 0;
+    my $pol = $pchan ? -1 : 1;
+
+    my $num = sub { my ($k, $d) = @_; my $n = _eng2num($p{$k}); defined $n ? $n : $d };
+    my $vto = abs($num->('vto', 2));
+    my $kp  = $num->('kp', 10);
+    my $lam = $num->('lambda', 0);
+    my $rd  = $num->('rd', 0) || 1e-6;
+    my $rs  = $num->('rs', 0) || 1e-6;
+    my $rg  = $num->('rg', 0) || 1e-6;
+    # default triode exponent 2 = the standard Kp*(Vov*Vds - Vds^2/2) form;
+    # verified against QSPICE64 gold (mtriode=1 halves the linear region)
+    my $mt  = $num->('mtriode', 2);
+    # QSPICE RonX (reverse-engineered against gold): sharpens the knee --
+    # triode transconductance scales by RonX and saturation starts at
+    # Vov/RonX, keeping the (verified-exact) sat current continuous:
+    #   Vds < Vov/RonX:  I = RonX*Kp*(Vov*Vds - RonX*Vds^2/2)*(1+lambda*Vds)
+    my $ronx = $num->('ronx', 1);
+    my $ks  = $num->('ksubthres', 0.1);
+    my $cgs = $num->('cgs', 0);
+    my $cgdmin = $num->('cgdmin', 0);
+    my $is  = $num->('is', 1e-14);
+    my $nd  = $num->('n', 1);
+    my $rb  = $num->('rb', 0);
+    my $cjo = $num->('cjo', 0);
+
+    push @$warnings, "VDMOS $name: QSPICE extension eta=$p{eta} not modeled"
+        if defined $p{eta};
+
+    my $U = uc $name;
+    my $S = $pol > 0 ? '' : '-';                       # current sign
+    my $vgs = $pol > 0 ? 'V(gi,si)' : 'V(si,gi)';      # polarity-folded senses
+    my $vds = $pol > 0 ? 'V(di,si)' : 'V(si,di)';
+    my $vov = sprintf '(%s-%.6g)', $vgs, $vto;
+    my $kpks2 = sprintf '%.6g', $kp * $ks * $ks;
+    my $sub_t = sprintf '%s*ln(1+exp(%s/%.6g))*ln(1+exp(%s/%.6g))', $kpks2, $vov, $ks, $vov, $ks;
+    my $tri_t = sprintf '%.6g*(%s*%s-%.6g*pow(max(%s,0),%.6g)*pow(max(%s,0),%.6g))*(1+%.6g*%s)',
+                        $kp * $ronx, $vov, $vds, 0.5 * $ronx, $vds, $mt, $vov, 2 - $mt, $lam, $vds;
+    my $sat_t = sprintf '0.5*%.6g*%s*%s*(1+%.6g*%s)', $kp, $vov, $vov, $lam, $vds;
+    my $ich = sprintf 'IF(%s<=0,%s,IF(%s<%s/%.6g,%s,%s))',
+                      $vov, $sub_t, $vds, $vov, $ronx, $tri_t, $sat_t;
+
+    my ($ba, $bk) = $pol > 0 ? ('si', 'di') : ('di', 'si');   # body diode anode/cathode
+    my $bd_rs = $rb > 0 ? sprintf(' RS=%.6g', $rb) : '';
+    my $bd_cj = $cjo > 0 ? sprintf(' CJO=%.6g', $cjo) : '';
+
+    my $txt = "* [qtz] VDMOS $name synthesized macromodel (" . ($pchan ? 'P' : 'N') . "-channel)\n";
+    $txt .= ".SUBCKT QTZ_VDMOS_$U d g s\n";
+    $txt .= sprintf "Rdd d di %.6g\n", $rd;
+    $txt .= sprintf "Rgg g gi %.6g\n", $rg;
+    $txt .= sprintf "Rss si s %.6g\n", $rs;
+    $txt .= "Bch di si I={$S($ich)}\n";
+    $txt .= ".model QTZ_VDMOS_${U}_BD D(IS=" . sprintf('%.6g', $is) . " N=" . sprintf('%.6g', $nd) . "$bd_rs$bd_cj)\n";
+    $txt .= "Dbd $ba $bk QTZ_VDMOS_${U}_BD\n";
+    $txt .= sprintf "Cq_gs gi si %.6g\n", $cgs    if $cgs > 0;
+    $txt .= sprintf "Cq_gd gi di %.6g\n", $cgdmin if $cgdmin > 0;
+    $txt .= ".ENDS QTZ_VDMOS_$U\n";
+    return $txt;
 }
 
 # Strip QSPICE documentation/extension params from a .model parameter list:
