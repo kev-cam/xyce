@@ -83,7 +83,8 @@ sub qcir_to_xyce {
     my @extract_libs;          # QSPICE-install libs queued for model extraction
     my %models_inline;         # model names defined inline in the deck
     my %params_defined;        # .param/.step param names (for bare-ref bracing)
-    my $need_rropamp = 0;      # emit the QTZ_RROPAMP subckt definition
+    my %need_builtin;          # QTZ_* subckt definitions to emit
+    my @appendix_models;       # generated .model cards (switches etc.)
 
     # Pass 1: analysis type, for .plot/.print lines that omit it (QSPICE's
     # netlister writes ".plot Ic(Q1)" with no analysis keyword).
@@ -260,38 +261,98 @@ sub qcir_to_xyce {
             }
         }
 
-        # QSPICE built-in ideal op-amp: instance prefix is the byte 0xC3 ("A~"),
-        # unconnected pins netlist as 0xA5 yen-sign tokens. Line shape (pin
-        # order verified against the Wien-bridge/phase-shift examples):
-        #   \xC3<name> vdd vss out in- in+ [\xA5 ...] RRopAmp Avol= GBW= Slew= ...
-        # Synthesize an X instance of the QTZ_RROPAMP behavioral subckt
-        # (dominant pole: DC gain AVOL, unity-gain at GBW; rail-clamped output).
-        # Slew/Rload/Phi are accepted but not yet modeled (warned).
-        if ($stripped =~ /^(?:\xc3\x83|\xc3)(\S*)\s+(.*)$/s) {
+        # QSPICE built-in mixed-mode devices: instance prefix is 0xC3 (analog,
+        # e.g. the RRopAmp ideal op-amp) or 0xA5 (logic/mixed: HMITT comparator,
+        # OR gate, SR-FLOP). Unconnected pins netlist as bare 0xA5 tokens. The
+        # model name is the LAST bare token; name=value params follow QSPICE
+        # conventions. Pin maps (verified against the example schematics):
+        #   RRopAmp:           vdd vss out in- in+
+        #   HMITT/OR/SR-FLOP:  vdd vss out outbar in1 in2
+        # Each maps to an X instance of a synthesized QTZ_* behavioral subckt.
+        if ($stripped =~ /^(?:\xc3\x83|\xc3|\xc2\xa5|\xa5)(\S*)\s+(.*)$/s) {
             my ($iname, $rest) = ($1, $2);
-            my @tok = grep { $_ ne "\xa5" && $_ ne "\xc2\xa5" } split /\s+/, $rest;
-            my (@nodes, $model, %prm);
-            for my $t (@tok) {
-                if ($t =~ /^(\w+)=(\S+)$/)          { $prm{ uc $1 } = $2; }
-                elsif (@nodes < 5)                   { push @nodes, $t; }
-                elsif (!defined $model)              { $model = $t; }
+            $rest =~ s/\xc2\xb5/u/g;  $rest =~ s/\xb5/u/g;   # micro in param values
+            my (@nodes, @bare, %prm);
+            for my $t (split /\s+/, $rest) {
+                if ($t =~ /^(\w[\w-]*)=(\S+)$/) { $prm{ uc $1 } = $2; }
+                elsif ($t eq "\xa5" || $t eq "\xc2\xa5") {
+                    push @nodes, sprintf 'qtz_nc%d_%s', scalar @nodes, ($iname =~ /^\w+$/ ? $iname : 'x');
+                } else { push @bare, scalar @nodes; push @nodes, $t; }
             }
-            if (defined $model && uc($model) eq 'RROPAMP' && @nodes == 5) {
-                my ($vdd, $vss, $out, $inn, $inp) = @nodes;
-                my @p;
-                push @p, "AVOL=$prm{AVOL}" if defined $prm{AVOL};
-                push @p, "GBW=$prm{GBW}"   if defined $prm{GBW};
-                for my $unhandled (grep { $_ !~ /^(?:AVOL|GBW)$/ } sort keys %prm) {
-                    push @warnings, "RRopAmp $iname: parameter $unhandled=$prm{$unhandled} not modeled";
+            # model = last bare (non-NC, non-param) token
+            my $model = @bare ? splice(@nodes, $bare[-1], 1) : '';
+            my %builtin = (
+                'RROPAMP' => { sub => 'QTZ_RROPAMP', npins => 5,
+                               params => { AVOL => 'AVOL', GBW => 'GBW' } },
+                'HMITT'   => { sub => 'QTZ_HMITT',   npins => 6, params => {} },
+                'OR'      => { sub => 'QTZ_OR2',     npins => 6, params => {} },
+                'SR-FLOP' => { sub => 'QTZ_SRFLOP',  npins => 6,
+                               params => { TRISE => 'TRISE' } },
+            );
+            my $b = $builtin{ uc $model };
+            if ($b && @nodes >= $b->{npins}) {
+                my @pins = @nodes[0 .. $b->{npins} - 1];
+                my (@p, %used);
+                while (my ($qname, $sname) = each %{ $b->{params} }) {
+                    if (defined $prm{$qname}) { push @p, "$sname=$prm{$qname}"; $used{$qname} = 1; }
+                }
+                for my $u (grep { !$used{$_} } sort keys %prm) {
+                    push @warnings, "$model $iname: parameter $u=$prm{$u} not modeled";
                 }
                 my $params = @p ? ' PARAMS: ' . join(' ', @p) : '';
-                push @changes, "L$lineno: QSPICE ideal op-amp -> X${iname} QTZ_RROPAMP";
-                push @output, "Xqoa${iname} $vdd $vss $out $inn $inp QTZ_RROPAMP$params\n";
-                $need_rropamp = 1;
+                push @changes, "L$lineno: QSPICE builtin $model -> X instance of $b->{sub}";
+                push @output, "Xqtz${iname} @pins $b->{sub}$params\n";
+                $need_builtin{ $b->{sub} } = 1;
                 next;
             }
-            push @warnings, "L$lineno: unrecognized QSPICE builtin device left as-is: $stripped";
+            push @warnings, "L$lineno: unrecognized QSPICE builtin '$model' left as-is";
             push @output, "$stripped\n";
+            next;
+        }
+
+        # Inline-parameter S switch (QSPICE/LTspice style): Xyce needs a .model.
+        #   S1 a b c d Ron=10 Roff=1G Vt=2 Vh=-1  ->  S1 a b c d QTZ_SW_S1
+        # Vh<0 means smooth (non-hysteretic): use a 1V transition window.
+        if ($stripped =~ /^([Ss]\S*)\s+(\S+\s+\S+\s+\S+\s+\S+)\s+(.*\bVt=.*)$/i) {
+            my ($sname, $snodes, $sparams) = ($1, $2, $3);
+            my %sp;
+            $sp{ uc $1 } = $2 while $sparams =~ /(\w+)=(\S+)/g;
+            my $vt = $sp{VT} // 0;
+            my $vh = ($sp{VH} // 0) > 0 ? $sp{VH} : 0.5;
+            my $von  = $vt + $vh;
+            my $voff = $vt - $vh;
+            my $mname = "QTZ_SW_\U$sname";
+            push @appendix_models,
+                ".model $mname VSWITCH(RON=" . ($sp{RON} // 1) .
+                " ROFF=" . ($sp{ROFF} // '1G') . " VON=$von VOFF=$voff)\n";
+            push @changes, "L$lineno: inline switch params -> .model $mname";
+            push @output, "$sname $snodes $mname\n";
+            next;
+        }
+
+        # Capacitor with Rpar= (QSPICE parallel-loss shorthand): emit a real
+        # parallel resistor. (Rser similarly has no Xyce equivalent on C.)
+        if ($stripped =~ /^([Cc]\S*)\s+(\S+)\s+(\S+)\s+(\S+)(.*)\bRpar=(\S+)(.*)$/) {
+            my ($cn, $n1, $n2, $val, $pre, $rv, $post) = ($1, $2, $3, $4, $5, $6, $7);
+            push @changes, "L$lineno: C Rpar= -> companion resistor";
+            push @output, "$cn $n1 $n2 $val$pre$post\n";
+            push @output, "Rqtzpar_$cn $n1 $n2 $rv\n";
+            next;
+        }
+
+        # Resistor flagged SHORTED (QSPICE shorted-component marker): a wire.
+        if ($stripped =~ /^([Rr]\S*\s+\S+\s+\S+\s+)\S+\s+SHORTED\s*$/i) {
+            push @changes, "L$lineno: SHORTED resistor -> 1m";
+            push @output, "${1}1m\n";
+            next;
+        }
+
+        # Identifier bytes >= 0x80 in subckt names / X-instance refs (QSPICE
+        # embeds symbol-name glyphs, e.g. 0x95 in "X1\x95NE555"): map to '_'.
+        if ($stripped =~ /[\x80-\xff]/ && $stripped =~ /^(?:\.subckt\b|\.ends\b|[Xx]\S*\s)/i) {
+            (my $c = $stripped) =~ s/[\x80-\xff]/_/g;
+            push @changes, "L$lineno: non-ASCII identifier byte(s) -> _";
+            push @output, "$c\n";
             next;
         }
 
@@ -349,7 +410,22 @@ sub qcir_to_xyce {
             if @extracted;
     }
 
-    push @appendix, _rropamp_subckt() if $need_rropamp;
+    # A synthesized latch makes the DC operating point ambiguous (Xyce DCOP
+    # fails on the bistability); start the transient UIC, matching the
+    # power-on-from-zero semantics of QSPICE's flop IC=0 default.
+    if ($need_builtin{QTZ_SRFLOP}) {
+        for my $l (@output) {
+            if ($l =~ /^\.TRAN\b/i && $l !~ /\bUIC\b/i) {
+                chomp $l; $l .= " UIC\n";
+                push @changes, "added UIC to .TRAN (latch present, DCOP ambiguous)";
+            }
+        }
+    }
+
+    push @appendix, @appendix_models;
+    my %gen = (QTZ_RROPAMP => \&_rropamp_subckt, QTZ_HMITT => \&_hmitt_subckt,
+               QTZ_OR2 => \&_or2_subckt, QTZ_SRFLOP => \&_srflop_subckt);
+    push @appendix, $gen{$_}->() for sort grep { $gen{$_} } keys %need_builtin;
 
     if (@appendix) {
         # insert before the final .END (everything after .END is ignored)
@@ -385,6 +461,72 @@ Evn rn 0 vss 0 1
 Bwind mid 0 I={(V(mid)>V(rp)+0.1)*(V(mid)-V(rp)-0.1) + (V(mid)<V(rn)-0.1)*(V(mid)-V(rn)+0.1)}
 B1 out 0 V={max(min(V(mid),V(rp)),V(rn))}
 .ENDS QTZ_RROPAMP
+EOS
+}
+
+# QSPICE HMITT builtin: comparator with rail-to-rail complementary outputs.
+# (The 555's references are static dividers, so hysteresis is not modeled yet.)
+sub _hmitt_subckt {
+    return <<'EOS';
+* [qtz] QSPICE HMITT comparator behavioral equivalent
+.SUBCKT QTZ_HMITT vdd vss out outb in1 in2
+Evp rp 0 vdd 0 1
+Evn rn 0 vss 0 1
+Rin1 in1 rn 1G
+Rin2 in2 rn 1G
+B1 o 0 V={V(rn)+(V(rp)-V(rn))*(0.5+0.5*tanh(V(in1,in2)/5m))}
+Ro o out 10
+Co out rn 10n
+Bb ob 0 V={V(rp)+V(rn)-V(out)}
+Rb ob outb 10
+Cb outb rn 10n
+.ENDS QTZ_HMITT
+EOS
+}
+
+# QSPICE OR builtin: 2-input OR with complementary outputs. Logic threshold is
+# mid-rail; an unconnected input reads low via the 1G pulldown (QSPICE uses a
+# one-input OR as an inverter through the outbar pin).
+sub _or2_subckt {
+    return <<'EOS';
+* [qtz] QSPICE OR gate behavioral equivalent
+.SUBCKT QTZ_OR2 vdd vss out outb in1 in2
+Evp rp 0 vdd 0 1
+Evn rn 0 vss 0 1
+Rin1 in1 rn 1G
+Rin2 in2 rn 1G
+B1 o 0 V={V(rn)+(V(rp)-V(rn))*max(0.5+0.5*tanh((V(in1)-0.5*(V(rp)+V(rn)))/(0.05*(V(rp)-V(rn)))),0.5+0.5*tanh((V(in2)-0.5*(V(rp)+V(rn)))/(0.05*(V(rp)-V(rn)))))}
+Ro o out 10
+Co out rn 10n
+Bb ob 0 V={V(rp)+V(rn)-V(out)}
+Rb ob outb 10
+Cb outb rn 10n
+.ENDS QTZ_OR2
+EOS
+}
+
+# QSPICE SR-FLOP builtin: set/reset latch with complementary outputs. State is
+# an ODE on Cst (charge toward the asserted rail at TRISE rate, hold when
+# neither input is asserted); Rleak settles the never-set latch low, matching
+# QSPICE's IC=0 default. UVLO/Ttol not modeled.
+sub _srflop_subckt {
+    return <<'EOS';
+* [qtz] QSPICE SR-FLOP behavioral equivalent
+.SUBCKT QTZ_SRFLOP vdd vss out outb s r PARAMS: TRISE=1U
+Evp rp 0 vdd 0 1
+Evn rn 0 vss 0 1
+Rs s rn 1G
+Rr r rn 1G
+Cst st rn 1n
+Rleak st rn 100G
+Bst 0 st I={1n/TRISE*((0.5+0.5*tanh((V(s)-0.5*(V(rp)+V(rn)))/(0.05*(V(rp)-V(rn)))))*(V(rp)-V(st))-(0.5+0.5*tanh((V(r)-0.5*(V(rp)+V(rn)))/(0.05*(V(rp)-V(rn)))))*(V(st)-V(rn)))}
+B1 o 0 V={V(rn)+(V(rp)-V(rn))*(0.5+0.5*tanh((V(st)-0.5*(V(rp)+V(rn)))/(0.02*(V(rp)-V(rn)))))}
+Ro o out 10
+Co out rn 10n
+Bb ob 0 V={V(rp)+V(rn)-V(out)}
+Rb ob outb 10
+Cb outb rn 10n
+.ENDS QTZ_SRFLOP
 EOS
 }
 
