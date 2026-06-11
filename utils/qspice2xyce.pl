@@ -83,6 +83,7 @@ sub qcir_to_xyce {
     my @extract_libs;          # QSPICE-install libs queued for model extraction
     my %models_inline;         # model names defined inline in the deck
     my %params_defined;        # .param/.step param names (for bare-ref bracing)
+    my $need_rropamp = 0;      # emit the QTZ_RROPAMP subckt definition
 
     # Pass 1: analysis type, for .plot/.print lines that omit it (QSPICE's
     # netlister writes ".plot Ic(Q1)" with no analysis keyword).
@@ -95,7 +96,10 @@ sub qcir_to_xyce {
         elsif ($u =~ /^\s*\.OP\b/)    { $analysis_type ||= 'DC' }
         elsif ($u =~ /^\s*\.NOISE\b/) { $analysis_type = 'NOISE' }
         $models_inline{ uc $1 } = 1 if $line =~ /^\s*\.model\s+(\S+)/i;
-        $params_defined{ uc $1 } = 1 if $line =~ /^\s*\.param\s+(\w+)/i;
+        if ($line =~ /^\s*\.param\s+(.*)$/i) {
+            my $body = $1;
+            $params_defined{ uc $1 } = 1 while $body =~ /(\w+)\s*=/g;
+        }
         $params_defined{ uc $1 } = 1 if $line =~ /^\s*\.step\s+(?:(?:oct|dec|lin)\s+)?param\s+(\w+)/i;
     }
 
@@ -160,7 +164,10 @@ sub qcir_to_xyce {
                 my $m = $mult{ lc $2 } // 1;
                 my $tstop = $1 * $m;
                 my $tstep = $tstop / 1000;
-                push @output, ".TRAN $tstep $tstop\n";
+                # dtmax: Xyce's adaptive stepper otherwise grows steps past
+                # signal periods on low-amplitude startups (kills oscillators)
+                my $dtmax = $tstop / 5000;
+                push @output, ".TRAN $tstep $tstop 0 $dtmax\n";
                 next;
             }
             push @changes, "L$lineno: dropped uic/startup" if $has_uic;
@@ -233,9 +240,10 @@ sub qcir_to_xyce {
             }
         }
 
-        # V/I source with a bare parameter name as its value: Xyce requires
-        # braces ("V1 G 0 VGS" -> "V1 G 0 {VGS}" when VGS is a .param/.step name).
-        if ($stripped =~ /^[VIvi]\S*\s/ && %params_defined) {
+        # Device value that's a bare parameter name: Xyce requires braces
+        # ("V1 G 0 VGS" -> {VGS}; "R1 N01 0 R" -> {R}) when it's a .param/.step
+        # name. Sources scan all value positions; R/C/L just the value token.
+        if ($stripped =~ /^[VIRCLvircl]\S*\s/ && %params_defined) {
             my @tok = split /\s+/, $stripped;
             my $chg = 0;
             for my $i (3 .. $#tok) {
@@ -246,10 +254,45 @@ sub qcir_to_xyce {
             }
             if ($chg) {
                 my $l = join ' ', @tok;
-                push @changes, "L$lineno: braced bare param reference(s) on source line";
+                push @changes, "L$lineno: braced bare param reference(s)";
                 push @output, "$l\n";
                 next;
             }
+        }
+
+        # QSPICE built-in ideal op-amp: instance prefix is the byte 0xC3 ("A~"),
+        # unconnected pins netlist as 0xA5 yen-sign tokens. Line shape (pin
+        # order verified against the Wien-bridge/phase-shift examples):
+        #   \xC3<name> vdd vss out in- in+ [\xA5 ...] RRopAmp Avol= GBW= Slew= ...
+        # Synthesize an X instance of the QTZ_RROPAMP behavioral subckt
+        # (dominant pole: DC gain AVOL, unity-gain at GBW; rail-clamped output).
+        # Slew/Rload/Phi are accepted but not yet modeled (warned).
+        if ($stripped =~ /^(?:\xc3\x83|\xc3)(\S*)\s+(.*)$/s) {
+            my ($iname, $rest) = ($1, $2);
+            my @tok = grep { $_ ne "\xa5" && $_ ne "\xc2\xa5" } split /\s+/, $rest;
+            my (@nodes, $model, %prm);
+            for my $t (@tok) {
+                if ($t =~ /^(\w+)=(\S+)$/)          { $prm{ uc $1 } = $2; }
+                elsif (@nodes < 5)                   { push @nodes, $t; }
+                elsif (!defined $model)              { $model = $t; }
+            }
+            if (defined $model && uc($model) eq 'RROPAMP' && @nodes == 5) {
+                my ($vdd, $vss, $out, $inn, $inp) = @nodes;
+                my @p;
+                push @p, "AVOL=$prm{AVOL}" if defined $prm{AVOL};
+                push @p, "GBW=$prm{GBW}"   if defined $prm{GBW};
+                for my $unhandled (grep { $_ !~ /^(?:AVOL|GBW)$/ } sort keys %prm) {
+                    push @warnings, "RRopAmp $iname: parameter $unhandled=$prm{$unhandled} not modeled";
+                }
+                my $params = @p ? ' PARAMS: ' . join(' ', @p) : '';
+                push @changes, "L$lineno: QSPICE ideal op-amp -> X${iname} QTZ_RROPAMP";
+                push @output, "Xqoa${iname} $vdd $vss $out $inn $inp QTZ_RROPAMP$params\n";
+                $need_rropamp = 1;
+                next;
+            }
+            push @warnings, "L$lineno: unrecognized QSPICE builtin device left as-is: $stripped";
+            push @output, "$stripped\n";
+            next;
         }
 
         # Shared safety nets with the LTspice front-end
@@ -268,6 +311,8 @@ sub qcir_to_xyce {
 
         push @output, "$stripped\n";
     }
+
+    my @appendix;              # lines to splice in before the final .END
 
     # Post-pass: extract referenced models from the queued QSPICE-install libs.
     # A model is "referenced" if its name appears as a word in the deck and is
@@ -300,16 +345,47 @@ sub qcir_to_xyce {
             }
             close $lfh;
         }
-        if (@extracted) {
-            # insert before the final .END (everything after .END is ignored)
-            my ($end_idx) = grep { $output[$_] =~ /^\s*\.end\s*$/i } reverse 0 .. $#output;
-            my @blk = ("* [qtz] models extracted from QSPICE libraries:\n", @extracted);
-            if (defined $end_idx) { splice @output, $end_idx, 0, @blk; }
-            else                  { push @output, @blk; }
-        }
+        push @appendix, "* [qtz] models extracted from QSPICE libraries:\n", @extracted
+            if @extracted;
+    }
+
+    push @appendix, _rropamp_subckt() if $need_rropamp;
+
+    if (@appendix) {
+        # insert before the final .END (everything after .END is ignored)
+        my ($end_idx) = grep { $output[$_] =~ /^\s*\.end\s*$/i } reverse 0 .. $#output;
+        if (defined $end_idx) { splice @output, $end_idx, 0, @appendix; }
+        else                  { push @output, @appendix; }
     }
 
     return (\@output, \@changes, \@warnings);
+}
+
+# Behavioral equivalent of QSPICE's built-in rail-to-rail ideal op-amp
+# (RRopAmp): single dominant pole giving DC gain AVOL and unity-gain bandwidth
+# GBW, output hard-clamped to the rails. Slew/Rload/Phi not yet modeled.
+sub _rropamp_subckt {
+    return <<'EOS';
+* [qtz] QSPICE RRopAmp behavioral equivalent. Ikick is a one-shot startup
+* perturbation (zero at DC, so the operating point is unaffected) that knocks
+* oscillator loops off the unstable zero equilibrium, which QSPICE's builtin
+* leaves by itself; steady state stays clamp/network-determined.
+.SUBCKT QTZ_RROPAMP vdd vss out inn inp PARAMS: AVOL=100K GBW=5MEG
+G1 0 mid inp inn 1m
+R1 mid 0 {AVOL/1m}
+C1 mid 0 {1m/(6.283185307179586*GBW)}
+Ikick 0 mid PULSE(0 1n 0 1u 1u 100u 1e6)
+* rails buffered through E sources: outer node names may contain +/- (QSPICE
+* allows "V+"), which Xyce expressions misparse; positional refs are safe.
+Evp rp 0 vdd 0 1
+Evn rn 0 vss 0 1
+* anti-windup: hold mid within ~0.1V of the rails so the output leaves
+* saturation as soon as the input reverses (QSPICE's builtin recovers
+* instantly; an unbounded integrator node would lag and drop the frequency)
+Bwind mid 0 I={(V(mid)>V(rp)+0.1)*(V(mid)-V(rp)-0.1) + (V(mid)<V(rn)-0.1)*(V(mid)-V(rn)+0.1)}
+B1 out 0 V={max(min(V(mid),V(rp)),V(rn))}
+.ENDS QTZ_RROPAMP
+EOS
 }
 
 # Strip QSPICE documentation/extension params from a .model parameter list:
