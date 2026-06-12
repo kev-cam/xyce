@@ -120,8 +120,14 @@ sub qcir_to_xyce {
 
         unless (length $stripped) { push @output, "\n"; next; }
 
-        # Comments pass through
+        # Comments pass through; QSPICE also writes C++-style // comments
         if ($stripped =~ /^\*/) { push @output, "$stripped\n"; next; }
+        if ($stripped =~ m{^//}) {
+            (my $c = $stripped) =~ s{^//}{*};
+            push @changes, "L$lineno: // comment -> *";
+            push @output, "$c\n";
+            next;
+        }
 
         # micro sign -> u, up front: every branch below may emit the line
         # directly, so the conversion must happen before any of them
@@ -393,10 +399,10 @@ sub qcir_to_xyce {
             next;
         }
 
-        # Capacitor with Rpar=/Rser= (QSPICE loss shorthands Xyce's C lacks):
+        # C or L with Rpar=/Rser= (QSPICE loss shorthands Xyce lacks):
         # Rpar -> companion parallel resistor; Rser -> series resistor through
         # an internal node.
-        if ($stripped =~ /^[Cc]\S*\s/ && $stripped =~ /\bR(?:par|ser)=/i) {
+        if ($stripped =~ /^[CcLl]\S*\s/ && $stripped =~ /\bR(?:par|ser)=/i) {
             my @tok = split /\s+/, $stripped;
             my ($cn, $n1, $n2, $val) = @tok[0 .. 3];
             my ($rpar, $rser, @keep);
