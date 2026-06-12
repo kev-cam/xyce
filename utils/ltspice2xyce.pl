@@ -138,6 +138,115 @@ sub _take_param_value {
 }
 
 
+# Locate LTspice's component database lib by basename (standard.mos etc.).
+# Works from Cygwin or WSL; $LTSPICE_CMP overrides.
+sub _lt_find_cmp_lib {
+    my ($base) = @_;
+    my @cands = grep { defined && length }
+        ($ENV{LTSPICE_CMP} ? "$ENV{LTSPICE_CMP}/$base" : undef),
+        glob("/mnt/c/Users/*/AppData/Local/LTspice/lib/cmp/$base"),
+        glob("/cygdrive/c/Users/*/AppData/Local/LTspice/lib/cmp/$base");
+    for my $p (@cands) { return $p if -f $p; }
+    return undef;
+}
+
+# Slurp an LTspice lib file. LTspice 26 ships these UTF-16LE without BOM;
+# strip NULs (content is ASCII) and CRs, join + continuation lines.
+sub _lt_slurp {
+    my ($path) = @_;
+    open my $fh, '<:raw', $path or return undef;
+    local $/; my $t = <$fh>; close $fh;
+    $t =~ s/\x00//g;
+    $t =~ s/\r//g;
+    $t =~ s/\n\+/ /g;          # fold continuations for one-line .model scan
+    return $t;
+}
+
+# Strip LTspice component-picker doc params from a .model parameter list
+# (mfg=, Vds=, Ron=, Qg=, Iave=, Vrev=, type= ...; bare or quoted) and µ -> u.
+sub _lt_sanitize_model_params {
+    my ($p) = @_;
+    $p =~ s/\xc2\xb5/u/g;  $p =~ s/\xb5/u/g;
+    $p =~ s/\s+(?:mfg|Vds|Ron|Qg|Iave|Vrev|type)\s*=\s*(?:"[^"]*"|\S+)//ig;
+    $p =~ s/=\s+/=/g;
+    return $p;
+}
+
+# Engineering-notation value -> plain number (for baking into expressions).
+sub _eng2num {
+    my ($v) = @_;
+    return undef unless defined $v;
+    $v =~ s/\xc2\xb5/u/; $v =~ s/\xb5/u/;
+    return $1 * 1 if $v =~ /^([-+]?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?)$/i;
+    if ($v =~ /^([-+]?(?:\d+\.?\d*|\.\d+))(meg|mil|[tgkmunpf])[a-z]*$/i) {
+        my %m = (t=>1e12, g=>1e9, meg=>1e6, k=>1e3, mil=>25.4e-6,
+                 m=>1e-3, u=>1e-6, n=>1e-9, p=>1e-12, f=>1e-15);
+        return $1 * $m{ lc $2 };
+    }
+    return undef;
+}
+
+# Synthesize a behavioral subckt for an LTspice VDMOS model (Xyce has no
+# VDMOS device). Same analytical form validated against QSPICE64 gold in
+# qspice2xyce.pl (QSPICE inherited LTspice's VDMOS): smooth subthreshold
+# Kp*Ks^2*ln(1+exp(Vov/Ks))^2, standard triode (default exponent 2 -- the
+# QSPICE-gold finding; LTspice native gold via ltz will confirm), Lambda CLM,
+# body diode, fixed Cgs/Cgdmin, Rd/Rs/Rg, pchan folding. The interim
+# destination is PyMS Verilog-A (see qspice_va/, blocked on the class-'e'
+# linkage); this keeps parity with the QSPICE path meanwhile.
+sub _vdmos_subckt {
+    my ($name, $params, $warnings) = @_;
+    my %p;
+    $p{ lc $1 } = $2 while $params =~ /(\w+)\s*=\s*(\S+)/g;
+    my $pchan = ($params =~ /\bpchan\b/i) ? 1 : 0;
+    my $pol = $pchan ? -1 : 1;
+
+    my $num = sub { my ($k, $d) = @_; my $n = _eng2num($p{$k}); defined $n ? $n : $d };
+    my $vto = abs($num->('vto', 2));
+    my $kp  = $num->('kp', 10);
+    my $lam = $num->('lambda', 0);
+    my $rd  = $num->('rd', 0) || 1e-6;
+    my $rs  = $num->('rs', 0) || 1e-6;
+    my $rg  = $num->('rg', 0) || 1e-6;
+    my $mt  = $num->('mtriode', 2);
+    my $ks  = $num->('ksubthres', 0.1);
+    my $cgs = $num->('cgs', 0);
+    my $cgdmin = $num->('cgdmin', 0);
+    my $is  = $num->('is', 1e-14);
+    my $nd  = $num->('n', 1);
+    my $rb  = $num->('rb', 0);
+    my $cjo = $num->('cjo', 0);
+
+    my $U = uc $name;
+    my $S = $pol > 0 ? '' : '-';
+    my $vgs = $pol > 0 ? 'V(gi,si)' : 'V(si,gi)';
+    my $vds = $pol > 0 ? 'V(di,si)' : 'V(si,di)';
+    my $vov = sprintf '(%s-%.6g)', $vgs, $vto;
+    my $kpks2 = sprintf '%.6g', $kp * $ks * $ks;
+    my $sub_t = sprintf '%s*ln(1+exp(%s/%.6g))*ln(1+exp(%s/%.6g))', $kpks2, $vov, $ks, $vov, $ks;
+    my $tri_t = sprintf '%.6g*(%s*%s-0.5*pow(max(%s,0),%.6g)*pow(max(%s,0),%.6g))*(1+%.6g*%s)',
+                        $kp, $vov, $vds, $vds, $mt, $vov, 2 - $mt, $lam, $vds;
+    my $sat_t = sprintf '0.5*%.6g*%s*%s*(1+%.6g*%s)', $kp, $vov, $vov, $lam, $vds;
+    my $ich = sprintf 'IF(%s<=0,%s,IF(%s<%s,%s,%s))', $vov, $sub_t, $vds, $vov, $tri_t, $sat_t;
+
+    my ($ba, $bk) = $pol > 0 ? ('si', 'di') : ('di', 'si');
+    my $bd_rs = $rb > 0 ? sprintf(' RS=%.6g', $rb) : '';
+    my $bd_cj = $cjo > 0 ? sprintf(' CJO=%.6g', $cjo) : '';
+
+    my $txt = "* [ltz] VDMOS $name synthesized macromodel (" . ($pchan ? 'P' : 'N') . "-channel)\n";
+    $txt .= ".SUBCKT LTZ_VDMOS_$U d g s\n";
+    $txt .= sprintf "Rdd d di %.6g\n", $rd;
+    $txt .= sprintf "Rgg g gi %.6g\n", $rg;
+    $txt .= sprintf "Rss si s %.6g\n", $rs;
+    $txt .= "Bch di si I={$S($ich)}\n";
+    $txt .= ".model LTZ_VDMOS_${U}_BD D(IS=" . sprintf('%.6g', $is) . " N=" . sprintf('%.6g', $nd) . "$bd_rs$bd_cj)\n";
+    $txt .= "Dbd $ba $bk LTZ_VDMOS_${U}_BD\n";
+    $txt .= sprintf "Cq_gs gi si %.6g\n", $cgs    if $cgs > 0;
+    $txt .= sprintf "Cq_gd gi di %.6g\n", $cgdmin if $cgdmin > 0;
+    $txt .= ".ENDS LTZ_VDMOS_$U\n";
+    return $txt;
+}
+
 # Decide whether a .PRINT/.PLOT body's leading analysis-type token matches an
 # analysis actually present in the deck. LTspice decks sometimes carry a
 # `.PRINT TRAN` alongside an AC-only analysis (and vice-versa); Xyce aborts with
@@ -164,6 +273,8 @@ sub cir_to_xyce {
     my %analyses;              # set of analysis types present (TRAN/AC/DC/NOISE)
     my %diode_models_used;     # model names referenced by D devices
     my %models_defined;        # model names defined by .model statements
+    my @extract_libs;          # LTspice cmp libs queued for model extraction
+    my %vdmos_models;          # VDMOS model names synthesized as subckts
 
     # First pass: detect analysis type, track models
     for my $line (@$lines_ref) {
@@ -224,12 +335,24 @@ sub cir_to_xyce {
             next;
         }
 
-        # .LIB with Windows paths
+        # .LIB with Windows paths. LTspice's own component database
+        # (lib\cmp\standard.*) resolves locally when LTspice is installed:
+        # queue it for referenced-model extraction (VDMOS models become
+        # synthesized subckts; plain models are copied through). Anything
+        # else Windows-pathed is dropped as before.
         if ($upper =~ /^\.LIB\b/ && $stripped =~ /\\/) {
+            if ($stripped =~ /\\lib\\cmp\\(standard\.\w+)\s*$/i
+                    && (my $local = _lt_find_cmp_lib($1))) {
+                push @changes, "L$lineno: LTspice cmp lib -> deferred model extraction ($1)";
+                push @output, "* [ltz] models extracted from: $1\n";
+                push @extract_libs, $local;
+                next;
+            }
             push @warnings, "L$lineno: Windows .lib path removed: $stripped";
             push @output, "* [ltz] removed Windows path: $stripped\n";
             next;
         }
+
 
         # .LIB <file>  (sectionless whole-file include): LTspice/PSpice mean
         # "include the file", but Xyce reads a one-arg .LIB <file> as a sectioned
@@ -411,6 +534,20 @@ sub cir_to_xyce {
         # --- Non-exclusive pre-processing (modifies $stripped in-place) ---
         my $modified = 0;
 
+        # Device instance names may carry glyph bytes -- LTspice 26 writes
+        # autogenerated names like "M\xC2\xA7Q1" (UTF-8 section sign).
+        # Sanitize the NAME token only; the rest of the line is untouched.
+        if ($stripped !~ /^[.*;]/) {
+            my ($iname) = $stripped =~ /^(\S+)/;
+            if (defined $iname && $iname =~ /[\x80-\xff]/) {
+                (my $clean = $iname) =~ s/\xc2[\x80-\xbf]/_/g;
+                $clean =~ s/[\x80-\xff]/_/g;
+                $stripped =~ s/^\Q$iname\E/$clean/;
+                push @changes, "L$lineno: device name glyph byte(s) -> _ ($clean)";
+                $modified = 1;
+            }
+        }
+
         # Strip Rser= inline parameter on source lines (LTspice-specific)
         if ($stripped =~ /^[VI]\S*\s/i && $stripped =~ /\bRser=/i) {
             $stripped =~ s/\s+Rser=\S+//ig;
@@ -460,6 +597,65 @@ sub cir_to_xyce {
         push @warnings,
             "No .PRINT statement -- Xyce needs explicit output specification";
     }
+    # Referenced-model extraction from LTspice's component database libs
+    # (lib\cmp\standard.*, queued above). VDMOS models become synthesized
+    # behavioral subckts (Xyce has no VDMOS device) and their M instances are
+    # rewritten to X instances; other model types are copied through with
+    # LTspice doc-params stripped.
+    if (@extract_libs) {
+        my $deck_text = join '', @output;
+        my (@extracted, %seen);
+        for my $lib (@extract_libs) {
+            my $text = _lt_slurp($lib);
+            unless (defined $text) {
+                push @warnings, "cannot read LTspice lib $lib";
+                next;
+            }
+            for my $ml (split /\n/, $text) {
+                next unless $ml =~ /^\s*\.model\s+(\S+)\s+(\w+)\s*\(?(.*?)\)?\s*$/i;
+                my ($name, $type, $params) = ($1, $2, $3);
+                next if $seen{ uc $name } || $models_defined{ $name } || $models_defined{ uc $name };
+                next unless $deck_text =~ /\b\Q$name\E\b/i;
+                $seen{ uc $name } = 1;
+                if ($type =~ /^VDMOS$/i) {
+                    push @extracted, _vdmos_subckt($name, $params, \@warnings);
+                    $vdmos_models{ uc $name } = 1;
+                    push @changes, "synthesized VDMOS macromodel LTZ_VDMOS_\U$name\E";
+                    next;
+                }
+                my $clean = _lt_sanitize_model_params($params);
+                push @extracted, ".model $name $type($clean)\n";
+                push @changes, "extracted .model $name $type from LTspice cmp lib";
+            }
+        }
+        if (@extracted) {
+            # insert before the final .END (everything after .END is ignored)
+            my ($end_idx) = grep { $output[$_] =~ /^\s*\.end\s*$/i } reverse 0 .. $#output;
+            my @blk = ("* [ltz] models extracted from LTspice component libs:\n", @extracted);
+            if (defined $end_idx) { splice @output, $end_idx, 0, @blk; }
+            else                  { push @output, @blk; }
+        }
+
+        # M instances of VDMOS models -> X instances of the 3-terminal subckt
+        if (%vdmos_models) {
+            my %renamed;
+            for my $l (@output) {
+                next unless $l =~ /^([Mm]\S*)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s*(.*)$/;
+                my ($mn, $nd, $ng, $ns, $nb, $mdl, $extra) = ($1, $2, $3, $4, $5, $6, $7);
+                next unless $vdmos_models{ uc $mdl };
+                push @warnings, "VDMOS $mn: bulk node $nb != source $ns (3-terminal macromodel ties them)"
+                    if uc($nb) ne uc($ns);
+                push @warnings, "VDMOS $mn: instance params dropped: $extra" if length $extra;
+                push @changes, "$mn -> Xltzvd_$mn (VDMOS macromodel LTZ_VDMOS_\U$mdl\E)";
+                $renamed{ uc $mn } = "Xltzvd_$mn";
+                $l = "Xltzvd_$mn $nd $ng $ns LTZ_VDMOS_\U$mdl\E\n";
+            }
+            for my $l (grep { /^\.PRINT\b/i } @output) {
+                $l =~ s/\bI[dD]?\(\s*(\w+)\s*\)/exists $renamed{uc $1} ? "I($renamed{uc $1}:RDD)" : $&/ge;
+            }
+        }
+    }
+
     # Add generic .model for diodes with no model definition
     # Skip if bundled library is being included (it provides standard models)
     my @missing_models;
