@@ -1,0 +1,22 @@
+`include "disciplines.vams"
+`include "constants.vams"
+
+// QSPICE inductor. Stands in for the SPICE L primitive in translated QSPICE
+// netlists: Rser in series (internal node collapses when 0), Rpar across the
+// element (default open). Parameter spellings match the QSPICE dialect.
+(* xyceModelGroup="Inductor" xyceLevelNumber="91" *)
+module qspice_ind(p, n);
+    inout p, n;
+    electrical p, n;
+    electrical mid;
+
+    parameter real L    = 1e-9;   // inductance
+    parameter real RSER = 0.0;    // QSPICE Rser= (0 = none)
+    parameter real RPAR = 1e30;   // QSPICE Rpar= (default: open)
+
+    analog begin
+        V(p, mid) <+ RSER * I(p, mid);
+        V(mid, n) <+ L * ddt(I(mid, n));
+        I(p, n)   <+ V(p, n) / RPAR;
+    end
+endmodule

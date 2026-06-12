@@ -1,0 +1,25 @@
+`include "disciplines.vams"
+`include "constants.vams"
+
+// QSPICE capacitor. Stands in for the SPICE C primitive in translated QSPICE
+// netlists, carrying QSPICE's loss shorthands natively: Rser in series
+// (internal node collapses when 0), Rpar across the element (default is
+// effectively open). Parameter spellings match the QSPICE netlist dialect so
+// qspice2xyce.pl passes them through unchanged. Branch-free contributions
+// per the VAE blend/collapse philosophy.
+(* xyceModelGroup="Capacitor" xyceLevelNumber="91" *)
+module qspice_cap(p, n);
+    inout p, n;
+    electrical p, n;
+    electrical mid;
+
+    parameter real C    = 1e-12;  // capacitance
+    parameter real RSER = 0.0;    // QSPICE Rser= (0 = none)
+    parameter real RPAR = 1e30;   // QSPICE Rpar= (default: open)
+
+    analog begin
+        V(p, mid) <+ RSER * I(p, mid);
+        I(mid, n) <+ C * ddt(V(mid, n));
+        I(p, n)   <+ V(p, n) / RPAR;
+    end
+endmodule
