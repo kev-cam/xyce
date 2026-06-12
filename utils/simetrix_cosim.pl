@@ -64,8 +64,9 @@ for my $l (@lines) {
     }
     my $type = $amodel{ lc $model } // lc $model;
     push @adev, { name => $name, nodes => \@nodes, model => $model, type => $type,
-                  map => $MAP{$type} };
+                  map => $MAP{$type}, src => $l };
 }
+sub _adline { my $a = shift; return $a->{src}; }
 
 # Boundary nets: a2d device's analog input (first node) -> Xyce drives nvc;
 # d2a device's analog output (last node) -> nvc drives Xyce.
@@ -78,22 +79,33 @@ for my $a (@adev) {
 }
 sub _flat { my $x = shift; ref $x ? $x->[0] : $x; }
 
-# ---- emit Xyce analog deck: drop A-devices + their .model cards, add PWL hooks
+# ---- emit Xyce deck: preserve structure (.subckt hierarchy intact -- no
+# flattening). Replace each analog<->digital BRIDGE in-place with its code:
+# PWL boundary source (matching "mark up the PWL sources in the subckt"); drop
+# pure-digital A-devices (they live in nvc) and the code-model .model cards.
+# Signal name == the analog boundary net (kept in sync with the nvc VHDL).
 my $BR = 'libcosim_bridge.so:nvc_bridge_init';
+my %ad = map { _adline($_) => $_ } @adev;
 open my $cir, '>', "$base.cir" or die;
-print $cir "* [s2x cosim] Xyce analog deck (digital -> nvc; PWL code: boundary)\n";
+print $cir "* [s2x cosim] Xyce deck: analog + in-place code: PWL boundaries\n";
 for my $l (@lines) {
-    next if $l =~ /^A\S*\s/i;                                   # digital device
-    next if $l =~ /^\s*\.model\s+\S+\s+(d_\w+|adc_\w+|dac_\w+)\b/i;  # code-model card
-    last if $l =~ /^\s*\.end\s*$/i;
+    if (my $a = $ad{$l}) {                          # an A-device, in whatever scope
+        my $kind = $a->{map} ? $a->{map}[1] : 'logic';
+        if ($kind eq 'a2d') {                       # adc_bridge: Xyce node -> nvc
+            my $n = _flat($a->{nodes}[0]);
+            print $cir qq{I_$a->{name} $n 0 PWL FILE "code:$BR:a2d:$n"\n};
+        } elsif ($kind eq 'd2a') {                  # dac_bridge: nvc -> Xyce node
+            my $n = _flat($a->{nodes}[-1]);
+            print $cir qq{V_$a->{name} $n 0 PWL FILE "code:$BR:d2a:$n"\n};
+        } else {
+            print $cir "* [s2x] digital (in nvc): $l\n";   # pure logic -> dropped
+        }
+        next;
+    }
+    next if $l =~ /^\s*\.model\s+\S+\s+(d_\w+|adc_\w+|dac_\w+)\b/i;
     if ($l =~ /^\.GRAPH\s+(\S+)/i) { print $cir ".PRINT TRAN V($1)\n"; }
     else                           { print $cir "$l\n"; }
 }
-print $cir "\n* analog<-digital (D2A): nvc drives a Xyce PWL voltage source\n";
-print $cir qq{V_$_ $_ 0 PWL FILE "code:$BR:d2a:$d2a{$_}"\n} for sort keys %d2a;
-print $cir "* analog->digital (A2D): Xyce node sampled into nvc\n";
-print $cir qq{I_$_ $_ 0 PWL FILE "code:$BR:a2d:$a2d{$_}"\n} for sort keys %a2d;
-print $cir ".end\n";
 close $cir;
 
 # ---- emit cosim.boundary
