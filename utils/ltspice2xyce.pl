@@ -53,10 +53,12 @@ sub translate_file {
     my ($inpath, $outpath, $lib, $is_include) = @_;
     verbose("translate $inpath" . ($is_include ? " (include)" : ""));
 
-    open my $fh, '<', $inpath or die "ltspice2xyce: cannot read $inpath: $!\n";
-    my @lines = <$fh>;
+    open my $fh, '<:raw', $inpath or die "ltspice2xyce: cannot read $inpath: $!\n";
+    local $/; my $blob = <$fh>;
     close $fh;
-    s/\r\n?/\n/ for @lines;                       # strip Windows CR
+    $blob =~ s/\x00//g;                           # LTspice 26 UTF-16LE libs
+    $blob =~ s/\r\n?/\n/g;                        # strip Windows CR
+    my @lines = map { "$_\n" } split /\n/, $blob;
 
     my ($out_ref) = cir_to_xyce(\@lines, $lib);
 
@@ -75,7 +77,13 @@ sub translate_file {
         $f =~ s/^["']|["']$//g;
         next if $f =~ /[\\]/ || File::Spec->file_name_is_absolute($f);
         my $src = File::Spec->catfile($indir, $f);
-        next unless -f $src;
+        if (!-f $src) {
+            # not beside the deck: LTspice resolves bare lib names against its
+            # install (lib\sub for subckt libs) -- do the same locally
+            $src = _lt_find_lib(basename($f));
+            next unless defined $src && -f $src;
+            verbose("  resolved $f -> $src");
+        }
         my $tgt = File::Spec->catfile($outdir, basename($f) . ".xyce");
         translate_file($src, $tgt, undef, 1);
         $ln = "$pre\"$tgt\"$post\n";
@@ -148,6 +156,18 @@ sub _lt_find_cmp_lib {
         glob("/cygdrive/c/Users/*/AppData/Local/LTspice/lib/cmp/$base");
     for my $p (@cands) { return $p if -f $p; }
     return undef;
+}
+
+# Locate any LTspice install lib by basename: subckt libs (lib/sub --
+# UniversalOpAmp2.lib, LTC.lib, TowTom2.sub...) then the cmp database.
+sub _lt_find_lib {
+    my ($base) = @_;
+    my @cands = grep { defined && length }
+        ($ENV{LTSPICE_SUB} ? "$ENV{LTSPICE_SUB}/$base" : undef),
+        glob("/mnt/c/Users/*/AppData/Local/LTspice/lib/sub/$base"),
+        glob("/cygdrive/c/Users/*/AppData/Local/LTspice/lib/sub/$base");
+    for my $p (@cands) { return $p if -f $p; }
+    return _lt_find_cmp_lib($base);
 }
 
 # Slurp an LTspice lib file. LTspice 26 ships these UTF-16LE without BOM;
@@ -312,6 +332,16 @@ sub cir_to_xyce {
         unless (length $stripped) {
             push @output, $line;
             next;
+        }
+
+        # micro sign -> u, up front: branches below (.tran parsing, C/L
+        # expansion) emit lines directly and must see converted values
+        if ($stripped =~ /\xb5|\xc2\xb5/) {
+            $stripped =~ s/\xc2\xb5/u/g;
+            $stripped =~ s/\xb5/u/g;
+            $upper = uc($stripped);
+            $line  = "$stripped\n";   # branches that emit $line see it too
+            push @changes, "L$lineno: micro sign -> u";
         }
 
         # .PROBE removal
@@ -501,6 +531,51 @@ sub cir_to_xyce {
             next;
         }
 
+        # C or L with LTspice loss shorthands Xyce's primitives lack:
+        # Rser= -> series resistor through an internal node, Rpar= ->
+        # parallel resistor, Cpar= -> parallel capacitor. Values may be
+        # brace expressions ({R1/2}).
+        if ($stripped =~ /^[CcLl]\S*\s/ && $stripped =~ /\bR(?:par|ser)=|\bCpar=/i) {
+            my @tok = split /\s+/, $stripped;
+            my ($dn, $n1, $n2, $val) = @tok[0 .. 3];
+            my ($rpar, $rser, $cpar, @keep);
+            for my $t (@tok[4 .. $#tok]) {
+                if    ($t =~ /^Rpar=(\S+)$/i) { $rpar = $1; }
+                elsif ($t =~ /^Rser=(\S+)$/i) { $rser = $1; }
+                elsif ($t =~ /^Cpar=(\S+)$/i) { $cpar = $1; }
+                else                          { push @keep, $t; }
+            }
+            my $bot = $n2;
+            if (defined $rser) {
+                $bot = "ltzser_$dn";
+                push @output, "Rltzser_$dn $bot $n2 $rser\n";
+                push @changes, "L$lineno: $dn Rser= -> series resistor";
+            }
+            push @output, "$dn $n1 $bot $val @keep\n";
+            if (defined $rpar) {
+                push @output, "Rltzpar_$dn $n1 $n2 $rpar\n";
+                push @changes, "L$lineno: $dn Rpar= -> parallel resistor";
+            }
+            if (defined $cpar) {
+                push @output, "Cltzpar_$dn $n1 $n2 $cpar\n";
+                push @changes, "L$lineno: $dn Cpar= -> parallel capacitor";
+            }
+            next;
+        }
+
+        # .options: LTspice option names don't map onto Xyce's sectioned
+        # .OPTIONS. Translate maxstep -> TIMEINT DELMAX; drop the rest.
+        if ($upper =~ /^\.OPTIONS?\s/) {
+            if ($stripped =~ /\bmaxstep\s*=\s*(\S+)/i) {
+                push @changes, "L$lineno: .options maxstep -> .OPTIONS TIMEINT DELMAX";
+                push @output, ".OPTIONS TIMEINT DELMAX=$1\n";
+            } else {
+                push @changes, "L$lineno: LTspice .options dropped";
+                push @output, "* [ltz] dropped: $stripped\n";
+            }
+            next;
+        }
+
         # Track .PRINT
         if ($upper =~ /^\.PRINT/) {
             my ($body) = $stripped =~ /^\.PRINT\s*(.*)/i;
@@ -578,15 +653,7 @@ sub cir_to_xyce {
             next;
         }
 
-        # µ (micro sign) -> u (ASCII) for engineering notation
-        # Handle both Latin-1 (0xB5) and UTF-8 (0xC2 0xB5) encodings
-        if ($stripped =~ /\xb5|\xc2\xb5/) {
-            (my $converted = $stripped) =~ s/\xc2\xb5/u/g;
-            $converted =~ s/\xb5/u/g;
-            push @changes, "L$lineno: µ -> u";
-            push @output, "$converted\n";
-            next;
-        }
+        # (micro sign handled in top-of-loop preprocessing)
 
         # Pass-through
         push @output, $modified ? "$stripped\n" : $line;
