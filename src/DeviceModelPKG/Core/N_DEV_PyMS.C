@@ -90,14 +90,38 @@ static std::string find_device_gen() {
 
 // Find Xyce include directories for compiling plugins
 static std::string find_xyce_includes() {
-    // Check XYCE_SRC environment variable
-    const char *xyce_src = getenv("XYCE_SRC");
-    if (!xyce_src)
-        xyce_src = "/usr/local/src/Xyce-8/xyce/src";
+    auto exists = [](const std::string &p) {
+        struct stat st; return stat(p.c_str(), &st) == 0;
+    };
 
-    const char *xyce_build = getenv("XYCE_BUILD");
-    if (!xyce_build)
+    // Source tree (headers). XYCE_SRC wins; otherwise probe the known
+    // layouts via a sentinel header so we use the LIVE source tree
+    // rather than whatever stale subset got `make install`ed into the
+    // default system include path. /usr/local/include is missing some
+    // group headers (e.g. N_DEV_Inductor.h), which silently broke the
+    // level=N auto-loader for those device families.
+    std::string xyce_src;
+    if (const char *e = getenv("XYCE_SRC")) {
+        xyce_src = e;
+    } else {
+        const char *cands[] = { "/usr/local/src/xyce/src",
+                                "/usr/local/src/Xyce-8/xyce/src", nullptr };
+        const char *sentinel = "/DeviceModelPKG/OpenModels/N_DEV_Inductor.h";
+        for (int i = 0; cands[i]; i++)
+            if (exists(std::string(cands[i]) + sentinel)) { xyce_src = cands[i]; break; }
+        if (xyce_src.empty()) xyce_src = "/usr/local/src/Xyce-8/xyce/src";
+    }
+
+    // Build tree (configured headers + libXyceLib.so). Same probe order
+    // as the compile step below.
+    std::string xyce_build;
+    if (const char *e = getenv("XYCE_BUILD")) {
+        xyce_build = e;
+    } else if (exists("/usr/local/src/xyce-build/src/libXyceLib.so")) {
+        xyce_build = "/usr/local/src/xyce-build";
+    } else {
         xyce_build = "/usr/local/src/Xyce-8/xyce-build";
+    }
 
     // Collect all subdirectories of src/ as include paths
     std::ostringstream incs;

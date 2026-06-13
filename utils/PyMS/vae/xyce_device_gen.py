@@ -247,6 +247,16 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
         'Capacitor': ('capacitance', 'c'),
         'Inductor':  ('inductance', 'l'),
     }
+    # Built-in model-group Traits to join, per xyceModelGroup. Header +
+    # qualified Traits name for the DeviceTraits third template arg.
+    _GROUP_TRAITS = {
+        'RESISTOR':  ('N_DEV_Resistor.h',  'Resistor::Traits'),
+        'CAPACITOR': ('N_DEV_Capacitor.h', 'Capacitor::Traits'),
+        'INDUCTOR':  ('N_DEV_Inductor.h',  'Inductor::Traits'),
+        'MOSFET':    ('N_DEV_MOSFET1.h',   'MOSFET1::Traits'),
+        'DIODE':     ('N_DEV_Diode.h',     'Diode::Traits'),
+        'BJT':       ('N_DEV_BJT.h',       'BJT::Traits'),
+    }
     # simple_rlc is either:
     #   ('R'|'C'|'L', cxx_param_name)              — direct value param
     #   ('R_SHEET', rsh_cxx, l_cxx, w_cxx)         — compact-resistor pattern
@@ -279,6 +289,10 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
         wanted = _SIMPLE_RLC_PARAM_NAMES[model_group]
         canonical = wanted[0]
         # Pass 1: direct value parameter (resistance/capacitance/inductance).
+        # Instance params take precedence; a plain ``parameter real R``
+        # with no type="instance" attr is a MODEL param (set from the
+        # .MODEL card, e.g. ``.MODEL m r level=91 R=2k``) — reference
+        # it through the model_ member so the stamp sees the card value.
         inst_params = [p for p in mod.params if getattr(p, 'is_instance', False)]
         ordered = sorted(inst_params,
                          key=lambda p: 0 if p.name.lower() == canonical else 1)
@@ -286,6 +300,15 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
             if p.name.lower() in wanted:
                 simple_rlc = (model_group[0], _cxx_mangle(p.name))
                 break
+        if simple_rlc is None:
+            model_params = [p for p in mod.params
+                            if not getattr(p, 'is_instance', False)]
+            ordered = sorted(model_params,
+                             key=lambda p: 0 if p.name.lower() == canonical else 1)
+            for p in ordered:
+                if p.name.lower() in wanted:
+                    simple_rlc = (model_group[0], 'model_.' + _cxx_mangle(p.name))
+                    break
         # Pass 2: compact-resistor sheet-resistance pattern (rsh × l / w).
         # Only applies to Resistor; nothing analogous exists for C/L in
         # the IHP set.
@@ -367,6 +390,20 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
     h.append('#include <N_DEV_DeviceModel.h>')
     h.append('#include <N_DEV_DeviceMaster.h>')
     h.append('#include <dlfcn.h>')
+    # Join the built-in model group rather than becoming our own.
+    # DeviceTraits<M, I> (two-arg) makes the generated device its own
+    # model group; Configuration::addDevice then last-one-sticks
+    # overrides modelTypeNameModelGroupMap_["r"] (etc.), stealing the
+    # device letter from the built-in — after which every PLAIN
+    # ``R1 a b 1k`` routes to the .va device and dies with "instance
+    # must reference a model". Built-in levels avoid this by passing
+    # the group's Traits as the third template arg (cf. Resistor3,
+    # MOSFET_B4); do the same for every group we register a level on.
+    group_traits = None
+    if level_number:
+        group_traits = _GROUP_TRAITS.get(model_group.upper())
+    if group_traits:
+        h.append(f'#include <{group_traits[0]}>')
     h.append('')
     # Xyce_config.h (pulled in transitively above) ``#define``s
     # build-version macros that collide with parameter names from
@@ -399,7 +436,10 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
     h.append('class Model;')
     h.append('class Instance;')
     h.append('')
-    h.append('struct Traits : public DeviceTraits<Model, Instance> {')
+    if group_traits:
+        h.append(f'struct Traits : public DeviceTraits<Model, Instance, {group_traits[1]}> {{')
+    else:
+        h.append('struct Traits : public DeviceTraits<Model, Instance> {')
     h.append(f'  static const char *name() {{ return "{name}"; }}')
     h.append(f'  static const char *deviceTypeName() {{ return "{NAME}"; }}')
     h.append(f'  static int numNodes() {{ return {num_nodes_required}; }}')
