@@ -84,8 +84,29 @@ Suggested next steps for whoever owns the VAE↔model-group glue:
 3. Add the AC reproducer above to the PyMS regression set (assert |Z|→RSER at HF and
    →`Rpar∥…` at LF), since the failure is silent.
 
-`qspice_va/qspice_ind` (level=91 inductor with the same RSER/RPAR shorthands) is almost
-certainly affected identically.
+## Inductor (`xyceModelGroup="Inductor"`) — verified, and WORSE
+
+`qspice_va/qspice_ind` (level=91, same RSER/RPAR shorthands) was tested the same way
+(`L=1m, RSER=10, RPAR=100k`, 1 A AC drive). It is not merely loss-dropped — **the device
+does not conduct at all.** It compiles and binds (`compiled and registered qspice_ind`),
+but presents `|Z| ≈ 1e12 Ω` (the gmin floor) flat across frequency, and the transient is
+100% off gold. The external node floats: the only thing that linked `p` to the internal
+`mid` node was the `RSER` series branch, and with that branch dropped — and `RPAR`
+(the one direct p–n path) dropped too — `p` has no connection to the `L` branch at all.
+
+| f       | analytic `Rpar∥(Rser+jωL)` | ngspice | QSPICE | **Xyce VA level=91** |
+|---------|----------------------------|---------|--------|----------------------|
+| 1 Hz    | 9.999                      | 9.999   | 9.999  | **1e12** (open)      |
+| 1 kHz   | 11.809                     | 11.81   | 11.809 | **1e12** (open)      |
+| 10 MHz  | 53198                      | 53198   | 53198  | **1e12** (open)      |
+
+The difference vs the capacitor is instructive: the cap branch is a **current**
+contribution `I(mid,n) <+ C*ddt(...)` and survived as an ideal cap p–n (mid effectively
+collapsed); the inductor branch is a **potential** contribution `V(mid,n) <+ L*ddt(I(...))`
+that needs a branch-current unknown, and with the series branch gone the node is left
+open rather than collapsed. So the model-group VAE adapter both (a) forwards only the
+group's primary branch and (b) handles the potential-contribution + internal-node case by
+leaving it disconnected. Both need fixing.
 
 ## Impact on the QSPICE→Xyce port
 
