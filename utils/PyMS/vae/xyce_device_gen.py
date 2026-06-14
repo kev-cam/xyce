@@ -144,6 +144,36 @@ def scan_va_attributes(va_path: str) -> dict:
     return attrs
 
 
+# --- behavioral-stamp emitters for the QSPICE C/L loss shorthands ----------
+# Emit C++ that adds the RSER (series) / RPAR (parallel) loss branches to the
+# simple-R/L/C behavioral stamp. They assume the enclosing stamp has already
+# emitted `double V_drop = V(p) - V(n);` and that li_<node> members exist.
+def _emit_rpar(c, rpar_ref, a, b):
+    """Parallel leakage RPAR directly across the +/- terminals (no node)."""
+    c.append(f'    double Rpar = {rpar_ref}; if (Rpar < 1e-12) Rpar = 1e-12;')
+    c.append('    double Gpar = 1.0 / Rpar;')
+    c.append(f'    F_[{a}] += Gpar * V_drop;')
+    c.append(f'    F_[{b}] -= Gpar * V_drop;')
+    c.append(f'    dFdx_[{a}][{a}] += Gpar;')
+    c.append(f'    dFdx_[{a}][{b}] -= Gpar;')
+    c.append(f'    dFdx_[{b}][{a}] -= Gpar;')
+    c.append(f'    dFdx_[{b}][{b}] += Gpar;')
+
+
+def _emit_rser(c, rser_ref, p0, mid_name, a, m):
+    """Series ESR between the + terminal (p0, slot a) and the internal node
+    (mid_name, slot m); the reactive element then sits between mid and -."""
+    c.append(f'    double Rser = {rser_ref}; if (Rser < 1e-12) Rser = 1e-12;')
+    c.append('    double Gser = 1.0 / Rser;')
+    c.append(f'    double Vpm = (*solVec)[li_{p0}] - (*solVec)[li_{mid_name}];')
+    c.append(f'    F_[{a}] += Gser * Vpm;')
+    c.append(f'    F_[{m}] -= Gser * Vpm;')
+    c.append(f'    dFdx_[{a}][{a}] += Gser;')
+    c.append(f'    dFdx_[{a}][{m}] -= Gser;')
+    c.append(f'    dFdx_[{m}][{a}] -= Gser;')
+    c.append(f'    dFdx_[{m}][{m}] += Gser;')
+
+
 def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str, str]:
     """Generate Xyce device C++ source (.h and .C) from parsed VA module.
 
@@ -298,7 +328,10 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
                          key=lambda p: 0 if p.name.lower() == canonical else 1)
         for p in ordered:
             if p.name.lower() in wanted:
-                simple_rlc = (model_group[0], _cxx_mangle(p.name))
+                # kind = SPICE letter from the param table (R/C/L), NOT
+                # model_group[0] -- "Inductor"[0] is 'I', which matched no
+                # stamp branch, leaving the inductor behaviorally unstamped.
+                simple_rlc = (wanted[1].upper(), _cxx_mangle(p.name))
                 break
         if simple_rlc is None:
             model_params = [p for p in mod.params
@@ -307,7 +340,7 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
                              key=lambda p: 0 if p.name.lower() == canonical else 1)
             for p in ordered:
                 if p.name.lower() in wanted:
-                    simple_rlc = (model_group[0], 'model_.' + _cxx_mangle(p.name))
+                    simple_rlc = (wanted[1].upper(), 'model_.' + _cxx_mangle(p.name))
                     break
         # Pass 2: compact-resistor sheet-resistance pattern (rsh × l / w).
         # Only applies to Resistor; nothing analogous exists for C/L in
@@ -330,6 +363,31 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
                               rsh_ref,
                               _cxx_mangle(l_p.name),
                               _cxx_mangle(w_p.name))
+
+    # QSPICE-dialect loss shorthands on a C/L value device: RSER in series
+    # and RPAR across the element. The behavioral stamp must honor these or
+    # a lossy cap/inductor silently simulates as ideal (RSER=0, RPAR=inf) --
+    # the simple-R/L/C path skips vae_eval, so loss branches in the .va are
+    # never evaluated. RSER sits between the + terminal and the reactive
+    # element, so it needs the module's internal node (qspice_cap/ind: `mid`).
+    rlc_loss = None
+    if simple_rlc and simple_rlc[0] in ('C', 'L'):
+        def _loss_ref(nm):
+            for p in mod.params:
+                if p.name.lower() == nm:
+                    return (_cxx_mangle(p.name) if getattr(p, 'is_instance', False)
+                            else 'model_.' + _cxx_mangle(p.name))
+            return None
+        rser_ref = _loss_ref('rser')
+        rpar_ref = _loss_ref('rpar')
+        if rser_ref or rpar_ref:
+            has_mid = bool(rser_ref) and n_int >= 1
+            rlc_loss = {
+                'rser':     rser_ref,
+                'rpar':     rpar_ref,
+                'mid_name': internals[0] if has_mid else None,
+                'mid_idx':  n_ext        if has_mid else None,
+            }
 
     # Split scalar vs array params. Scalars go into Model/Instance class
     # members via addPar; arrays are emitted once as namespace-scope static
@@ -1004,23 +1062,55 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
         elif kind == 'C':
             vparam = simple_rlc[1]
             c.append(f'    double C_val = {vparam};')
-            c.append('    double Q = C_val * V_drop;')
-            c.append(f'    Q_[{a}] += Q;')
-            c.append(f'    Q_[{b}] -= Q;')
-            c.append(f'    dQdx_[{a}][{a}] += C_val;')
-            c.append(f'    dQdx_[{a}][{b}] -= C_val;')
-            c.append(f'    dQdx_[{b}][{a}] -= C_val;')
-            c.append(f'    dQdx_[{b}][{b}] += C_val;')
+            if rlc_loss and rlc_loss['rpar']:
+                _emit_rpar(c, rlc_loss['rpar'], a, b)
+            if rlc_loss and rlc_loss['mid_name'] is not None:
+                # Series ESR: p --RSER-- mid, capacitor between mid and n.
+                _emit_rser(c, rlc_loss['rser'], p0, rlc_loss['mid_name'], a, rlc_loss['mid_idx'])
+                m, mn = rlc_loss['mid_idx'], rlc_loss['mid_name']
+                c.append(f'    double Vmn = (*solVec)[li_{mn}] - (*solVec)[li_{p1}];')
+                c.append('    double Q = C_val * Vmn;')
+                c.append(f'    Q_[{m}] += Q;')
+                c.append(f'    Q_[{b}] -= Q;')
+                c.append(f'    dQdx_[{m}][{m}] += C_val;')
+                c.append(f'    dQdx_[{m}][{b}] -= C_val;')
+                c.append(f'    dQdx_[{b}][{m}] -= C_val;')
+                c.append(f'    dQdx_[{b}][{b}] += C_val;')
+            else:
+                # Ideal C between p and n (no series ESR).
+                c.append('    double Q = C_val * V_drop;')
+                c.append(f'    Q_[{a}] += Q;')
+                c.append(f'    Q_[{b}] -= Q;')
+                c.append(f'    dQdx_[{a}][{a}] += C_val;')
+                c.append(f'    dQdx_[{a}][{b}] -= C_val;')
+                c.append(f'    dQdx_[{b}][{a}] -= C_val;')
+                c.append(f'    dQdx_[{b}][{b}] += C_val;')
         elif kind == 'L':
+            # NB: the inductive reactance is still an OP-only near-short
+            # placeholder (transient needs the full VAE current-state model);
+            # but RSER/RPAR loss are honored so they aren't silently dropped.
             vparam = simple_rlc[1]
             c.append(f'    double L_val = {vparam};')
-            c.append('    (void) L_val;  // OP-only fallback; transient needs full VAE')
-            c.append(f'    F_[{a}] += 1e3 * V_drop;')
-            c.append(f'    F_[{b}] -= 1e3 * V_drop;')
-            c.append(f'    dFdx_[{a}][{a}] += 1e3;')
-            c.append(f'    dFdx_[{a}][{b}] -= 1e3;')
-            c.append(f'    dFdx_[{b}][{a}] -= 1e3;')
-            c.append(f'    dFdx_[{b}][{b}] += 1e3;')
+            c.append('    (void) L_val;  // OP-only fallback; reactance needs full VAE')
+            if rlc_loss and rlc_loss['rpar']:
+                _emit_rpar(c, rlc_loss['rpar'], a, b)
+            if rlc_loss and rlc_loss['mid_name'] is not None:
+                _emit_rser(c, rlc_loss['rser'], p0, rlc_loss['mid_name'], a, rlc_loss['mid_idx'])
+                m, mn = rlc_loss['mid_idx'], rlc_loss['mid_name']
+                c.append(f'    double Vmn = (*solVec)[li_{mn}] - (*solVec)[li_{p1}];')
+                c.append(f'    F_[{m}] += 1e3 * Vmn;')
+                c.append(f'    F_[{b}] -= 1e3 * Vmn;')
+                c.append(f'    dFdx_[{m}][{m}] += 1e3;')
+                c.append(f'    dFdx_[{m}][{b}] -= 1e3;')
+                c.append(f'    dFdx_[{b}][{m}] -= 1e3;')
+                c.append(f'    dFdx_[{b}][{b}] += 1e3;')
+            else:
+                c.append(f'    F_[{a}] += 1e3 * V_drop;')
+                c.append(f'    F_[{b}] -= 1e3 * V_drop;')
+                c.append(f'    dFdx_[{a}][{a}] += 1e3;')
+                c.append(f'    dFdx_[{a}][{b}] -= 1e3;')
+                c.append(f'    dFdx_[{b}][{a}] -= 1e3;')
+                c.append(f'    dFdx_[{b}][{b}] += 1e3;')
         c.append('  }')
         c.append('')
     # Diagonal regularization. Two flavours:
