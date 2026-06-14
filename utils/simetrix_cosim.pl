@@ -109,10 +109,14 @@ for my $l (@lines) {
 close $cir;
 
 # ---- emit cosim.boundary
+# Field 1 is the NVC signal path: the VHDL testbench declares every net as
+# "sig_<net>" (sig_ prefix avoids clashing with keywords/entity names), so the
+# boundary path must carry that prefix to resolve. Field 2 is the bridge signal
+# name, which must equal the net used in the .cir "code:...:{d2a,a2d}:<net>" URI.
 open my $bnd, '>', "$base.boundary" or die;
 print $bnd "# [s2x cosim] boundary map (analog-on-top)\n";
-print $bnd "D2A .$d2a{$_} $_\n" for sort keys %d2a;
-print $bnd "A2D .$a2d{$_} $_\n" for sort keys %a2d;
+print $bnd "D2A .sig_$d2a{$_} $_\n" for sort keys %d2a;
+print $bnd "A2D .sig_$a2d{$_} $_\n" for sort keys %a2d;
 close $bnd;
 
 # ---- emit VHDL testbench: instantiate the digital primitives, wire by net
