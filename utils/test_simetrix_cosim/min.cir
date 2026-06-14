@@ -1,0 +1,7 @@
+* minimal analog-on-top cosim: digital square wave -> nin, RC -> nout
+V_d2a nin 0 PWL FILE "code:libcosim_bridge.so:nvc_bridge_init:d2a:nin"
+R1 nin nout 1k
+C1 nout 0 100p
+.tran 1n 200n
+.print tran V(nin) V(nout)
+.end
