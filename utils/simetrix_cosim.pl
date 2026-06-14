@@ -96,7 +96,17 @@ for my $l (@lines) {
             print $cir qq{I_$a->{name} $n 0 PWL FILE "code:$BR:a2d:$n"\n};
         } elsif ($kind eq 'd2a') {                  # dac_bridge: nvc -> Xyce node
             my $n = _flat($a->{nodes}[-1]);
-            print $cir qq{V_$a->{name} $n 0 PWL FILE "code:$BR:d2a:$n"\n};
+            # A real dac_bridge has finite output conductance (g_pullup/
+            # g_pulldown); an IDEAL voltage source driving nonlinear analog
+            # (e.g. a BJT base) collapses the transient timestep. Drive an
+            # internal node and add a series output resistance R = 1/g_pullup
+            # if the model gives one, else a nominal 50 ohm. n.b. multi-line
+            # .model continuations aren't parsed, so most fall to the default.
+            my $p = $aparams{ lc $a->{model} } // '';
+            my $g = ($p =~ /g_pullup\s*=\s*([\d.eE+-]+)/i) ? $1 : 0;
+            my $r = ($g > 0) ? 1.0 / $g : 50;
+            print $cir qq{V_$a->{name} ${n}_drv 0 PWL FILE "code:$BR:d2a:$n"\n};
+            printf $cir "R_%s %s_drv %s %.4g\n", $a->{name}, $n, $n, $r;
         } else {
             print $cir "* [s2x] digital (in nvc): $l\n";   # pure logic -> dropped
         }
@@ -104,7 +114,29 @@ for my $l (@lines) {
     }
     next if $l =~ /^\s*\.model\s+\S+\s+(d_\w+|adc_\w+|dac_\w+)\b/i;
     if ($l =~ /^\.GRAPH\s+(\S+)/i) { print $cir ".PRINT TRAN V($1)\n"; }
-    else                           { print $cir "$l\n"; }
+    # SIMetrix allows a single-arg ".tran <tstop>" (auto step); Xyce's .TRAN
+    # needs <tstep> <tstop>. Inject a nominal step = tstop/10000 (the cosim
+    # loop governs the real stepping via simulateUntil anyway).
+    elsif ($l =~ /^\s*\.tran\s+([\d.eE+-]+)([a-zA-Z]*)\s*$/i) {
+        my ($n, $u) = ($1, $2);
+        printf $cir ".tran %s%s %s%s\n", $n/10000, $u, $n, $u;
+    }
+    else {
+        # SIMetrix syntactic cleanup on analog instance/subckt lines (mirrors
+        # simetrix2xyce.pl): strip '$' in X-instance and subckt names, drop the
+        # trailing "pinnames: ..." annotation, and turn a " : p=v" subckt param
+        # clause into Xyce "PARAMS: p=v".
+        if ($l =~ /^X/i) {
+            $l =~ s/^X\$+/X/;
+            $l =~ s/\$+//g;
+            $l =~ s/\s+pinnames:.*$//i;
+            $l =~ s/\s+:\s+/ PARAMS: /;
+        }
+        elsif ($l =~ /^\.subckt\s/i) {
+            $l =~ s/^(\.subckt\s+)\$+/$1/i;
+        }
+        print $cir "$l\n";
+    }
 }
 close $cir;
 
@@ -132,27 +164,45 @@ library s2x;
 entity ${stem}_tb is end entity;
 architecture cosim of ${stem}_tb is
 HDR
-print $vhd "    signal sig_$_ : resolved_logic3da;\n" for sort keys %sig;
-print $vhd "begin\n";
+# Build the body first so we can also collect the extra signal declarations
+# (vector-gate input buses) that must precede `begin`.
+my (@busdecls, @body);
 my $idx = 0;
 for my $a (@adev) {
     my $m = $a->{map} or do {
-        print $vhd "    -- UNMAPPED code model: $a->{name} ($a->{type})\n"; next;
+        push @body, "    -- UNMAPPED code model: $a->{name} ($a->{type})";
+        next;
     };
     my $ent = $m->[0];
     my @flat = map { _flat($_) } @{$a->{nodes}};
     my $pm;
     if ($m->[1] eq 'logic' && $ent =~ /nand|_or$/) {
-        # vector-input gates: map inputs onto i(0..), n_used, last node is output
-        my @ins = @flat[0 .. $#flat-1]; my $out = $flat[-1];
+        # vector-input gates: inputs are every node but the last, with any
+        # bracketed bus group EXPANDED to its members (a 2-input nand is
+        # written "[a b] o" -> nodes (a,b) then o); _flat collapses a bus to
+        # its first element, so expand here instead. Drive the vector port
+        # through an intermediate bus signal: passing a named aggregate
+        # directly as a port actual trips an nvc inertial-actual codegen bug.
+        # n_used tells the entity how many low elements are live.
+        my @nodes = @{$a->{nodes}};
+        my $out = _flat($nodes[-1]);
+        my @ins = map { ref $_ ? @$_ : $_ } @nodes[0 .. $#nodes-1];
+        my $bus = "u${idx}_ibus";
+        push @busdecls, "    signal $bus : logic3da_vector(0 to 7);";
         my $im = join(", ", map { "$_ => sig_$ins[$_]" } 0 .. $#ins);
-        $pm = "i($im), n_used => " . scalar(@ins) . ", o => sig_$out";
+        push @body, "    $bus <= ($im, others => L3DA_0);";
+        $pm = "i => $bus, n_used => " . scalar(@ins) . ", o => sig_$out";
     } else {
         # scalar entities: map ports positionally by entity convention
         $pm = _scalar_portmap($ent, \@flat);
     }
-    printf $vhd "    u%d: entity s2x.%s(rtl) port map( %s );\n", $idx++, $ent, $pm;
+    push @body, sprintf("    u%d: entity s2x.%s(rtl) port map( %s );",
+                        $idx++, $ent, $pm);
 }
+print $vhd "    signal sig_$_ : resolved_logic3da;\n" for sort keys %sig;
+print $vhd "$_\n" for @busdecls;
+print $vhd "begin\n";
+print $vhd "$_\n" for @body;
 print $vhd "end architecture;\n";
 close $vhd;
 
