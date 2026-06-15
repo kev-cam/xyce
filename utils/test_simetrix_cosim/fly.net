@@ -1,0 +1,189 @@
+* C:\Users\Claude\Documents\Elements\Examples-92\SIMetrix\Flyback_PSU\flyback.sxsch
+*#SIMETRIX
+.GRAPH U1_Vp axisType="auto" persistence=2 curveLabel="15V supply"  GUID="5afec633-9d46-463f-8ef8-16ef59556795" disabled=false PROBEREF=Probe3  
+R5 Q1_S U1_Sense 1K
+V1 R14_P 0  Pulse(0 160  0 1m 1m)
+R6 0 R6_N 56m
+X$U1 U1_Vout R7_N U1_Vp C2_P U1_Sense R4_N R7_P 0 UC3844 pinnames: Vout Osc Vp Comp Sense Vfb Refv Gnd
+R8 R14_P R8_N 1k
+C1 R6_N C1_N 680u   
+D2 TX2_W3B R4_P D1N4148
+X$TX2 R14_P C3_N 0 C5_N 0 TX2_W3B Ideal_TxTX2 pinnames: W1A W1B W2A W2B W3A W3B 
+.subckt Ideal_TxTX2 W1A W1B W2A W2B W3A W3B 
+L1 W1A W1B 2m 
+L2 W2A W2B 20u 
+L3 W3A W3B 180u 
+K12 L1 L2 990m 
+K13 L1 L3 990m 
+K23 L2 L3 990m 
+.ends 
+
+R9 Q1_S 0 1.8
+R7 R7_P R7_N 16k
+.GRAPH R4_P axisType="auto" persistence=2 curveLabel="Vsense"  GUID="ee881d94-3f11-47af-a4ec-108c3330679f" disabled=false PROBEREF=Probe2  
+R4 R4_P R4_N 18k
+.GRAPH C1_N axisType="auto" persistence=2 curveLabel="Output"  GUID="eafbbe3b-2acf-4fbd-9ced-f26b0ae56f67" disabled=false PROBEREF=Probe1  
+R3 0 R3_N 1K
+X$Q1 C3_N R1_P Q1_S IRFR420 pinnames: D G S
+R2 C1_N 0 5
+R14 R14_P U1_Vp 47k
+R13 R4_N 0 3.3k
+R12 R12_P R4_N 15k
+R11 0 R11_N 1K
+R10 0 R4_P 330
+R1 R1_P U1_Vout 100
+C3 R8_N C3_N 330p   
+D4 TX2_W3B U1_Vp D1N4148
+C2 C2_P R12_P 1n   
+X$D3 0 U1_Vp BZX79-18 pinnames: P N
+D1 C5_N C1_N mur110
+C9 R12_P R4_N 330p   
+C8 R11_N TX2_W3B 1n   
+C7 0 R4_P 1u   
+C6 U1_Sense 0 330p   
+C5 R3_N C5_N 1n   
+C4 R7_N 0 470p   
+C11 0 U1_Vp 1u   
+.tran 8m
+.options minbreak=100p
+** uncomment the following line if you experience convergence problems
+*.options pivrel=990m
+
+.model D1n4148 D(IS=1.6f RS=1.0 IKF=22m CJO=3p M=0.3 VJ=0.75 ISR=2.6n 
++ BV=70 TT=20n)
+
+.subckt IRFR420 D G S
+.model mosfet NMOS( LEVEL=17 VTO=3.81 RS=0.06816 KP=2.149 RD=2.3567 TC1RD=0.0127 RG=15 IS=1e-36
++ CGDMAX=1.00E-09 CGDMIN=1.06E-11 XG2CGD=0.5 XG1CGD=0.1 CBD=6.97E-11 VTCGD=0)
+.model diode D( IS=3.50e-13 RS=0.0343 TT=1.657e-06)
+M1 D G S S mosfet
+D1 S D Diode
+Cgs G S 3.18E-10
+.ends
+
+.model mur110 D(IS=9p RS=23m IKF=11m CJO=40p M=0.37 VJ=0.75 ISR=820p 
++ BV=100 IBV=100u tt=62n)
+
+.subckt BZX79-18 1 2
+D1 1 2 D1
+D2 2 3 D2
+I1 1 3 1.71956
+R1 1 3 10 TC1=0.8374m
+.model D1 D IS=9.19e-16 CJO=70p RS=0.57061 ISR=1.36e-08
+.model D2 D IS=1.00e-15
+.ends
+
+** From psu.sxlib
+.subckt UC3844 Vout Osc Vp Comp Sense Vfb Ref Gnd 
+A$U2 [U6_OUT U5_IN4] U2_OUT nand
+A$U3 [U2_OUT U7_OUT] U5_IN4 nand
+X$ARB1 R1_P Sense ARB1_OUT $$arbsourceARB1 pinnames: N1 N2 OUT 
+.subckt $$arbsourceARB1 N1 N2 OUT 
+B1 OUT 0 V=tanh(v(n1,n2)*1000)*2.5+2.5 
+.ends
+A$U16 U12_OUT U16_OUT DA
+X$U1 Vfb Ref Vp Comp Gnd R5_N $$error_amp_2 pinnames: VINN BIAS VP VOUT VN VINP
+A$U17 U9_OUT U17_OUT DA
+A$U6 U12_OUT U6_OUT inv
+V1 S2_P 0 5V
+A$U7 U15_OUT U7_OUT delay1
+A$U15 ARB1_OUT U15_OUT AD
+A$U4 Vp U4_OUT schmitt
+A$U5 [U10_OUT U12_OUT U8_QP U5_IN4] U11_IN1 or
+A$U12 Osc U12_OUT schmitt_osc
+I2 R1_N Comp 10u
+A$U13 U11_OUT U13_OUT DA
+A$U10 U4_OUT U10_OUT inv
+A$U11 U11_IN1 U11_OUT inv_dead
+I1 Gnd I1_N 40m
+A$U18 U4_OUT U18_OUT DA
+A$VCC2 VCC2_P DIG_VCC
+D1 Comp D1_N Diode
+D2 D1_N R1_N Diode
+D3 R1_P I1_N Diode
+Q2 Vp S1_N Vout 0 N1 20
+R4 S1_N Gnd 1K
+R5 Ref R5_N 10k
+X$S4 Osc 0 U16_OUT 0 gen_switch : RON=250 ROFF=100Meg VON=3 VOFF=2 pinnames: P N CP CN
+A$U8 VCC2_P U12_OUT U8_SET U8_SET U8_QP U8_QN Toggle
+A$GND2 U8_SET DIG_GND
+R6 R5_N Gnd 10k
+A$U9 U11_IN1 U9_OUT dead
+Q1 Vout U17_OUT Gnd 0 N1 20
+X$S2 S2_P Ref U18_OUT 0 gen_switch : RON=1 ROFF=100Meg VON=3 VOFF=2 pinnames: P N CP CN
+R1 R1_P R1_N 20k
+X$S3 Vp 0 U18_OUT 0 gen_switch : RON=1.36k ROFF=30k VON=3 VOFF=2 pinnames: P N CP CN
+R2 Gnd R1_P 10k
+.ic Osc 0
+R3 I1_N Gnd 10
+X$S1 Vp S1_N U13_OUT Gnd gen_switch : RON=1  ROFF=1Meg VON=3  VOFF=2  pinnames: P N CP CN
+.model inv d_inverter
+.model or d_or
+.model DIG_GND d_pulldown strong=true out_family="FORCE5"
+.model DIG_VCC d_pullup strong=true out_family="FORCE5"
+.model toggle d_tff
+.model delay1 d_buffer rise_delay=150n fall_delay=150n
+.model dead d_buffer rise_delay=20n fall_delay=1n
+.model inv_dead d_inverter rise_delay=20n fall_delay=1n
+.model nand d_nand
+.model and d_and
+.model Diode D(IS=1.6f CJO=0.3p M=0.3 VJ=0.75 ISR=2.6n)
+.model N1 NPN BF=300 TF=0.5n CJC=0.3p VAF=100
+.model P1 PNP BF=150 TF=2n CJC=0.3p VAF=150
+.model D1 D
+.model schmitt_osc adc_schmitt in_low=1 in_high=3
+* 842/4
+.model schmitt adc_schmitt in_low=10 in_high=16
+* 843/5
+*.model schmitt adc_schmitt in_low=7.6 in_high=8.4
+.subckt gen_switch 1 2 3 4
+S1 1 2 3 4 SW
+.model SW VSWITCH RON={ron} ROFF={roff} VON={von} VOFF={voff}
+.ends
+.model AD adc_bridge 
++ in_low=2.1 
++ in_high=2.2 
++ rise_delay=1e-12 
++ fall_delay=1e-12
++ out_family = "UNIV"
++ out_low = 0
++ out_high = 5
++ clamp_bias=0.5
++ clamp_res=10
+.model DA dac_bridge 
++ out_high=5        
++ input_load=-31p   
++ t_rise=2n         
++ t_fall=2n         
++ g_pullup=0.024    
++ g_pulldown=0.034  
++ g_hiz=1e-9        
++ knee_low = 2.0    
++ knee_high =2.75   
++ v_smooth = 0.5    
++ in_family="UNIV"
+.subckt $$error_amp_2 VINN BIAS VP VOUT VN VINP
+Q8 Q6_C Q6_C VN 0 N1
+Q9 Q10_B Q6_C VN 0 N1
+V1 D2_N VN 5.5 
+Q10 VOUT Q10_B Q10_E 0 N1
+C1 C1_P Q10_B 270p
+D1 Q10_E VN D1
+D2 VOUT D2_N D1
+E1 C1_P 0 VOUT 0 1
+G2 VP G2_N BIAS VN 20u
+Q6 Q6_C R2_P G2_N 0 P1
+Q7 Q10_B R3_P G2_N 0 P1
+R2 R2_P VINN 2.7k
+X$S1 VP VOUT BIAS 0 gen_switch : RON=30k ROFF=1G VON=3 VOFF=2 pinnames: P N CP CN
+R3 R3_P VINP 2.7k
+.subckt gen_switch 1 2 3 4
+S1 1 2 3 4 SW
+.model SW VSWITCH RON={ron} ROFF={roff} VON={von} VOFF={voff}
+.ends
+.model N1 NPN BF=200 TF=0.15n CJC=0.3p VAF=100
+.model P1 PNP BF=150 TF=5n CJC=30p VAF=150 RB=100
+.model D1 D
+.ends
+.ends
+

@@ -95,6 +95,54 @@ sub _genmap {
     return join(", ", @g);
 }
 
+# Synthesize a behavioral subckt macromodel for a power-MOSFET .model (SIMetrix
+# NMOS/PMOS LEVEL=17 -- the IRFR420 etc., same family as the LTspice VDMOS;
+# Xyce's native VDMOS is a different LEVEL=18 academic model with none of these
+# params). Ported from ltspice2xyce.pl _vdmos_subckt (validated vs QSPICE gold):
+# smooth subthreshold + triode + saturation Bch, body diode, Cgs/Cgd, Rd/Rs/Rg.
+sub _vdmos_subckt {
+    my ($name, $params, $pchan) = @_;
+    my %p; $p{ lc $1 } = $2 while $params =~ /(\w+)\s*=\s*([^\s)]+)/g;
+    my $pol = $pchan ? -1 : 1;
+    my $num = sub { my ($k, $d) = @_; my $n = _spice_num($p{$k}); defined $n ? $n : $d };
+    my $vto = abs($num->('vto', 2));
+    my $kp  = $num->('kp', 10);
+    my $lam = $num->('lambda', 0);
+    my $rd  = $num->('rd', 0) || 1e-6;
+    my $rs  = $num->('rs', 0) || 1e-6;
+    my $rg  = $num->('rg', 0) || 1e-6;
+    my $mt  = $num->('mtriode', 2);
+    my $ks  = $num->('ksubthres', 0.1);
+    my $cgs = $num->('cgs', 0);
+    my $cgdmin = $num->('cgdmin', 0);
+    my $is  = $num->('is', 1e-14);
+    my $nd  = $num->('n', 1);
+    my $U = uc $name;
+    my $S = $pol > 0 ? '' : '-';
+    my $vgs = $pol > 0 ? 'V(gi,si)' : 'V(si,gi)';
+    my $vds = $pol > 0 ? 'V(di,si)' : 'V(si,di)';
+    my $vov = sprintf '(%s-%.6g)', $vgs, $vto;
+    my $kpks2 = sprintf '%.6g', $kp * $ks * $ks;
+    my $sub_t = sprintf '%s*ln(1+exp(%s/%.6g))*ln(1+exp(%s/%.6g))', $kpks2, $vov, $ks, $vov, $ks;
+    my $tri_t = sprintf '%.6g*(%s*%s-0.5*pow(max(%s,0),%.6g)*pow(max(%s,0),%.6g))*(1+%.6g*%s)',
+                        $kp, $vov, $vds, $vds, $mt, $vov, 2 - $mt, $lam, $vds;
+    my $sat_t = sprintf '0.5*%.6g*%s*%s*(1+%.6g*%s)', $kp, $vov, $vov, $lam, $vds;
+    my $ich = sprintf 'IF(%s<=0,%s,IF(%s<%s,%s,%s))', $vov, $sub_t, $vds, $vov, $tri_t, $sat_t;
+    my ($ba, $bk) = $pol > 0 ? ('si', 'di') : ('di', 'si');
+    my $txt = "* [s2x] VDMOS $name macromodel (" . ($pchan ? 'P' : 'N') . "-channel, from LEVEL=17)\n";
+    $txt .= ".SUBCKT LTZ_VDMOS_$U d g s\n";
+    $txt .= sprintf "Rdd d di %.6g\n", $rd;
+    $txt .= sprintf "Rgg g gi %.6g\n", $rg;
+    $txt .= sprintf "Rss si s %.6g\n", $rs;
+    $txt .= "Bch di si I={$S($ich)}\n";
+    $txt .= ".model LTZ_VDMOS_${U}_BD D(IS=" . sprintf('%.6g', $is) . " N=" . sprintf('%.6g', $nd) . ")\n";
+    $txt .= "Dbd $ba $bk LTZ_VDMOS_${U}_BD\n";
+    $txt .= sprintf "Cq_gs gi si %.6g\n", $cgs    if $cgs > 0;
+    $txt .= sprintf "Cq_gd gi di %.6g\n", $cgdmin if $cgdmin > 0;
+    $txt .= ".ENDS LTZ_VDMOS_$U\n";
+    return $txt;
+}
+
 # XSPICE code model -> (VHDL entity, kind). kind: logic | a2d(adc) | d2a(dac)
 my %MAP = (
     d_inverter => ['xsp_d_inverter', 'logic'],
@@ -144,8 +192,34 @@ sub _flat { my $x = shift; ref $x ? $x->[0] : $x; }
 # Signal name == the analog boundary net (kept in sync with the nvc VHDL).
 my $BR = 'libcosim_bridge.so:nvc_bridge_init';
 my %ad = map { _adline($_) => $_ } @adev;
+
+# Detect power-MOSFET models (NMOS/PMOS LEVEL=17, e.g. the IRFR420) and
+# synthesize a VDMOS macromodel subckt for each (Xyce can't build a LEVEL=17
+# model card). The M instances referencing them are rewritten M -> X below.
+my %vdmos;   # lc model name -> macromodel .SUBCKT text
+{
+    my ($nm, $type, $txt);
+    my $finish = sub {
+        return unless defined $nm;
+        $vdmos{$nm} = _vdmos_subckt($nm, $txt, $type eq 'pmos')
+            if $txt =~ /\bLEVEL\s*=\s*17\b/i;
+        $nm = undef;
+    };
+    for my $l (@lines) {
+        if ($l =~ /^\s*\.model\s+(\S+)\s+([np]mos)\b(.*)$/i) {
+            $finish->(); ($nm, $type, $txt) = (lc $1, lc $2, $3);
+        }
+        elsif (defined $nm && $l =~ /^\s*\+\s*(.*)$/) { $txt .= ' ' . $1; }
+        else { $finish->(); }
+    }
+    $finish->();
+}
+
 open my $cir, '>', "$base.cir" or die;
 print $cir "* [s2x cosim] Xyce deck: analog + in-place code: PWL boundaries\n";
+# emit the synthesized VDMOS macromodels at top level (globally visible to the
+# X instances, even those inside .subckts like IRFR420)
+print $cir $vdmos{$_} for sort keys %vdmos;
 my $drop_model = 0;   # inside a dropped code-model .model card (skip its "+" lines)
 for my $l (@lines) {
     if (my $a = $ad{$l}) {                          # an A-device, in whatever scope
@@ -171,10 +245,20 @@ for my $l (@lines) {
         }
         next;
     }
-    # drop code-model .model cards AND their "+" continuation lines
+    # drop code-model AND remapped-VDMOS .model cards (+ their "+" lines); the
+    # VDMOS macromodels were already emitted as subckts at top level.
     if ($drop_model && $l =~ /^\s*\+/) { next; }
-    if ($l =~ /^\s*\.model\s+\S+\s+(d_\w+|adc_\w+|dac_\w+)\b/i) { $drop_model = 1; next; }
+    if ($l =~ /^\s*\.model\s+(\S+)\s+(?:d_\w+|adc_\w+|dac_\w+)\b/i
+        || ($l =~ /^\s*\.model\s+(\S+)\s+[np]mos\b/i && $vdmos{ lc $1 })) {
+        $drop_model = 1; next;
+    }
     $drop_model = 0;
+    # rewrite M<inst> nd ng ns nb <vdmosmodel> -> X<inst> nd ng ns <macromodel>
+    if ($l =~ /^M(\S*)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)/i
+        && $vdmos{ lc $6 }) {
+        print $cir "XM$1 $2 $3 $4 LTZ_VDMOS_" . uc($6) . "\n";
+        next;
+    }
     if ($l =~ /^\.GRAPH\s+(\S+)/i) { print $cir ".PRINT TRAN V($1)\n"; }
     # SIMetrix allows a single-arg ".tran <tstop>" (auto step); Xyce's .TRAN
     # needs <tstep> <tstop>. Inject a nominal step = tstop/10000 (the cosim
