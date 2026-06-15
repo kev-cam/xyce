@@ -26,6 +26,9 @@ use warnings;
 use File::Basename qw(dirname basename);
 use File::Spec;
 use Getopt::Long qw(:config no_ignore_case);
+use FindBin;
+use lib "$FindBin::Bin/lib";
+use S2X::Vdmos qw(vdmos_subckt);   # shared VDMOS macromodel synthesis
 
 my ($opt_output, $opt_lib, $opt_no_lib, $opt_verbose, $opt_help);
 GetOptions(
@@ -192,80 +195,8 @@ sub _lt_sanitize_model_params {
     return $p;
 }
 
-# Engineering-notation value -> plain number (for baking into expressions).
-sub _eng2num {
-    my ($v) = @_;
-    return undef unless defined $v;
-    $v =~ s/\xc2\xb5/u/; $v =~ s/\xb5/u/;
-    return $1 * 1 if $v =~ /^([-+]?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?)$/i;
-    if ($v =~ /^([-+]?(?:\d+\.?\d*|\.\d+))(meg|mil|[tgkmunpf])[a-z]*$/i) {
-        my %m = (t=>1e12, g=>1e9, meg=>1e6, k=>1e3, mil=>25.4e-6,
-                 m=>1e-3, u=>1e-6, n=>1e-9, p=>1e-12, f=>1e-15);
-        return $1 * $m{ lc $2 };
-    }
-    return undef;
-}
-
-# Synthesize a behavioral subckt for an LTspice VDMOS model (Xyce has no
-# VDMOS device). Same analytical form validated against QSPICE64 gold in
-# qspice2xyce.pl (QSPICE inherited LTspice's VDMOS): smooth subthreshold
-# Kp*Ks^2*ln(1+exp(Vov/Ks))^2, standard triode (default exponent 2 -- the
-# QSPICE-gold finding; LTspice native gold via ltz will confirm), Lambda CLM,
-# body diode, fixed Cgs/Cgdmin, Rd/Rs/Rg, pchan folding. The interim
-# destination is PyMS Verilog-A (see qspice_va/, blocked on the class-'e'
-# linkage); this keeps parity with the QSPICE path meanwhile.
-sub _vdmos_subckt {
-    my ($name, $params, $warnings) = @_;
-    my %p;
-    $p{ lc $1 } = $2 while $params =~ /(\w+)\s*=\s*(\S+)/g;
-    my $pchan = ($params =~ /\bpchan\b/i) ? 1 : 0;
-    my $pol = $pchan ? -1 : 1;
-
-    my $num = sub { my ($k, $d) = @_; my $n = _eng2num($p{$k}); defined $n ? $n : $d };
-    my $vto = abs($num->('vto', 2));
-    my $kp  = $num->('kp', 10);
-    my $lam = $num->('lambda', 0);
-    my $rd  = $num->('rd', 0) || 1e-6;
-    my $rs  = $num->('rs', 0) || 1e-6;
-    my $rg  = $num->('rg', 0) || 1e-6;
-    my $mt  = $num->('mtriode', 2);
-    my $ks  = $num->('ksubthres', 0.1);
-    my $cgs = $num->('cgs', 0);
-    my $cgdmin = $num->('cgdmin', 0);
-    my $is  = $num->('is', 1e-14);
-    my $nd  = $num->('n', 1);
-    my $rb  = $num->('rb', 0);
-    my $cjo = $num->('cjo', 0);
-
-    my $U = uc $name;
-    my $S = $pol > 0 ? '' : '-';
-    my $vgs = $pol > 0 ? 'V(gi,si)' : 'V(si,gi)';
-    my $vds = $pol > 0 ? 'V(di,si)' : 'V(si,di)';
-    my $vov = sprintf '(%s-%.6g)', $vgs, $vto;
-    my $kpks2 = sprintf '%.6g', $kp * $ks * $ks;
-    my $sub_t = sprintf '%s*ln(1+exp(%s/%.6g))*ln(1+exp(%s/%.6g))', $kpks2, $vov, $ks, $vov, $ks;
-    my $tri_t = sprintf '%.6g*(%s*%s-0.5*pow(max(%s,0),%.6g)*pow(max(%s,0),%.6g))*(1+%.6g*%s)',
-                        $kp, $vov, $vds, $vds, $mt, $vov, 2 - $mt, $lam, $vds;
-    my $sat_t = sprintf '0.5*%.6g*%s*%s*(1+%.6g*%s)', $kp, $vov, $vov, $lam, $vds;
-    my $ich = sprintf 'IF(%s<=0,%s,IF(%s<%s,%s,%s))', $vov, $sub_t, $vds, $vov, $tri_t, $sat_t;
-
-    my ($ba, $bk) = $pol > 0 ? ('si', 'di') : ('di', 'si');
-    my $bd_rs = $rb > 0 ? sprintf(' RS=%.6g', $rb) : '';
-    my $bd_cj = $cjo > 0 ? sprintf(' CJO=%.6g', $cjo) : '';
-
-    my $txt = "* [ltz] VDMOS $name synthesized macromodel (" . ($pchan ? 'P' : 'N') . "-channel)\n";
-    $txt .= ".SUBCKT LTZ_VDMOS_$U d g s\n";
-    $txt .= sprintf "Rdd d di %.6g\n", $rd;
-    $txt .= sprintf "Rgg g gi %.6g\n", $rg;
-    $txt .= sprintf "Rss si s %.6g\n", $rs;
-    $txt .= "Bch di si I={$S($ich)}\n";
-    $txt .= ".model LTZ_VDMOS_${U}_BD D(IS=" . sprintf('%.6g', $is) . " N=" . sprintf('%.6g', $nd) . "$bd_rs$bd_cj)\n";
-    $txt .= "Dbd $ba $bk LTZ_VDMOS_${U}_BD\n";
-    $txt .= sprintf "Cq_gs gi si %.6g\n", $cgs    if $cgs > 0;
-    $txt .= sprintf "Cq_gd gi di %.6g\n", $cgdmin if $cgdmin > 0;
-    $txt .= ".ENDS LTZ_VDMOS_$U\n";
-    return $txt;
-}
+# (VDMOS macromodel synthesis moved to the shared S2X::Vdmos module --
+#  vdmos_subckt(), also used by simetrix2xyce.pl / simetrix_cosim.pl)
 
 # Decide whether a .PRINT/.PLOT body's leading analysis-type token matches an
 # analysis actually present in the deck. LTspice decks sometimes carry a
@@ -685,7 +616,7 @@ sub cir_to_xyce {
                 next unless $deck_text =~ /\b\Q$name\E\b/i;
                 $seen{ uc $name } = 1;
                 if ($type =~ /^VDMOS$/i) {
-                    push @extracted, _vdmos_subckt($name, $params, \@warnings);
+                    push @extracted, vdmos_subckt($name, $params);
                     $vdmos_models{ uc $name } = 1;
                     push @changes, "synthesized VDMOS macromodel LTZ_VDMOS_\U$name\E";
                     next;
