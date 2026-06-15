@@ -17,6 +17,9 @@
 use strict;
 use warnings;
 use Getopt::Long;
+use FindBin;
+use lib "$FindBin::Bin/lib";
+use S2X::Vdmos qw(vdmos_subckt);   # shared LEVEL=17 -> VDMOS macromodel
 
 my $opt_out;
 my $verbose;
@@ -38,12 +41,49 @@ for my $l (@lines) {
         if $l =~ /^\s*\.model\s+(\S+)\s+(d_\w+|adc_\w+|dac_\w+|a\w+_bridge)\b/i;
 }
 
+# Pass 1b: detect power-MOSFET models (NMOS/PMOS LEVEL=17, e.g. the IRFR420)
+# and synthesize a VDMOS macromodel subckt for each -- Xyce can't build a
+# LEVEL=17 model card. The M instances referencing them are rewritten M -> X.
+my %vdmos;   # lc model name -> macromodel .SUBCKT text
+{
+    my ($nm, $type, $txt);
+    my $finish = sub {
+        return unless defined $nm;
+        $vdmos{$nm} = vdmos_subckt($nm, $txt, $type eq 'pmos')
+            if $txt =~ /\bLEVEL\s*=\s*17\b/i;
+        $nm = undef;
+    };
+    for my $l (@lines) {
+        if ($l =~ /^\s*\.model\s+(\S+)\s+([np]mos)\b(.*)$/i) {
+            $finish->(); ($nm, $type, $txt) = (lc $1, lc $2, $3);
+        }
+        elsif (defined $nm && $l =~ /^\s*\+\s*(.*)$/) { $txt .= ' ' . $1; }
+        else { $finish->(); }
+    }
+    $finish->();
+}
+
+my $drop_model = 0;   # inside a remapped LEVEL=17 .model card (skip its "+" lines)
 for my $raw (@lines) {
     (my $s = $raw) =~ s/^\s+|\s+$//g;
 
     if (!length $s)            { push @out, ""; next; }
     if ($s =~ /^\*#SIMETRIX/)  { push @out, "* [s2x] $s"; next; }   # tool marker
     if ($s =~ /^\*/)           { push @out, $s; next; }             # comment
+
+    # LEVEL=17 power-MOSFET remap: drop the .model card (+ its "+" lines; the
+    # macromodel subckt is emitted up front) and rewrite the M instances to X.
+    if ($drop_model && $s =~ /^\+/) { next; }
+    $drop_model = 0;
+    if ($s =~ /^\.model\s+(\S+)\s+[np]mos\b/i && $vdmos{ lc $1 }) {
+        push @changes, "LEVEL=17 .model $1 -> VDMOS macromodel";
+        $drop_model = 1; next;
+    }
+    if ($s =~ /^M(\S*)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)/i && $vdmos{ lc $6 }) {
+        push @out, "XM$1 $2 $3 $4 LTZ_VDMOS_" . uc($6);
+        push @changes, "M$1 -> XM$1 (VDMOS $6)";
+        next;
+    }
 
     # .GRAPH <node> ... : SIMetrix probe directive. Collect the probed node
     # for a consolidated .PRINT; drop the directive.
@@ -106,7 +146,17 @@ if (@prints) {
 my $ofh;
 if (defined $opt_out) { open $ofh, '>', $opt_out or die "$0: cannot write $opt_out: $!\n"; }
 else { $ofh = \*STDOUT; }
-print {$ofh} "$_\n" for @out;
+# emit any synthesized VDMOS macromodels at top level, just after the title
+# line (line 1 is the SPICE title and is ignored), so M->X instances resolve.
+if (%vdmos) {
+    my $start = (@out && $out[0] =~ /^\*/) ? 1 : 0;
+    print {$ofh} "$out[$_]\n" for 0 .. $start - 1;
+    print {$ofh} $vdmos{$_}   for sort keys %vdmos;
+    print {$ofh} "$out[$_]\n" for $start .. $#out;
+}
+else {
+    print {$ofh} "$_\n" for @out;
+}
 close $ofh if defined $opt_out;
 
 # Catalog to stderr: the A-device code models = the VHDL primitive library scope

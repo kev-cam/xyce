@@ -18,6 +18,9 @@
 use strict;
 use warnings;
 use Getopt::Long;
+use FindBin;
+use lib "$FindBin::Bin/lib";
+use S2X::Vdmos qw(vdmos_subckt);   # shared LEVEL=17 -> VDMOS macromodel
 
 my $base = 'cosim';
 GetOptions('o=s' => \$base) or die "usage: $0 -o base in.net\n";
@@ -95,53 +98,8 @@ sub _genmap {
     return join(", ", @g);
 }
 
-# Synthesize a behavioral subckt macromodel for a power-MOSFET .model (SIMetrix
-# NMOS/PMOS LEVEL=17 -- the IRFR420 etc., same family as the LTspice VDMOS;
-# Xyce's native VDMOS is a different LEVEL=18 academic model with none of these
-# params). Ported from ltspice2xyce.pl _vdmos_subckt (validated vs QSPICE gold):
-# smooth subthreshold + triode + saturation Bch, body diode, Cgs/Cgd, Rd/Rs/Rg.
-sub _vdmos_subckt {
-    my ($name, $params, $pchan) = @_;
-    my %p; $p{ lc $1 } = $2 while $params =~ /(\w+)\s*=\s*([^\s)]+)/g;
-    my $pol = $pchan ? -1 : 1;
-    my $num = sub { my ($k, $d) = @_; my $n = _spice_num($p{$k}); defined $n ? $n : $d };
-    my $vto = abs($num->('vto', 2));
-    my $kp  = $num->('kp', 10);
-    my $lam = $num->('lambda', 0);
-    my $rd  = $num->('rd', 0) || 1e-6;
-    my $rs  = $num->('rs', 0) || 1e-6;
-    my $rg  = $num->('rg', 0) || 1e-6;
-    my $mt  = $num->('mtriode', 2);
-    my $ks  = $num->('ksubthres', 0.1);
-    my $cgs = $num->('cgs', 0);
-    my $cgdmin = $num->('cgdmin', 0);
-    my $is  = $num->('is', 1e-14);
-    my $nd  = $num->('n', 1);
-    my $U = uc $name;
-    my $S = $pol > 0 ? '' : '-';
-    my $vgs = $pol > 0 ? 'V(gi,si)' : 'V(si,gi)';
-    my $vds = $pol > 0 ? 'V(di,si)' : 'V(si,di)';
-    my $vov = sprintf '(%s-%.6g)', $vgs, $vto;
-    my $kpks2 = sprintf '%.6g', $kp * $ks * $ks;
-    my $sub_t = sprintf '%s*ln(1+exp(%s/%.6g))*ln(1+exp(%s/%.6g))', $kpks2, $vov, $ks, $vov, $ks;
-    my $tri_t = sprintf '%.6g*(%s*%s-0.5*pow(max(%s,0),%.6g)*pow(max(%s,0),%.6g))*(1+%.6g*%s)',
-                        $kp, $vov, $vds, $vds, $mt, $vov, 2 - $mt, $lam, $vds;
-    my $sat_t = sprintf '0.5*%.6g*%s*%s*(1+%.6g*%s)', $kp, $vov, $vov, $lam, $vds;
-    my $ich = sprintf 'IF(%s<=0,%s,IF(%s<%s,%s,%s))', $vov, $sub_t, $vds, $vov, $tri_t, $sat_t;
-    my ($ba, $bk) = $pol > 0 ? ('si', 'di') : ('di', 'si');
-    my $txt = "* [s2x] VDMOS $name macromodel (" . ($pchan ? 'P' : 'N') . "-channel, from LEVEL=17)\n";
-    $txt .= ".SUBCKT LTZ_VDMOS_$U d g s\n";
-    $txt .= sprintf "Rdd d di %.6g\n", $rd;
-    $txt .= sprintf "Rgg g gi %.6g\n", $rg;
-    $txt .= sprintf "Rss si s %.6g\n", $rs;
-    $txt .= "Bch di si I={$S($ich)}\n";
-    $txt .= ".model LTZ_VDMOS_${U}_BD D(IS=" . sprintf('%.6g', $is) . " N=" . sprintf('%.6g', $nd) . ")\n";
-    $txt .= "Dbd $ba $bk LTZ_VDMOS_${U}_BD\n";
-    $txt .= sprintf "Cq_gs gi si %.6g\n", $cgs    if $cgs > 0;
-    $txt .= sprintf "Cq_gd gi di %.6g\n", $cgdmin if $cgdmin > 0;
-    $txt .= ".ENDS LTZ_VDMOS_$U\n";
-    return $txt;
-}
+# (power-MOSFET LEVEL=17 -> VDMOS macromodel lives in S2X::Vdmos, shared with
+#  simetrix2xyce.pl -- see vdmos_subckt())
 
 # XSPICE code model -> (VHDL entity, kind). kind: logic | a2d(adc) | d2a(dac)
 my %MAP = (
@@ -201,7 +159,7 @@ my %vdmos;   # lc model name -> macromodel .SUBCKT text
     my ($nm, $type, $txt);
     my $finish = sub {
         return unless defined $nm;
-        $vdmos{$nm} = _vdmos_subckt($nm, $txt, $type eq 'pmos')
+        $vdmos{$nm} = vdmos_subckt($nm, $txt, $type eq 'pmos')
             if $txt =~ /\bLEVEL\s*=\s*17\b/i;
         $nm = undef;
     };
