@@ -29,12 +29,70 @@ open my $fh, '<', $in or die "cannot read $in: $!\n";
 my @lines = map { s/\r?\n$//r } <$fh>;
 close $fh;
 
-# map .model <name> <codemodel> [params]
+# map .model <name> <codemodel> [params], accumulating "+ ..." continuation
+# lines so multi-line bridge cards (adc_bridge/dac_bridge) are captured whole.
 my (%amodel, %aparams);
-for my $l (@lines) {
-    next unless $l =~ /^\s*\.model\s+(\S+)\s+(d_\w+|adc_\w+|dac_\w+)\b\s*(.*)$/i;
-    $amodel{ lc $1 } = lc $2;
-    $aparams{ lc $1 } = $3;
+{
+    my $cur;
+    for my $l (@lines) {
+        if ($l =~ /^\s*\.model\s+(\S+)\s+(d_\w+|adc_\w+|dac_\w+)\b\s*(.*)$/i) {
+            $cur = lc $1; $amodel{$cur} = lc $2; $aparams{$cur} = $3;
+        }
+        elsif (defined $cur && $l =~ /^\s*\+\s*(.*)$/) {
+            $aparams{$cur} .= ' ' . $1;
+        }
+        else { $cur = undef; }
+    }
+}
+
+# --- bridge/gate model generics -> VHDL entity generics --------------------
+# Each entry: VHDL generic => [ SIMetrix .model param, kind ]. kind 'real'
+# emits a VHDL real literal; 'time' converts a SPICE delay to a fs time literal.
+my %GENMAP = (
+    xsp_d_inverter => { RISE_DELAY=>['rise_delay','time'], FALL_DELAY=>['fall_delay','time'] },
+    xsp_d_buffer   => { RISE_DELAY=>['rise_delay','time'], FALL_DELAY=>['fall_delay','time'] },
+    xsp_d_nand     => { DELAY=>['rise_delay','time'] },
+    xsp_d_or       => { DELAY=>['rise_delay','time'] },
+    xsp_d_tff      => { DELAY=>['rise_delay','time'] },
+    xsp_adc_bridge => { IN_LOW=>['in_low','real'], IN_HIGH=>['in_high','real'],
+                        RISE_DELAY=>['rise_delay','time'], FALL_DELAY=>['fall_delay','time'] },
+    xsp_adc_schmitt=> { IN_LOW=>['in_low','real'], IN_HIGH=>['in_high','real'] },
+    xsp_dac_bridge => { OUT_LOW=>['out_low','real'], OUT_HIGH=>['out_high','real'],
+                        T_RISE=>['t_rise','time'], T_FALL=>['t_fall','time'] },
+);
+
+# SPICE number (with engineering suffix) -> plain float.
+sub _spice_num {
+    my $s = shift;
+    return undef unless defined $s
+        && $s =~ /^\s*([-+]?[\d.]+(?:[eE][-+]?\d+)?)\s*([a-zA-Z]*)\s*$/;
+    my ($v, $suf) = ($1, lc $2);
+    my $mul = 1;
+    if    ($suf =~ /^meg/)          { $mul = 1e6; }
+    elsif ($suf =~ /^([fpnumkgt])/) {
+        my %M = (f=>1e-15, p=>1e-12, n=>1e-9, u=>1e-6, m=>1e-3, k=>1e3, g=>1e9, t=>1e12);
+        $mul = $M{$1};
+    }
+    return $v * $mul;
+}
+sub _vhdl_real { my $v = "" . shift; $v .= ".0" if $v =~ /^-?\d+$/; return $v; }
+sub _vhdl_time { return sprintf("%.0f fs", (shift) * 1e15); }   # seconds -> fs literal
+
+# Build a VHDL "generic map(...)" body for an entity from its .model params,
+# or '' if none apply.
+sub _genmap {
+    my ($ent, $params) = @_;
+    my $spec = $GENMAP{$ent} or return '';
+    return '' unless defined $params && length $params;
+    my @g;
+    for my $gen (sort keys %$spec) {
+        my ($pname, $kind) = @{ $spec->{$gen} };
+        next unless $params =~ /\b\Q$pname\E\s*=\s*(\S+)/i;
+        my $num = _spice_num($1);
+        next unless defined $num;
+        push @g, "$gen => " . ($kind eq 'time' ? _vhdl_time($num) : _vhdl_real($num));
+    }
+    return join(", ", @g);
 }
 
 # XSPICE code model -> (VHDL entity, kind). kind: logic | a2d(adc) | d2a(dac)
@@ -88,8 +146,10 @@ my $BR = 'libcosim_bridge.so:nvc_bridge_init';
 my %ad = map { _adline($_) => $_ } @adev;
 open my $cir, '>', "$base.cir" or die;
 print $cir "* [s2x cosim] Xyce deck: analog + in-place code: PWL boundaries\n";
+my $drop_model = 0;   # inside a dropped code-model .model card (skip its "+" lines)
 for my $l (@lines) {
     if (my $a = $ad{$l}) {                          # an A-device, in whatever scope
+        $drop_model = 0;
         my $kind = $a->{map} ? $a->{map}[1] : 'logic';
         if ($kind eq 'a2d') {                       # adc_bridge: Xyce node -> nvc
             my $n = _flat($a->{nodes}[0]);
@@ -100,8 +160,7 @@ for my $l (@lines) {
             # g_pulldown); an IDEAL voltage source driving nonlinear analog
             # (e.g. a BJT base) collapses the transient timestep. Drive an
             # internal node and add a series output resistance R = 1/g_pullup
-            # if the model gives one, else a nominal 50 ohm. n.b. multi-line
-            # .model continuations aren't parsed, so most fall to the default.
+            # (from the model card, continuation lines included) else 50 ohm.
             my $p = $aparams{ lc $a->{model} } // '';
             my $g = ($p =~ /g_pullup\s*=\s*([\d.eE+-]+)/i) ? $1 : 0;
             my $r = ($g > 0) ? 1.0 / $g : 50;
@@ -112,7 +171,10 @@ for my $l (@lines) {
         }
         next;
     }
-    next if $l =~ /^\s*\.model\s+\S+\s+(d_\w+|adc_\w+|dac_\w+)\b/i;
+    # drop code-model .model cards AND their "+" continuation lines
+    if ($drop_model && $l =~ /^\s*\+/) { next; }
+    if ($l =~ /^\s*\.model\s+\S+\s+(d_\w+|adc_\w+|dac_\w+)\b/i) { $drop_model = 1; next; }
+    $drop_model = 0;
     if ($l =~ /^\.GRAPH\s+(\S+)/i) { print $cir ".PRINT TRAN V($1)\n"; }
     # SIMetrix allows a single-arg ".tran <tstop>" (auto step); Xyce's .TRAN
     # needs <tstep> <tstop>. Inject a nominal step = tstop/10000 (the cosim
@@ -196,8 +258,12 @@ for my $a (@adev) {
         # scalar entities: map ports positionally by entity convention
         $pm = _scalar_portmap($ent, \@flat);
     }
-    push @body, sprintf("    u%d: entity s2x.%s(rtl) port map( %s );",
-                        $idx++, $ent, $pm);
+    # propagate the .model params (thresholds, delays, levels) onto the entity
+    # generics; defaults apply for anything not given on the card.
+    my $gm = _genmap($ent, $aparams{ lc $a->{model} });
+    my $gmap = $gm ? "generic map( $gm ) " : "";
+    push @body, sprintf("    u%d: entity s2x.%s(rtl) %sport map( %s );",
+                        $idx++, $ent, $gmap, $pm);
 }
 print $vhd "    signal sig_$_ : resolved_logic3da;\n" for sort keys %sig;
 print $vhd "$_\n" for @busdecls;
