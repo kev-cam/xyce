@@ -71,6 +71,13 @@ my @text;
 while ($blob =~ /^Text\s+value="((?:[^"\\]|\\.)*)"/mg) { push @text, unesc($1); }
 my %subckt;
 for my $t (@text) { $subckt{$1} = 1 while $t =~ /^\s*\.subckt\s+(\S+)/img; }
+# XSPICE code-model names (.model <name> d_*/adc_*/dac_*) -> instances using
+# them netlist as A-devices (A$<ref> <nodes> <model>), per SIMetrix.
+my %codemodel;
+for my $t (@text) {
+    $codemodel{ lc $1 } = 1
+        while $t =~ /^\s*\.model\s+(\S+)\s+(?:d_\w+|adc_\w+|dac_\w+|a\w+_bridge)\b/img;
+}
 
 # 3. Expand each instance's template into a netlist line.
 # Connectivity comes from Netnames (pinN -> net); the symbol (if embedded)
@@ -89,13 +96,15 @@ for my $i (@inst) {
     next if $sn =~ /^(gnd|ground|0|node)$/i;
     next if $sn =~ /free_text|text|annotation|title|comment/i;
 
-    # an instance whose "value" names a .subckt netlists as X<ref> (SIMetrix
-    # writes X$<ref>; simetrix2xyce.pl strips the '$').
+    # classify by the instance "value": a .subckt name -> X$<ref>; an XSPICE
+    # code-model name -> A$<ref> (digital); else a plain device.
     my $mv = defined $p->{value} ? $p->{value} : '';
     my $is_sub = length $mv && $subckt{$mv};
+    my $is_a   = length $mv && $codemodel{ lc $mv };
 
     my $s = $sym{$sn};
     my $t = ($s && defined $s->{tmpl} && length $s->{tmpl}) ? $s->{tmpl}
+          : $is_a   ? 'A$<ref> <nodelist> <value>'   # XSPICE digital A-device
           : $is_sub ? 'X$<ref> <nodelist> <value>'   # subckt instance
           :           '<ref> <nodelist> <value>';     # default device template
 
