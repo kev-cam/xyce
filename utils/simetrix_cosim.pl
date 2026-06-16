@@ -34,19 +34,23 @@ close $fh;
 
 # map .model <name> <codemodel> [params], accumulating "+ ..." continuation
 # lines so multi-line bridge cards (adc_bridge/dac_bridge) are captured whole.
-my (%amodel, %aparams);
-{
-    my $cur;
-    for my $l (@lines) {
+sub parse_models {
+    my $lines = shift;
+    my (%am, %ap); my $cur;
+    for my $l (@$lines) {
         if ($l =~ /^\s*\.model\s+(\S+)\s+(d_\w+|adc_\w+|dac_\w+)\b\s*(.*)$/i) {
-            $cur = lc $1; $amodel{$cur} = lc $2; $aparams{$cur} = $3;
+            $cur = lc $1; $am{$cur} = lc $2; $ap{$cur} = $3;
         }
-        elsif (defined $cur && $l =~ /^\s*\+\s*(.*)$/) {
-            $aparams{$cur} .= ' ' . $1;
-        }
+        elsif (defined $cur && $l =~ /^\s*\+\s*(.*)$/) { $ap{$cur} .= ' ' . $1; }
         else { $cur = undef; }
     }
+    return (\%am, \%ap);
 }
+my ($am_ref, $ap_ref) = parse_models(\@lines);
+auto_bridge(\@lines, $am_ref);                 # insert adc/dac at analog<->digital boundaries
+($am_ref, $ap_ref) = parse_models(\@lines);    # re-parse (auto_bridge may add bridge models)
+my %amodel  = %$am_ref;
+my %aparams = %$ap_ref;
 
 # --- bridge/gate model generics -> VHDL entity generics --------------------
 # Each entry: VHDL generic => [ SIMetrix .model param, kind ]. kind 'real'
@@ -326,4 +330,102 @@ sub _scalar_portmap {
     return "a => sig_$n->[0], d => sig_$n->[1]"    if $ent =~ /adc/;   # analog in, digital out
     return "d => sig_$n->[0], a => sig_$n->[1]"    if $ent =~ /dac/;   # digital in, analog out
     return join(", ", map { "p$_ => sig_$n->[$_]" } 0 .. $#$n);
+}
+
+# auto_bridge — SIMetrix doesn't place explicit adc/dac bridge instances; it
+# bridges analog<->digital boundaries implicitly (by signal family). Replicate
+# that: classify every net, find boundary nets (a digital-gate net that's also
+# touched by an analog device or a probe), and splice in the bridge with net
+# splitting. adc (analog drives a gate input) gets a series R on its analog
+# input to dodge the cosim's ideal-voltage-source-on-A2D-node issue; dac
+# (gate output read by analog) gets the D2A series-R from the main pass.
+sub auto_bridge {
+    my ($lines, $amodel) = @_;
+    my %is_gate = map { $_ => 1 }
+        qw(d_inverter d_buffer d_nand d_or d_tff d_pullup d_pulldown d_and d_nor);
+
+    my $parse_a = sub {                       # -> (\@flatnodes, type)
+        (my $body = shift) =~ s/^A\S*\s+//;
+        my $model = ($body =~ s/\s+(\S+)\s*$//) ? $1 : '';
+        my @flat;
+        while ($body =~ /\G\s*(?:\[([^\]]*)\]|(\S+))/gc) {
+            push @flat, defined $1 ? split(' ', $1) : $2;
+        }
+        return (\@flat, $amodel->{ lc $model } // lc $model);
+    };
+
+    my (%dig, %dig_out, %analog_tok, %probe, %explicit);
+    for my $l (@$lines) {
+        next if $l !~ /\S/ || $l =~ /^\s*\*/;
+        if ($l =~ /^A\S*\s/i) {
+            my ($f, $t) = $parse_a->($l);
+            if    ($t =~ /^adc_/) { $analog_tok{$f->[0]}=1; $dig{$f->[-1]}=1; $dig_out{$f->[-1]}=1; $explicit{$f->[0]}=1; }
+            elsif ($t =~ /^dac_/) { $dig{$f->[0]}=1; $analog_tok{$f->[-1]}=1; $explicit{$f->[-1]}=1; }
+            elsif ($is_gate{$t})  { $dig{$_}=1 for @$f; $dig_out{$f->[-1]}=1; }
+            else                  { $dig{$_}=1 for @$f; }
+            next;
+        }
+        if ($l =~ /^\.(?:graph|print|plot)\b/i) {
+            $probe{$1}=1 while $l =~ /\bV\((\w+)\)/gi;
+            $probe{$1}=1 if $l =~ /^\.graph\s+(\S+)/i;
+            next;
+        }
+        if ($l =~ /^[A-Za-z]/) {               # analog device line
+            my @t = split /\s+/, $l; shift @t;
+            $analog_tok{$_}=1 for @t;
+        }
+    }
+
+    my %bnd;                                   # net -> 'adc'|'dac'
+    for my $n (keys %dig) {
+        next if $explicit{$n};
+        next unless $analog_tok{$n} || $probe{$n};
+        $bnd{$n} = $dig_out{$n} ? 'dac' : 'adc';
+    }
+    return unless %bnd;
+
+    my ($adcm, $dacm);                          # reuse existing bridge models if any
+    for my $l (@$lines) {
+        $adcm = $1 if !$adcm && $l =~ /^\s*\.model\s+(\S+)\s+adc_(?:bridge|schmitt)\b/i;
+        $dacm = $1 if !$dacm && $l =~ /^\s*\.model\s+(\S+)\s+dac_bridge\b/i;
+    }
+    my @newmodels;
+    if (!$adcm && grep { $bnd{$_} eq 'adc' } keys %bnd) {
+        $adcm = 'auto_adc'; $amodel->{auto_adc} = 'adc_bridge';
+        push @newmodels, ".model auto_adc adc_bridge in_low=2 in_high=3";
+    }
+    if (!$dacm && grep { $bnd{$_} eq 'dac' } keys %bnd) {
+        $dacm = 'auto_dac'; $amodel->{auto_dac} = 'dac_bridge';
+        push @newmodels, ".model auto_dac dac_bridge out_low=0 out_high=5 g_pullup=0.024 g_pulldown=0.034";
+    }
+
+    my %rn = map { $_ => "${_}_d" } keys %bnd;  # digital-side rename (gate lines only)
+    my @ins;
+    for my $n (sort keys %bnd) {
+        if ($bnd{$n} eq 'adc') {
+            push @ins, "R_ab_$n $n ${n}_b 1k";
+            push @ins, "A_ab_adc_$n ${n}_b ${n}_d $adcm";
+        } else {
+            push @ins, "A_ab_dac_$n ${n}_d $n $dacm";
+        }
+    }
+
+    my @out; my $spliced = 0;
+    for my $l (@$lines) {
+        if ($l =~ /^A\S*\s/i) {
+            my (undef, $t) = $parse_a->($l);
+            if ($is_gate{$t}) {                 # rename boundary nets on the gate's digital side
+                for my $n (keys %rn) { $l =~ s/(?<![\w\$])\Q$n\E(?![\w\$])/$rn{$n}/g; }
+            }
+        }
+        if (!$spliced && $l =~ /^\s*\.(?:tran|ac|dc|end)\b/i) {
+            push @out, @ins, @newmodels; $spliced = 1;
+        }
+        push @out, $l;
+    }
+    push @out, @ins, @newmodels unless $spliced;
+    @$lines = @out;
+    print STDERR "auto_bridge: inserted "
+        . scalar(grep { $bnd{$_} eq 'adc' } keys %bnd) . " adc + "
+        . scalar(grep { $bnd{$_} eq 'dac' } keys %bnd) . " dac bridge(s)\n";
 }
