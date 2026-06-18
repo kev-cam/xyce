@@ -1798,7 +1798,7 @@ PWLinDynData::PWLinDynData(const DeviceEntity & device, const std::vector<Param>
     BridgeFn     = NoConnection; // fail later
     BridgeFnData = NULL;
     next_bp      = 0.0;
-    
+
     for ( ; iter != last; ++iter)
     {
         const std::string & tmpname = iter->tag();
@@ -2082,16 +2082,55 @@ bool PWLinData::updateSource()
 //-----------------------------------------------------------------------------
 bool PWLinDynData::updateSource()
 {
+    // Clear before the bridge call so each evaluation re-predicts from scratch:
+    // the cosim probe (a2d_callback) calls addBreak(next_bp) with the time the
+    // analog node is expected to next move ~A2D_DV volts (from its dV/dt).  That
+    // prediction is then consumed by getMaxTimeStepSize()/getBreakPoints() to
+    // pull the next analog step in to the crossing -- "before acceptance any
+    // model can cut the acceptance time back."  (Kevin Cameron's original
+    // "should maybe pull step in here" TODO, now realised via the step/BP hooks
+    // rather than from inside the load.)
+    next_bp = -1;
     CallBridge(Update,&TVVEC);
     bool sts = PWLinData::updateSource();
 
-    if (next_bp > 0) {
-        // double time = getTime_();
-        // should maybe pull step in here
-        next_bp = -1;
-    }
-    
     return sts;
+}
+
+//-----------------------------------------------------------------------------
+// Function      : PWLinDynData::getMaxTimeStepSize
+// Purpose       : Cap the analog step so it cannot stride past the cosim
+//                 probe's predicted A2D crossing (next_bp).  A linear analog
+//                 ramp has ~zero local truncation error, so without this the
+//                 integrator strides the whole transition in a single step and
+//                 the digital side only sees the endpoints.  Overshooting the
+//                 crossing by a small amount is expected of an analog solver
+//                 (cf. Verilog-AMS last_crossing()); this just keeps the step
+//                 from overshooting by a lot.
+// Creator       : Kevin Cameron / cosim
+//-----------------------------------------------------------------------------
+// Floor on the distance-to-crossing that may cap the step (seconds).  File
+// static (NOT a class member) so PWLinDynData's sizeof/ABI is unchanged and we
+// need not recompile every TU that allocates it.  Override via COSIM_A2D_DTMIN.
+static double dyn_bp_floor()
+{
+  static double v = -1.0;
+  if (v < 0.0) { const char *e = getenv("COSIM_A2D_DTMIN"); v = e ? atof(e) : 1.0e-9; }
+  return v;
+}
+
+double PWLinDynData::getMaxTimeStepSize ()
+{
+  // Cap the step so it reaches the predicted crossing -- but ONLY while that is
+  // still a meaningful distance away.  When the step has essentially arrived at
+  // next_bp (currTime ~ next_bp), returning the tiny remainder would collapse
+  // the step to ~0 and, with the breakpoint already landing the step there,
+  // spiral into thousands of sub-ns steps.  Below the floor, defer to the
+  // default and let the breakpoint do the landing (small overshoot is fine).
+  double dt = next_bp - solState_.currTime_;
+  if (dt > dyn_bp_floor())
+    return dt;
+  return SourceData::getMaxTimeStepSize();
 }
 
 //-----------------------------------------------------------------------------
@@ -2360,6 +2399,13 @@ bool PWLinDynData::getBreakPoints
       }
       preComputedBreakpointsDone = true;
   }
+
+  // NB: the dynamic crossing prediction (next_bp, set by addBreak() in the
+  // bridge Update callback) is NOT pushed as a breakpoint here.  Emitting a
+  // fresh future breakpoint every step accumulates a dense cloud the integrator
+  // must hit one-by-one, collapsing the step.  Instead getMaxTimeStepSize()
+  // uses next_bp to *cap* the step (soft limit, no accumulation), which bounds
+  // the stride across a linear ramp without the breakpoint pile-up.
 
   return bsuccess;
 }

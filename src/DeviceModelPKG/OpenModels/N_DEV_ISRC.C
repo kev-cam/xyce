@@ -499,6 +499,23 @@ bool Instance::processParams ()
 }
 
 //-----------------------------------------------------------------------------
+// Function      : Instance::getMaxTimeStepSize
+// Purpose       : Delegate to the transient source data so a dynamic-PWL
+//                 (cosim probe) I-source can cap the analog step to its
+//                 predicted A2D crossing.  Mirrors VSRC::Instance.
+// Scope         : public
+//-----------------------------------------------------------------------------
+double Instance::getMaxTimeStepSize  ()
+{
+  double maxStep = 1.0e+100;
+  if (tranSourceData_ != 0)
+  {
+    maxStep = tranSourceData_->getMaxTimeStepSize ();
+  }
+  return maxStep;
+}
+
+//-----------------------------------------------------------------------------
 // Function      : Instance::~Instance
 // Purpose       : destructor
 // Special Notes :
