@@ -502,7 +502,8 @@ class PWLinDynData : public PWLinData
 
   virtual bool updateSource();
   virtual bool getBreakPoints( std::vector<Util::BreakPoint> & breakPointTimes);
-  
+  virtual double getMaxTimeStepSize();
+
   enum BridgeOP {
 # define BRIDGE_OP(o) o,
 # include "N_DEV_BridgeOp.inc"

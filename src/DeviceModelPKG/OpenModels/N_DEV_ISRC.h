@@ -165,6 +165,12 @@ public:
 
   bool processParams ();
 
+  // Let a dynamic-PWL (cosim probe) I-source cap the analog timestep to its
+  // predicted A2D crossing, mirroring VSRC.  The base DeviceInstance reports
+  // maxTimeStepSupported()==false, which would otherwise skip the I-source.
+  double getMaxTimeStepSize ();
+  virtual bool maxTimeStepSupported () {return true;};
+
   bool updateIntermediateVars () { return true; }
   bool updatePrimaryState () { return true; }
 
