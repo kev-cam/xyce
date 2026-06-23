@@ -51,6 +51,7 @@
 // ----------   Xyce Includes   ----------
 
 #include <N_PDS_EpetraMPIComm.h>
+#include <N_PDS_ShmComm.h>
 
 #include <N_ERH_ErrorMgr.h>
 #include <N_UTL_FeatureTest.h>
@@ -76,7 +77,7 @@ EpetraMPIComm::EpetraMPIComm( int iargs,
 {
 #ifdef Xyce_PARALLEL_MPI
   createMPIComm( iargs, cargs );
-  petraComm_ = new Epetra_MpiComm( mpiComm_ );
+  petraComm_ = new ShmComm( mpiComm_ );   // shared-memory SumAll short-circuit
 #else
   petraComm_ = new Epetra_SerialComm();
 #endif
@@ -99,7 +100,7 @@ EpetraMPIComm::EpetraMPIComm( MPI_Comm comm )
   mpiCommOwned_(false)
 {
   mpiComm_ = comm;
-  petraComm_ = new Epetra_MpiComm( mpiComm_ );
+  petraComm_ = new ShmComm( mpiComm_ );   // shared-memory SumAll short-circuit
 
   isSerial_ = ( numProc() == 1 );
 }
