@@ -1230,7 +1230,12 @@ bool DeviceMgr::addDeviceModel(const ModelBlock & model_block)
   DeviceModel *device_model = device.addModel(model_block, factory_block);
 
   modelTypeMap_[model_block.getName()] = model_type;
-  modelGroupMap_[model_block.getName()] = model_group;
+  // A dynamically-registered device (ADMS/PyMS .HDL) may resolve a defined
+  // model type but an undefined model group; storing an undefined ModelTypeId
+  // here makes it a null type_index that later crashes std::map's operator<
+  // (type_info::before on a null type_). Fall back to model_type as the group,
+  // mirroring the model_group=model_type pattern used elsewhere in this file.
+  modelGroupMap_[model_block.getName()] = model_group.defined() ? model_group : model_type;
 
   // add the various model vectors:
   if (device_model != 0)
@@ -1494,7 +1499,10 @@ DeviceInstance * DeviceMgr::addDeviceInstance(
       nonPdeInstancePtrVec_.push_back(instance);
     }
 
-    modelGroupInstanceVector_[model_group].push_back(instance);
+    // Guard against an undefined model_group (dynamically-registered ADMS/PyMS
+    // devices may have none): an undefined ModelTypeId is a null type_index and
+    // crashes the map's operator< (type_info::before). model_type is defined here.
+    modelGroupInstanceVector_[model_group.defined() ? model_group : model_type].push_back(instance);
     modelTypeInstanceVector_[model_type].push_back(instance);
 
     // set up the independent source map.
