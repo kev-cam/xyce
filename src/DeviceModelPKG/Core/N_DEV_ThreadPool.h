@@ -1,19 +1,24 @@
 //-------------------------------------------------------------------------
 // N_DEV_ThreadPool.h
 //
-// A persistent, core-pinned, spin-based fork/join thread pool for the device
+// A persistent, core-pinned, PURE-SPIN fork/join thread pool for the device
 // per-instance load passes (e.g. Master::updateState). The device load is
 // ~76% of a large-circuit step and embarrassingly parallel (each instance's
 // updateIntermediateVars writes only its own members + its own per-instance
 // state-vector indices -- no shared-node contention), so we just partition the
 // instance loop across pinned threads.
 //
-// MPI is the wrong primitive on one node (message-multiplexed, sync/imbalance
-// bound). This uses pinned threads + a sense-reversing spin barrier (no futex),
-// the regime where the aggregate per-core L2 ("32 caches vs 1") pays.
+// Design (per dkc / the nvc model): workers SPIN, never sleep. The per-Newton-
+// iteration dispatch happens ~100k times per run; thread suspend/restart is
+// ~us and would dwarf a dispatch, so we trade a hot core for minimum response
+// time. The dispatch generation `gen_` is a single line workers only READ
+// (shared, no coherence storm); completion is signalled via PER-WORKER flags,
+// each padded onto its own cache line, so the barrier has NO contended shared
+// counter (a single fetch_add counter ping-pongs P-ways/dispatch).
 //
-// Enabled only when XYCE_DEVICE_THREADS > 1 (env). Default off => serial,
-// behaviour identical to before. Pin map fills physical cores first.
+// MPI is the wrong primitive on one node (message-multiplexed, sync/imbalance
+// bound). Enabled only when XYCE_DEVICE_THREADS > 1 (env); default off =>
+// serial, behaviour identical to before. Pin map fills physical cores first.
 //-------------------------------------------------------------------------
 
 #ifndef Xyce_N_DEV_ThreadPool_h
@@ -25,6 +30,7 @@
 #include <functional>
 #include <cstdlib>
 #include <cstddef>
+#include <cstdint>
 
 #if defined(__linux__)
 #include <sched.h>
@@ -54,11 +60,13 @@ public:
     if ( P_ <= 1 || n < (std::size_t) P_ * 64 ) { fn( 0, n ); return; }
     n_  = n;
     fn_ = &fn;
-    done_.store( 0, std::memory_order_relaxed );
-    gen_.fetch_add( 1, std::memory_order_release );      // dispatch to workers
+    std::uint64_t g = gen_.fetch_add( 1, std::memory_order_release ) + 1;  // dispatch
     fn( 0, part_hi( 0 ) );                               // main does partition 0
-    while ( done_.load( std::memory_order_acquire ) < P_ - 1 )
-      cpu_relax();
+    // Pure low-latency spin on per-worker flags (each its own cache line) --
+    // no contended shared counter, no sleep.
+    for ( int t = 1; t < P_; ++t )
+      while ( arrived_[t].v.load( std::memory_order_acquire ) < g )
+        cpu_relax();
   }
 
 private:
@@ -71,6 +79,7 @@ private:
       int hw = (int) std::thread::hardware_concurrency();
       if ( hw <= 0 ) hw = 1;
       if ( v < 1 ) v = 1; if ( v > hw ) v = hw;
+      if ( v > 64 ) v = 64;
       P_ = v;
     }
     pin_self( 0 );
@@ -112,7 +121,7 @@ private:
     std::uint64_t my = 0;
     for ( ;; )
     {
-      while ( gen_.load( std::memory_order_acquire ) == my )
+      while ( gen_.load( std::memory_order_acquire ) == my )       // spin: read-only
       {
         if ( stop_.load( std::memory_order_acquire ) ) return;
         cpu_relax();
@@ -120,14 +129,17 @@ private:
       my = gen_.load( std::memory_order_acquire );
       if ( stop_.load( std::memory_order_acquire ) ) return;
       (*fn_)( part_lo( t ), part_hi( t ) );
-      done_.fetch_add( 1, std::memory_order_release );
+      arrived_[t].v.store( my, std::memory_order_release );        // own cache line
     }
   }
+
+  // each worker's completion flag on its own cache line (no false sharing)
+  struct alignas(64) PadFlag { std::atomic<std::uint64_t> v{0}; };
 
   int P_;
   std::vector<std::thread> workers_;
   std::atomic<std::uint64_t> gen_{0};
-  std::atomic<int> done_{0};
+  PadFlag arrived_[64];
   std::atomic<bool> stop_{false};
   std::size_t n_{0};
   const std::function<void(std::size_t,std::size_t)> * fn_{nullptr};
