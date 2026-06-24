@@ -41,6 +41,7 @@
 #include <N_DEV_MOSFET1.h>
 #include <N_DEV_Const.h>
 #include <N_DEV_DeviceMgr.h>
+#include <N_DEV_ThreadPool.h>
 #include <N_DEV_DeviceOptions.h>
 #include <N_DEV_ExternData.h>
 #include <N_DEV_MatrixLoadData.h>
@@ -4240,11 +4241,19 @@ void Instance::loadErrorWeightMask ()
 //-----------------------------------------------------------------------------
 bool Master::updateState (double * solVec, double * staVec, double * stoVec)
 {
-  bool bsuccess = true;
+  std::atomic<bool> bsuccess(true);
 
-  for (InstanceVector::const_iterator it = getInstanceBegin(); it != getInstanceEnd(); ++it)
+  // SMP: the per-instance eval (updateIntermediateVars + writes to this
+  // instance's OWN state-vector indices) has no cross-instance contention, so
+  // partition the loop across core-pinned threads (XYCE_DEVICE_THREADS).
+  InstanceVector::const_iterator instBegin = getInstanceBegin();
+  std::size_t numInst = (std::size_t)(getInstanceEnd() - instBegin);
+  ThreadPool::instance().parallel_for(numInst,
+    [&](std::size_t threadLo, std::size_t threadHi)
   {
-    Instance & mi = *(*it);
+    for (std::size_t kInst = threadLo; kInst < threadHi; ++kInst)
+    {
+    Instance & mi = *(instBegin[kInst]);
     double * oldstaVec = mi.extData.currStaVectorRawPtr;
     double * stoVec = mi.extData.nextStoVectorRawPtr;
     double * oldstoVec = mi.extData.currStoVectorRawPtr;
@@ -4252,7 +4261,7 @@ bool Master::updateState (double * solVec, double * staVec, double * stoVec)
     double vgs1(0.0), vgd1(0.0), vbs1(0.0),vgb1(0.0), vds1(0.0);
 
     bool btmp = mi.updateIntermediateVars ();
-    bsuccess = bsuccess && btmp;
+    if (!btmp) bsuccess.store(false, std::memory_order_relaxed);
 
     // voltage drops:
     stoVec[mi.li_store_vbd] = mi.vbd;
@@ -4327,9 +4336,10 @@ bool Master::updateState (double * solVec, double * staVec, double * stoVec)
     // these charges were set in updateIntermediateVars
     staVec[mi.li_state_qbd] = mi.qbd;
     staVec[mi.li_state_qbs] = mi.qbs;
-  }
+    }
+  });
 
-  return bsuccess;
+  return bsuccess.load();
 }
 
 //-----------------------------------------------------------------------------
