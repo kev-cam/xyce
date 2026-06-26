@@ -38,6 +38,22 @@
 #
 #-------------------------------------------------------------------------
 
+# -------------------------------------------------------------------------
+# ADMS is DEPRECATED.  Both ADMS and PyMS compile the SAME Verilog-A -- the
+# difference is the compiler.  PyMS/VAE (xyce/utils/PyMS) is a GiNaC-based
+# just-in-time compiler that compiles PER INSTANCE, whereas ADMS/admsXml does
+# static whole-model C++ generation up front.  This legacy ADMS flow is no
+# longer maintained; refuse to run unless explicitly overridden via the
+# XYCE_ALLOW_ADMS environment variable.
+# -------------------------------------------------------------------------
+if [ -z "${XYCE_ALLOW_ADMS}" ]; then
+    echo "`basename $0`: ADMS is DEPRECATED -- use PyMS/VAE (xyce/utils/PyMS)." 1>&2
+    echo "    Same Verilog-A, different compiler: PyMS is a GiNaC-based just-in-time" 1>&2
+    echo "    compiler that compiles per instance (ADMS does static whole-model codegen)." 1>&2
+    echo "    Set XYCE_ALLOW_ADMS=1 to run the legacy (unmaintained) ADMS flow anyway." 1>&2
+    exit 1
+fi
+
 usage ()
 {
     echo "Usage: `basename $0` [options] <veriloginputfile>* destinationdirectory"
