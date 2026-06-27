@@ -587,33 +587,35 @@ class CodeGen:
         lines.append('}')
         lines.append('')
 
-        # --- vae_jacobian ---
+        # --- vae_jacobian: finite-difference of vae_eval ---
+        # An inline analytic stamp captures only ONE branch of a multi-regime
+        # if/else (the assignment to the contribution variable that survives to
+        # the contribution -- i.e. the LAST regime written), so it is wrong
+        # whenever the operating point sits in a non-final regime: e.g. a
+        # current mirror biased in saturation while the triode branch is last.
+        # Finite-differencing vae_eval makes dF/dV, dQ/dV track whichever regime
+        # is actually live at this bias, for ANY ordering of the branches.  The
+        # solution is unaffected (it is set by the exact eval/residual); only
+        # Newton's convergence rate depends on the Jacobian.
+        nb = max(n_branches, 1)
         lines.append(f'void vae_jacobian(VaeState* s, double* dFdV, double* dQdV) {{')
-        lines.append(f'    // dFdV[row * {self.n_nodes} + col], dQdV[row * {self.n_nodes} + col]')
-
-        # Branch voltage locals
-        for i, (p, q) in enumerate(pairs):
-            pi = self._node_index(p)
-            qi = self._node_index(q)
-            if q == 'gnd':
-                lines.append(f'    double V_{p} = s->V[{pi}];')
-            else:
-                lines.append(f'    double V_{p}_{q} = s->V[{pi}] - s->V[{qi}];')
-
-        # Hoisted model-variable declarations (mirrors vae_eval)
-        for v in self._eval_vars:
-            lines.append(f'    double {v} = 0.0;')
-        if self._eval_vars:
-            lines.append('')
-
-        lines.append(f'    memset(dFdV, 0, {n_branches} * {self.n_nodes} * sizeof(double));')
-        lines.append(f'    memset(dQdV, 0, {n_branches} * {self.n_nodes} * sizeof(double));')
-        lines.append('')
-
-        # Emit inline Jacobian body (mirrors eval structure with if/else)
-        for stmt in self.jac_stmts:
-            lines.append(stmt)
-        lines.append('}')
+        lines.append(f'    const int NB = {n_branches}, NN = {self.n_nodes};')
+        lines.append(f'    memset(dFdV, 0, NB * NN * sizeof(double));')
+        lines.append(f'    memset(dQdV, 0, NB * NN * sizeof(double));')
+        lines.append(f'    double F0[{nb}], Q0[{nb}], Fp[{nb}], Qp[{nb}];')
+        lines.append(f'    vae_eval(s, F0, Q0);')
+        lines.append(f'    for (int j = 0; j < NN; j++) {{')
+        lines.append(f'        double sv = s->V[j];')
+        lines.append(f'        double h = 1e-6 * (fabs(sv) + 1.0);')
+        lines.append(f'        s->V[j] = sv + h;')
+        lines.append(f'        vae_eval(s, Fp, Qp);')
+        lines.append(f'        s->V[j] = sv;')
+        lines.append(f'        for (int i = 0; i < NB; i++) {{')
+        lines.append(f'            dFdV[i * NN + j] = (Fp[i] - F0[i]) / h;')
+        lines.append(f'            dQdV[i * NN + j] = (Qp[i] - Q0[i]) / h;')
+        lines.append(f'        }}')
+        lines.append(f'    }}')
+        lines.append(f'}}')
         lines.append('')
 
         # --- Metadata ---
