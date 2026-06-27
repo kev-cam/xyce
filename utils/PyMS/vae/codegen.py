@@ -11,6 +11,7 @@ The generated code uses the VaeState struct for node voltages and parameters.
 
 from __future__ import annotations
 import re
+import sys
 from dataclasses import dataclass, field
 from typing import Optional
 import sympy
@@ -117,6 +118,11 @@ class CodeGen:
         self.eval_stmts: list[str] = []
         # C++ statements for jacobian body (emitted inline with contributions)
         self.jac_stmts: list[str] = []
+        # Names of model variables assigned in the body.  Declared once at
+        # function scope (not inline) so a variable written inside an if/else
+        # branch — e.g. ``id`` across cutoff/triode/saturation — is still in
+        # scope where the contributions read it after the branch closes.
+        self._eval_vars: list[str] = []
 
     def generate(self) -> str:
         """Generate complete C++ source file."""
@@ -145,23 +151,41 @@ class CodeGen:
     def _process_assign(self, node: ASTNode):
         cpp_expr = self._translate_expr(node.expr)
         sympy_expr = self._to_sympy(node.expr)
+        # Ensure the LHS has a sympy symbol so a later contribution that reads
+        # this variable (e.g. ``I(d,s) <+ id``) can substitute its expression
+        # and differentiate it.  Without this, an assigned-but-not-declared
+        # variable stays an opaque symbol and its Jacobian comes out zero.
+        self.var_syms.setdefault(node.lhs, sympy.Symbol(node.lhs, real=True))
         self.var_assignments[node.lhs] = sympy_expr
-        self.eval_stmts.append(f'    double {node.lhs} = {cpp_expr};')
-        self.jac_stmts.append(f'    double {node.lhs} = {cpp_expr};')
+        # Hoist the declaration (see self._eval_vars); assign without `double`
+        # so branch-local writes remain visible after the branch.
+        if node.lhs not in self._eval_vars:
+            self._eval_vars.append(node.lhs)
+        self.eval_stmts.append(f'    {node.lhs} = {cpp_expr};')
+        self.jac_stmts.append(f'    {node.lhs} = {cpp_expr};')
 
     def _process_contrib(self, node: ASTNode):
         expr_str = node.expr.strip()
-
-        # Check for ddt()
-        is_ddt = False
         inner_expr = expr_str
-        ddt_match = re.match(r'^ddt\s*\((.*)\)$', expr_str)
-        if ddt_match:
-            is_ddt = True
-            inner_expr = ddt_match.group(1).strip()
 
-        cpp_expr = self._translate_expr(inner_expr)
-        sympy_expr = self._to_sympy(inner_expr)
+        # Detect ddt() anywhere in the contribution, including the common
+        # scaled form ``cgs*ddt(V(g,s))``.  A bare ``^ddt(...)$`` regex misses
+        # the coefficient case and mis-routes the charge into the current (F)
+        # path, where differentiating the still-unparsed ddt() blows up the
+        # C printer (PrintMethodNotImplementedError: _print_Derivative_ddt).
+        # Use sympy instead: if ddt appears, the stamped charge is the whole
+        # expression with each ddt(arg) replaced by its argument (the
+        # contribution is treated as reactive — current = d/dt of that charge).
+        ddt_fn = sympy.Function('ddt')
+        full_sym = self._to_sympy(expr_str)
+        is_ddt = full_sym.has(ddt_fn)
+        if is_ddt:
+            charge_sym = self._substitute_vars(full_sym).replace(ddt_fn, lambda a: a)
+            cpp_expr = self._sympy_to_cpp(charge_sym)
+            sympy_expr = charge_sym
+        else:
+            cpp_expr = self._translate_expr(inner_expr)
+            sympy_expr = self._to_sympy(inner_expr)
 
         contrib = Contribution(
             kind=node.contrib_kind,
@@ -304,6 +328,12 @@ class CodeGen:
         # Clean up spacing
         result = re.sub(r'\s+', ' ', result).strip()
 
+        # Repair multi-char operators the upstream tokenizer split with a
+        # space ("vov < = 0" -> "vov <= 0"), which is a C++ syntax error.
+        for split, joined in (('< =', '<='), ('> =', '>='), ('= =', '=='),
+                              ('! =', '!='), ('& &', '&&'), ('| |', '||')):
+            result = result.replace(split, joined)
+
         return result
 
     def _to_sympy(self, expr: str) -> sympy.Expr:
@@ -368,11 +398,25 @@ class CodeGen:
             if define_name not in ns:
                 ns[define_name] = sympy.Symbol(define_name, real=True, positive=True)
 
+        # Verilog-A identifiers may collide with Python keywords (notably
+        # ``lambda`` for channel-length modulation).  sympify() parses through
+        # the Python tokenizer, which rejects the bare keyword, so alias it to
+        # a safe token bound to the SAME symbol — the symbol keeps its original
+        # name, so it still maps back to s->params[...] when printed to C++.
+        import keyword
+        for kw in [n for n in ns if keyword.iskeyword(n)]:
+            alias = '_kw_' + kw
+            s = re.sub(rf'\b{re.escape(kw)}\b', alias, s)
+            ns[alias] = ns[kw]
+
         try:
             return sympy.sympify(s, locals=ns)
-        except Exception:
-            # Can't parse — return a dummy symbol
-            return sympy.Symbol(f'__unparsed_{hash(s) % 10000}')
+        except Exception as e:
+            # Surface the failure: a silent dummy here yields a zero Jacobian
+            # that is very hard to trace back (the eval path still works).
+            sys.stderr.write(f"[codegen] WARNING: could not parse for "
+                             f"differentiation: {s!r} ({e})\n")
+            return sympy.Symbol(f'__unparsed_{abs(hash(s)) % 10000}')
 
     # --- Jacobian computation ---
 
@@ -525,6 +569,13 @@ class CodeGen:
                 lines.append(f'    double V_{p}_{q} = s->V[{pi}] - s->V[{qi}];')
         lines.append('')
 
+        # Hoisted model-variable declarations (assigned in the body below,
+        # possibly inside if/else branches)
+        for v in self._eval_vars:
+            lines.append(f'    double {v} = 0.0;')
+        if self._eval_vars:
+            lines.append('')
+
         # Zero output arrays
         lines.append(f'    memset(F, 0, {n_branches} * sizeof(double));')
         lines.append(f'    memset(Q, 0, {n_branches} * sizeof(double));')
@@ -548,6 +599,12 @@ class CodeGen:
                 lines.append(f'    double V_{p} = s->V[{pi}];')
             else:
                 lines.append(f'    double V_{p}_{q} = s->V[{pi}] - s->V[{qi}];')
+
+        # Hoisted model-variable declarations (mirrors vae_eval)
+        for v in self._eval_vars:
+            lines.append(f'    double {v} = 0.0;')
+        if self._eval_vars:
+            lines.append('')
 
         lines.append(f'    memset(dFdV, 0, {n_branches} * {self.n_nodes} * sizeof(double));')
         lines.append(f'    memset(dQdV, 0, {n_branches} * {self.n_nodes} * sizeof(double));')

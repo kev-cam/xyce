@@ -734,21 +734,25 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
 
     c.append('bool Instance::processParams() {')
     c.append('  if (!vae_eval_) {')
-    c.append('    // Try VAE_SO_PATH (single .so) or VAE_SO_DIR/<modelname>.so')
-    c.append('    std::string so_path;')
+    c.append('    // Find the VAE math .so: VAE_SO_PATH (explicit single .so), then')
+    c.append('    // VAE_SO_DIR/<modelname>.so, then VAE_SO_DIR/<module>.so -- the last')
+    c.append('    // is the per-module analytical .so the .hdl flow generates next to')
+    c.append('    // the device plugin (the .hdl flow only knows the module, not the')
+    c.append('    // model-card name, so the module-named .so is the reliable fallback).')
     c.append('    const char *so = getenv("VAE_SO_PATH");')
     c.append('    const char *dir = getenv("VAE_SO_DIR");')
-    c.append('    if (so) {')
-    c.append('      so_path = so;')
-    c.append('    } else if (dir) {')
-    c.append('      so_path = std::string(dir) + "/" + model_.getName() + ".so";')
+    c.append('    if (so) vae_dl_ = dlopen(so, RTLD_NOW);')
+    c.append('    if (!vae_dl_ && dir) {')
+    c.append('      std::string p = std::string(dir) + "/" + model_.getName() + ".so";')
+    c.append('      vae_dl_ = dlopen(p.c_str(), RTLD_NOW);')
     c.append('    }')
-    c.append('    if (!so_path.empty()) {')
-    c.append('      vae_dl_ = dlopen(so_path.c_str(), RTLD_NOW);')
-    c.append('      if (vae_dl_) {')
-    c.append('        vae_eval_ = (VaeEvalFn)dlsym(vae_dl_, "vae_eval");')
-    c.append('        vae_jac_ = (VaeEvalFn)dlsym(vae_dl_, "vae_jacobian");')
-    c.append('      }')
+    c.append(f'    if (!vae_dl_ && dir) {{')
+    c.append(f'      std::string p = std::string(dir) + "/{name}.so";')
+    c.append('      vae_dl_ = dlopen(p.c_str(), RTLD_NOW);')
+    c.append('    }')
+    c.append('    if (vae_dl_) {')
+    c.append('      vae_eval_ = (VaeEvalFn)dlsym(vae_dl_, "vae_eval");')
+    c.append('      vae_jac_ = (VaeEvalFn)dlsym(vae_dl_, "vae_jacobian");')
     c.append('    }')
     c.append('  }')
     c.append('  return true;')
@@ -1288,6 +1292,9 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
     c.append('}')
 
     impl = '\n'.join(c) + '\n'
+    # Side channel for main(): simple R/L/C devices inline their stamp and
+    # hard-skip vae_eval, so they need no analytical math .so generated.
+    mod._pyms_simple_rlc = bool(simple_rlc)
     return header, impl
 
 
@@ -1328,6 +1335,167 @@ def resolve_entry_point(va_path: str) -> str:
     return va_path
 
 
+def _compile_math_so(mod, out_path):
+    """Generate the analytical VAE math .so the .hdl device wrapper dlopen's at
+    VAE_SO_DIR/<module>.so.
+
+    This is the piece the .hdl flow was missing: xyce_device_gen only ever
+    emitted the device *wrapper*; the wrapper's processParams dlopen's a math
+    .so that nothing generated, so every complex (non-R/L/C) .hdl device was a
+    silent no-op.
+
+    Primary path is codegen.py, which emits true eval-time C++ if/else branches
+    -- so one .so is correct across *all* regimes (cutoff/triode/saturation for
+    a MOSFET), unlike the GiNaC builder, which resolves each branch at compile
+    time and bakes a single regime (non-physical, and prone to spurious Newton
+    solutions outside it).  GiNaC remains as a fallback for devices codegen
+    can't handle.
+
+    The .so bakes the module's *default* parameter values; model-card param
+    overrides are not yet threaded in (would require compiling at processParams
+    time when the card is known).  Returns True on success; any failure is
+    non-fatal (the device just stays a no-op, exactly as before this change).
+    """
+    import subprocess
+    d = os.path.dirname(os.path.abspath(out_path)) or '.'
+    stem = os.path.join(d, '_mathso_' + mod.name)
+
+    def run(cmd, **kw):
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, **kw)
+        return r.returncode == 0, (r.stderr or r.stdout or '')
+
+    if _compile_math_so_codegen(mod, out_path, stem, run):
+        return True
+    sys.stderr.write("[pyms] math .so: codegen path failed; trying GiNaC fallback\n")
+    return _compile_math_so_ginac(mod, out_path, stem, run)
+
+
+def _compile_math_so_codegen(mod, out_path, stem, run):
+    """Build the math .so from codegen.py's runtime-branched C++.
+
+    codegen emits its own pointer-based ABI (struct VaeState {double* V; double*
+    params; ...}); the device wrapper expects {double V[16]; double Vt;}.  We
+    #include codegen's output with the function/struct names macro-renamed out
+    of the way, then export a thin shim in the wrapper ABI that copies the
+    fixed V[] across and supplies the baked parameter defaults.
+    """
+    try:
+        from codegen import CodeGen
+    except ImportError:
+        from vae.codegen import CodeGen
+
+    cg = CodeGen(mod)
+    try:
+        src = cg.generate()
+        pairs = cg._branch_pairs()
+    except Exception as e:
+        sys.stderr.write(f"[pyms] math .so (codegen): generate failed: {e}\n")
+        return False
+
+    cg_cpp = stem + '_cg.cpp'
+    with open(cg_cpp, 'w') as f:
+        f.write(src)
+
+    labels = [f'I({p},{q})' if q != 'gnd' else f'I({p})' for (p, q) in pairs]
+    labels_c = ', '.join(f'"{l}"' for l in labels) or '""'
+    n_nodes = len(mod.ports) + len(mod.internal_nodes)
+    n_br = len(pairs)
+    n_params = len(mod.params)
+
+    wrapper = f'''#include <cmath>
+#include <cstring>
+// Public (device-wrapper) ABI -- layout must match the .hdl wrapper's VaeState.
+struct VaeStatePub {{ double V[16]; double Vt; }};
+// Pull in codegen's evaluator, renaming its symbols out of the way so the
+// public shim below can own the exported vae_eval / vae_jacobian.
+#define vae_eval _cg_eval
+#define vae_jacobian _cg_jac
+#define VaeState VaeStateCG
+#include "{cg_cpp}"
+#undef vae_eval
+#undef vae_jacobian
+#undef VaeState
+static double* _cg_params() {{
+    static double P[{max(n_params, 1)}];
+    static bool init = false;
+    if (!init) {{ for (int i = 0; i < {n_params}; i++) P[i] = vae_param_default(i); init = true; }}
+    return P;
+}}
+static inline void _cg_fill(VaeStateCG& s, VaeStatePub* w) {{
+    s.V = w->V; s.params = _cg_params();
+    s.temperature = 300.15; s.Vt = w->Vt; s.dt = 0.0; s.time = 0.0;
+}}
+extern "C" void vae_eval(VaeStatePub* w, double* F, double* Q) {{
+    VaeStateCG s; _cg_fill(s, w); _cg_eval(&s, F, Q);
+}}
+extern "C" void vae_jacobian(VaeStatePub* w, double* dFdV, double* dQdV) {{
+    VaeStateCG s; _cg_fill(s, w); _cg_jac(&s, dFdV, dQdV);
+}}
+extern "C" int vae_n_nodes() {{ return {n_nodes}; }}
+extern "C" int vae_n_branches() {{ return {n_br}; }}
+extern "C" const char* vae_branch_label(int i) {{
+    static const char* L[] = {{ {labels_c} }};
+    return (i >= 0 && i < {n_br}) ? L[i] : "";
+}}
+'''
+    wrap_cpp = stem + '_cgwrap.cpp'
+    with open(wrap_cpp, 'w') as f:
+        f.write(wrapper)
+    ok, err = run(f'g++ -O2 -std=c++17 -shared -fPIC -o {out_path} {wrap_cpp} -lm')
+    if not ok:
+        sys.stderr.write(f"[pyms] math .so (codegen): compile failed:\n{err[:800]}\n")
+        return False
+    return True
+
+
+def _compile_math_so_ginac(mod, out_path, stem, run):
+    """Fallback: GiNaC pipeline (emit a C++ builder program -> run it to print
+    eval/jacobian -> wrap with the VaeState ABI -> compile).  Single-regime
+    only (conditions resolve at build time), so use it only when codegen can't
+    handle the device."""
+    try:
+        from ginac_emitter import GiNaCEmitter
+    except ImportError:
+        from vae.ginac_emitter import GiNaCEmitter
+
+    try:
+        ginac_src = GiNaCEmitter(mod, param_values={}).emit()
+    except Exception as e:
+        sys.stderr.write(f"[pyms] math .so (ginac): emit failed: {e}\n")
+        return False
+    with open(stem + '_ginac.cpp', 'w') as f:
+        f.write(ginac_src)
+    ok, err = run(f'g++ -O2 -std=c++17 -o {stem}_ginac {stem}_ginac.cpp -lginac -lcln')
+    if not ok:
+        sys.stderr.write(f"[pyms] math .so (ginac): builder compile failed:\n{err[:600]}\n")
+        return False
+    ok, err = run(f'{stem}_ginac > {stem}_eval.cpp', timeout=600)
+    if not ok:
+        sys.stderr.write(f"[pyms] math .so (ginac): builder run failed:\n{err[:600]}\n")
+        return False
+    wrapper = (
+        '#include <cmath>\n#include <cstdio>\n#include <cstring>\n'
+        'struct VaeState { double V[16]; double Vt; };\n'
+        'inline double conjugate(double x) { return x; }\n'
+        '#define vae_eval _vae_eval_impl\n'
+        '#define vae_jacobian _vae_jacobian_impl\n'
+        'static const double temperature = 300.15;\n'
+        f'#include "{stem}_eval.cpp"\n'
+        '#undef vae_eval\n#undef vae_jacobian\n'
+        'extern "C" void vae_eval(VaeState* s, double* F, double* Q) '
+        '{ _vae_eval_impl(s, F, Q); }\n'
+        'extern "C" void vae_jacobian(VaeState* s, double* dFdV, double* dQdV) '
+        '{ _vae_jacobian_impl(s, dFdV, dQdV); }\n'
+    )
+    with open(stem + '_wrap.cpp', 'w') as f:
+        f.write(wrapper)
+    ok, err = run(f'g++ -O2 -std=c++17 -shared -fPIC -o {out_path} {stem}_wrap.cpp -lm')
+    if not ok:
+        sys.stderr.write(f"[pyms] math .so (ginac): eval .so compile failed:\n{err[:600]}\n")
+        return False
+    return True
+
+
 if __name__ == '__main__':
     if len(sys.argv) < 2:
         print("Usage: xyce_device_gen.py <input.va> [--output <dir>]")
@@ -1352,5 +1520,17 @@ if __name__ == '__main__':
         f.write(impl)
 
     print(f"Generated {h_path} and {c_path}")
+
+    # Generate the analytical math eval .so the wrapper loads at runtime.
+    # Simple R/L/C devices inline their stamp and need none.
+    if not getattr(mod, '_pyms_simple_rlc', False):
+        so_path = os.path.join(output_dir, f'{mod.name}.so')
+        if _compile_math_so(mod, so_path):
+            print(f"Generated math eval .so: {so_path}")
+        else:
+            sys.stderr.write(
+                "[pyms] WARNING: math eval .so not generated; this complex "
+                "device will be a no-op until one is provided\n")
+
     print(f"Module: {mod.name}, Ports: {[p.name for p in mod.ports]}, "
           f"Internal: {mod.internal_nodes}, Params: {len(mod.params)}")
