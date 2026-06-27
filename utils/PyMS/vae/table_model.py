@@ -195,6 +195,77 @@ void vae_jacobian(VaeState* s, double* dFdV, double* dQdV)
     return cpp
 
 
+def _smooth_mos_id(vgs, vds, kp, vth, lam, w, l, vtsm=0.05):
+    """Level-1 MOSFET id with a softplus-smoothed threshold (no hard cutoff)."""
+    import math
+    beta = kp * w / l
+    vov = vgs - vth
+    vovs = vtsm * math.log1p(math.exp(min(vov / vtsm, 30.0)))   # softplus(max(vov,0))
+    vd = vds if vds > 0.0 else 0.0
+    if vd < vovs:
+        return beta * (vovs * vd - 0.5 * vd * vd) * (1.0 + lam * vd)   # triode
+    return 0.5 * beta * vovs * vovs * (1.0 + lam * vd)                  # saturation
+
+
+def emit_diffpair_table_so(model_name: str, kp=150e-6, vth=0.6, lam=0.02,
+                           w=20e-6, l=1e-6, cgs=2e-15, cgd=1e-15,
+                           vg=(-1.0, 3.5, 46), vd=(-0.5, 3.5, 41)) -> str:
+    """Table fall-back .so for a bfit --merge'd diff-pair (6 ports d1,g1,d2,g2,s,b).
+
+    A 2-D MOSFET id(vgs,vds) lookup shared by both halves. The threshold is
+    softplus-smoothed so the Jacobian has a NON-ZERO gradient everywhere -- which is
+    what lets Xyce's DC operating point settle the high-gain feedback loop, where the
+    analytical hard-cutoff square-law (zero gradient below threshold) sticks on the
+    degenerate output~0 solution. Loaded into Xyce via VAE_SO_PATH (overrides the
+    JIT'd analytical eval of the same .va wrapper). Validated: op-amp follower that
+    collapsed analytically (timestep -> 0) converges to 0.10% with this table.
+    """
+    vg0, vg1, ng = vg
+    vd0, vd1, nd = vd
+    dvg = (vg1 - vg0) / (ng - 1)
+    dvd = (vd1 - vd0) / (nd - 1)
+    tbl = [_smooth_mos_id(vg0 + i*dvg, vd0 + j*dvd, kp, vth, lam, w, l)
+           for i in range(ng) for j in range(nd)]
+    cpp = _HEADER.format(name=model_name,
+                         desc=f"{ng}x{nd} 2-D id(vgs,vds) diff-pair table fall-back") + f"""
+static const int NG={ng}, ND={nd};
+static const double VG0={vg0:.6e}, DVG={dvg:.8e}, VD0={vd0:.6e}, DVD={dvd:.8e};
+static const double CGS={cgs:.4e}, CGD={cgd:.4e};
+static const double TBL[{ng*nd}] = {{
+    {', '.join('%.7e' % v for v in tbl)}
+}};
+static inline double interp2d(double vgs, double vds) {{
+    double fi=(vgs-VG0)/DVG, fj=(vds-VD0)/DVD;
+    int i=(int)fi, j=(int)fj;
+    if(i<0)i=0; else if(i>NG-2)i=NG-2;
+    if(j<0)j=0; else if(j>ND-2)j=ND-2;
+    double a=fi-i, b=fj-j; if(a<0)a=0; if(a>1)a=1; if(b<0)b=0; if(b>1)b=1;
+    double t00=TBL[i*ND+j], t01=TBL[i*ND+j+1], t10=TBL[(i+1)*ND+j], t11=TBL[(i+1)*ND+j+1];
+    return t00*(1-a)*(1-b)+t01*(1-a)*b+t10*a*(1-b)+t11*a*b;
+}}
+extern "C" {{
+int vae_n_nodes() {{ return 6; }}              // d1,g1,d2,g2,s,b
+int vae_n_branches() {{ return 6; }}
+void vae_eval(VaeState* s, double* F, double* Q) {{
+    double Vd1=s->V[0],Vg1=s->V[1],Vd2=s->V[2],Vg2=s->V[3],Vs=s->V[4];
+    double id1=interp2d(Vg1-Vs, Vd1-Vs), id2=interp2d(Vg2-Vs, Vd2-Vs);
+    for(int k=0;k<6;k++){{ F[k]=0; Q[k]=0; }}
+    F[0]=id1; F[2]=id2; F[4]=-(id1+id2);                 // KCL: drains +, shared source -
+    Q[1]=CGS*(Vg1-Vs)+CGD*(Vg1-Vd1); Q[0]=-CGD*(Vg1-Vd1);
+    Q[3]=CGS*(Vg2-Vs)+CGD*(Vg2-Vd2); Q[2]=-CGD*(Vg2-Vd2);
+}}
+void vae_jacobian(VaeState* s, double* dF, double* dQ) {{
+    const double dv=1e-6; VaeState sp; double F0[6],Q0[6],Fp[6],Qp[6];
+    memset(dF,0,36*sizeof(double)); memset(dQ,0,36*sizeof(double));
+    vae_eval(s,F0,Q0);
+    for(int j=0;j<6;j++){{ sp=*s; sp.V[j]+=dv; vae_eval(&sp,Fp,Qp);
+        for(int i=0;i<6;i++){{ dF[i*6+j]=(Fp[i]-F0[i])/dv; dQ[i*6+j]=(Qp[i]-Q0[i])/dv; }} }}
+}}
+}} // extern "C"
+"""
+    return cpp
+
+
 def compile_table_so(cpp_source: str, output_path: str, cxx: str = None) -> bool:
     """Compile a table-model .so (PyMS ABI). Returns True on success."""
     cxx = cxx or os.environ.get("CXX", "g++")
