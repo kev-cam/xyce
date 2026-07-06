@@ -4253,6 +4253,16 @@ bool Master::updateState (double * solVec, double * staVec, double * stoVec)
   {
     for (std::size_t kInst = threadLo; kInst < threadHi; ++kInst)
     {
+    // The instance sweep is pointer-chasing (vector of pointers to scattered
+    // objects) which hardware prefetchers cannot follow; software-prefetch a
+    // few instances ahead so the object header is resident on arrival.
+    if (kInst + 4 < threadHi)
+    {
+      const char * pf = (const char *) instBegin[kInst + 4];
+      __builtin_prefetch(pf);
+      __builtin_prefetch(pf + 64);
+      __builtin_prefetch(pf + 128);
+    }
     Instance & mi = *(instBegin[kInst]);
     double * oldstaVec = mi.extData.currStaVectorRawPtr;
     double * stoVec = mi.extData.nextStoVectorRawPtr;
