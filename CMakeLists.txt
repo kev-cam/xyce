@@ -33,8 +33,11 @@ endif()
 
 project(Xyce VERSION 7.11.0 LANGUAGES CXX C)
 
-# Note: setting C++11 standard here can still be overridden by Trilinos later.
-set(CMAKE_CXX_STANDARD 11)
+# C++17: Trilinos 14.4-era headers (Kokkos 4 / desul atomics) do not compile
+# below it. smak builds masked this by ignoring CXX_STANDARD (gcc-14 defaults
+# to gnu++17); real cmake enforces the declared standard, including in the
+# tps.cmake Teuchos compile probe.
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
