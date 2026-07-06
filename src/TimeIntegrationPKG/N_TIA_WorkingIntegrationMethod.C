@@ -209,6 +209,7 @@ struct Oracle
   int mode = 0;                       // 0 off, 1 record, 2 replay
   long n = 0;
   FILE *f = 0;
+  unsigned long recrows = 0;          // rows written; row 0 (DC op) is flushed
   FILE *fsto = 0;                     // XYCE_ORACLE_RECORD_STORE: store-vector
   long m = -1;                        // channel (regime keys etc.); header
                                       // written on first accepted step
@@ -504,6 +505,11 @@ void WorkingIntegrationMethod::completeStep(const TIAParams &tia_params)
     double t = oracleSec_->currentTime;
     std::fwrite(&t, sizeof t, 1, s_oracle.f);
     std::fwrite(x, sizeof(double), len, s_oracle.f);
+    // The first row is the DC op — flush it so a concurrent trainer
+    // (ensemble watcher, arena observer) can ingest it while this run's
+    // transient is still in progress.
+    if (s_oracle.recrows++ == 0)
+      std::fflush(s_oracle.f);
   }
 
   if (s_oracle.fsto && oracleDs_ && oracleSec_ && oracleDs_->currStorePtr)
