@@ -505,10 +505,10 @@ void WorkingIntegrationMethod::completeStep(const TIAParams &tia_params)
     double t = oracleSec_->currentTime;
     std::fwrite(&t, sizeof t, 1, s_oracle.f);
     std::fwrite(x, sizeof(double), len, s_oracle.f);
-    // The first row is the DC op — flush it so a concurrent trainer
-    // (ensemble watcher, arena observer) can ingest it while this run's
-    // transient is still in progress.
-    if (s_oracle.recrows++ == 0)
+    // Keep the tail visible to a concurrent trainer: row 0 is the DC op
+    // (ensemble watcher ingests it mid-run), and every 64th row bounds a
+    // live tuner's lag at 64 steps for ~µs of flush cost.
+    if ((s_oracle.recrows++ & 63) == 0)
       std::fflush(s_oracle.f);
   }
 
