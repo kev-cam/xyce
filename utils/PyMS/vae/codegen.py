@@ -123,6 +123,8 @@ class CodeGen:
         # branch — e.g. ``id`` across cutoff/triode/saturation — is still in
         # scope where the contributions read it after the branch closes.
         self._eval_vars: list[str] = []
+        # Sequential bit index for voltage-dependent conditions (regime key)
+        self._regime_bits: int = 0
 
     def generate(self) -> str:
         """Generate complete C++ source file."""
@@ -231,16 +233,24 @@ class CodeGen:
 
     def _process_if(self, node: ASTNode):
         cond_cpp = self._translate_expr(node.condition)
-        self.eval_stmts.append(f'    if ({cond_cpp}) {{')
-        self.jac_stmts.append(f'    if ({cond_cpp}) {{')
+        # Regime export: every voltage-dependent branch gets a bit in the
+        # regime key — set when the condition is reached AND true. The
+        # executed-path bitmask identifies the operating regime, which is the
+        # validity/trust token for behavioral models fitted per regime.
+        bit = self._regime_bits
+        self._regime_bits += 1
+        for stmts in (self.eval_stmts, self.jac_stmts):
+            stmts.append(f'    {{ const bool _vc{bit} = ({cond_cpp});')
+            stmts.append(f'      _vae_rk |= (unsigned long long)_vc{bit} << {bit};')
+            stmts.append(f'      if (_vc{bit}) {{')
         for child in node.children:
             self._process_analog_block(child)
         if node.else_body:
             self.eval_stmts.append(f'    }} else {{')
             self.jac_stmts.append(f'    }} else {{')
             self._process_analog_block(node.else_body)
-        self.eval_stmts.append(f'    }}')
-        self.jac_stmts.append(f'    }}')
+        self.eval_stmts.append(f'    }} }}')
+        self.jac_stmts.append(f'    }} }}')
 
     def _process_initial_step(self, node: ASTNode):
         # Collect initial step assignments — these go in a separate init function
@@ -541,6 +551,9 @@ class CodeGen:
         lines.append(f'    double Vt;            // thermal voltage kT/q')
         lines.append(f'    double dt;            // timestep')
         lines.append(f'    double time;          // current time')
+        lines.append(f'    unsigned long long regime_key;  // OUT: reached-and-true bit per')
+        lines.append(f'                                    // voltage condition (ABI-appended;')
+        lines.append(f'                                    // stale callers/sos leave sentinel)')
         lines.append('};')
         lines.append('')
 
@@ -581,9 +594,14 @@ class CodeGen:
         lines.append(f'    memset(Q, 0, {n_branches} * sizeof(double));')
         lines.append('')
 
+        # Regime-key accumulator (reached-and-true bit per voltage condition)
+        lines.append('    unsigned long long _vae_rk = 0ULL;')
+        lines.append('')
+
         # Emit eval body
         for stmt in self.eval_stmts:
             lines.append(stmt)
+        lines.append('    s->regime_key = _vae_rk;')
         lines.append('}')
         lines.append('')
 

@@ -486,7 +486,7 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
     h.append('')
 
     # VAE function pointer types
-    h.append('struct VaeState { double V[16]; double Vt; };')
+    h.append('struct VaeState { double V[16]; double Vt; unsigned long long regime_key; };')
     h.append('typedef void (*VaeEvalFn)(VaeState*, double*, double*);')
     h.append('')
 
@@ -503,7 +503,12 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
     h.append(f'  static int numNodes() {{ return {num_nodes_required}; }}')
     h.append(f'  static int numOptionalNodes() {{ return {num_nodes_optional}; }}')
     h.append(f'  static bool isLinearDevice() {{ return false; }}')
-    h.append(f'  static bool modelRequired() {{ return true; }}')
+    # A model card is only required if the device actually has model-level
+    # parameters. Purely behavioral devices whose parameters are all
+    # type="instance" (toys/vsrc, isrc, the qspice_va PLL blocks) carry no model
+    # state and must instantiate as a bare Y<MODULE> with no .model card.
+    _has_model_params = any(not getattr(p, 'is_instance', False) for p in mod.params)
+    h.append(f'  static bool modelRequired() {{ return {"true" if _has_model_params else "false"}; }}')
     h.append('  static const char **nodeNames();')
     h.append('  static void loadInstanceParameters(ParametricData<Instance> &p);')
     h.append('  static void loadModelParameters(ParametricData<Model> &p);')
@@ -560,6 +565,11 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
     h.append('  void *vae_dl_;')
     h.append('  VaeEvalFn vae_eval_;')
     h.append('  VaeEvalFn vae_jac_;')
+    h.append('  // operating-regime key from the last eval (reached-and-true bit per')
+    h.append('  // voltage condition; ~0 = unknown/stale .so). Exported via the store')
+    h.append('  // vector as the validity token for behavioral-model trust gating.')
+    h.append('  unsigned long long regimeKey_;')
+    h.append('  int li_regime_;')
     h.append(f'  double prevV_[{n_total}];')
     h.append('  bool hasPrevV_;')
     h.append(f'  double F_[{n_total}];')
@@ -700,12 +710,13 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
     c.append('  : DeviceInstance(ib, config.getInstanceParameters(), fb),')
     c.append('    model_(model),')
     c.append('    vae_dl_(nullptr), vae_eval_(nullptr), vae_jac_(nullptr),')
+    c.append('    regimeKey_(~0ULL), li_regime_(-1),')
     c.append('    hasPrevV_(true)  // start with zero as "previous" for limiting')
     c.append('{')
     c.append(f'  numExtVars = {n_ext};')
     c.append(f'  numIntVars = {n_int};')
     c.append(f'  numStateVars = 0;')
-    c.append(f'  numStoreVars = 0;')
+    c.append(f'  numStoreVars = 1;  // [0] = operating-regime key (trust token)')
     c.append('')
     c.append(f'  jacStamp_.resize(numNodes);')
     c.append(f'  for (int i = 0; i < numNodes; i++) {{')
@@ -778,7 +789,9 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
     c.append('')
 
     c.append('void Instance::registerStateLIDs(const std::vector<int> &v) {}')
-    c.append('void Instance::registerStoreLIDs(const std::vector<int> &v) {}')
+    c.append('void Instance::registerStoreLIDs(const std::vector<int> &v) {')
+    c.append('  if (!v.empty()) li_regime_ = v[0];')
+    c.append('}')
     c.append('std::map<int,std::string> &Instance::getIntNameMap() {')
     c.append('  static std::map<int,std::string> m;')
     for i, n in enumerate(internals):
@@ -786,7 +799,9 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
     c.append('  return m;')
     c.append('}')
     c.append('std::map<int,std::string> &Instance::getStoreNameMap() {')
-    c.append('  static std::map<int,std::string> m; return m;')
+    c.append('  static std::map<int,std::string> m;')
+    c.append('  m[0] = "REGIME";')
+    c.append('  return m;')
     c.append('}')
     c.append('const std::vector<std::string> &Instance::getDepSolnVars() {')
     c.append('  static std::vector<std::string> v; return v;')
@@ -899,6 +914,7 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
         else:
             c.append(f'    state.V[{i}] = (*solVec)[li_{n}];')
     c.append('    state.Vt = 8.617087e-5 * 300.15;')
+    c.append('    state.regime_key = ~0ULL;  // sentinel: stale .so leaves "unknown"')
     c.append('')
     # Check if VAE .so uses node-indexed or branch-indexed output.
     # We generate support for both: try node-indexed first (n_nodes output),
@@ -925,6 +941,11 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
     c.append('')
     c.append(f'    double Fb[{max(n_branches, n_total)}]={{}}, Qb[{max(n_branches, n_total)}]={{}};')
     c.append(f'    vae_eval_(&state, Fb, Qb);')
+    c.append('    // capture the regime BEFORE any jacobian call: the FD jacobian')
+    c.append('    // re-runs vae_eval at perturbed voltages and would overwrite it')
+    c.append('    regimeKey_ = state.regime_key;')
+    c.append('    if (li_regime_ >= 0 && extData.nextStoVectorRawPtr)')
+    c.append('      extData.nextStoVectorRawPtr[li_regime_] = (double)(regimeKey_ & 0xFFFFFFFFFFFFFull);')
     c.append('')
     c.append('    // Sanitize NaN/Inf')
     c.append(f'    for (int i = 0; i < {max(n_branches, n_total)}; i++) {{')
@@ -1414,7 +1435,9 @@ def _compile_math_so_codegen(mod, out_path, stem, run):
     wrapper = f'''#include <cmath>
 #include <cstring>
 // Public (device-wrapper) ABI -- layout must match the .hdl wrapper's VaeState.
-struct VaeStatePub {{ double V[16]; double Vt; }};
+// regime_key is ABI-appended (OUT): reached-and-true bit per voltage condition
+// from the codegen core; older wrappers simply never read past Vt.
+struct VaeStatePub {{ double V[16]; double Vt; unsigned long long regime_key; }};
 // Pull in codegen's evaluator, renaming its symbols out of the way so the
 // public shim below can own the exported vae_eval / vae_jacobian.
 #define vae_eval _cg_eval
@@ -1435,7 +1458,9 @@ static inline void _cg_fill(VaeStateCG& s, VaeStatePub* w) {{
     s.temperature = 300.15; s.Vt = w->Vt; s.dt = 0.0; s.time = 0.0;
 }}
 extern "C" void vae_eval(VaeStatePub* w, double* F, double* Q) {{
-    VaeStateCG s; _cg_fill(s, w); _cg_eval(&s, F, Q);
+    VaeStateCG s; _cg_fill(s, w); s.regime_key = ~0ULL;
+    _cg_eval(&s, F, Q);
+    w->regime_key = s.regime_key;
 }}
 extern "C" void vae_jacobian(VaeStatePub* w, double* dFdV, double* dQdV) {{
     VaeStateCG s; _cg_fill(s, w); _cg_jac(&s, dFdV, dQdV);
