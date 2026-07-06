@@ -54,7 +54,14 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
+
+#if !defined(_WIN32)
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 namespace Xyce {
 namespace TimeIntg {
@@ -201,6 +208,17 @@ double WorkingIntegrationMethod::partialTimeDeriv() const
 // Replaying a run against its own recording measures the perfect-oracle
 // ceiling on Newton iterations — the number every real (cycle-behind,
 // observation-trained) model is judged against.
+//
+// XYCE_ORACLE_SHM=<path>     memory-resident ring (mmap a tmpfs path, e.g.
+//                            /dev/shm/xyce_live) shared with a live trainer.
+//                            Producer cost per accepted step: one in-cache
+//                            row copy + a release-store of the sequence
+//                            counter — no syscalls, no stdio, no disk. The
+//                            trainer samples rows in place at its own pace;
+//                            ring overrun just means it trains on a sampled
+//                            window (advisory contract: never blocks, never
+//                            is waited for). XYCE_ORACLE_SHM_ROWS sizes the
+//                            ring (default 2048 rows).
 //-----------------------------------------------------------------------------
 namespace {
 
@@ -210,6 +228,8 @@ struct Oracle
   long n = 0;
   FILE *f = 0;
   unsigned long recrows = 0;          // rows written; row 0 (DC op) is flushed
+  double *shmbase = 0;                // XYCE_ORACLE_SHM ring (header page +
+  unsigned long shmrows = 0;          //   R rows of (t, solution)), tmpfs
   FILE *fsto = 0;                     // XYCE_ORACLE_RECORD_STORE: store-vector
   long m = -1;                        // channel (regime keys etc.); header
                                       // written on first accepted step
@@ -260,6 +280,35 @@ void oracle_init(int n)
   s_oracle.inited = true;
   const char * rec = std::getenv("XYCE_ORACLE_RECORD");
   const char * rep = std::getenv("XYCE_ORACLE_REPLAY");
+#if !defined(_WIN32)
+  if (const char * sp = std::getenv("XYCE_ORACLE_SHM"))
+  {
+    long rows = 2048;
+    if (const char * r = std::getenv("XYCE_ORACLE_SHM_ROWS"))
+      rows = std::atol(r) > 16 ? std::atol(r) : 2048;
+    size_t bytes = 4096 + (size_t) rows * (1 + n) * sizeof(double);
+    int fd = ::open(sp, O_CREAT | O_RDWR | O_TRUNC, 0644);
+    if (fd >= 0)
+    {
+      void * p = MAP_FAILED;
+      if (::ftruncate(fd, (off_t) bytes) == 0)
+        p = ::mmap(0, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+      ::close(fd);
+      if (p != MAP_FAILED)
+      {
+        long * h = (long *) p;
+        h[1] = n;
+        h[2] = rows;
+        h[3] = 0;                                   // seq
+        // publish the magic last so a waiting trainer never sees a
+        // half-initialized header
+        __atomic_store_n(&h[0], 0x584C495645L, __ATOMIC_RELEASE);
+        s_oracle.shmbase = (double *) p;
+        s_oracle.shmrows = (unsigned long) rows;
+      }
+    }
+  }
+#endif
   if (const char * rs = std::getenv("XYCE_ORACLE_RECORD_STORE"))
   {
     s_oracle.fsto = std::fopen(rs, "wb");
@@ -511,6 +560,21 @@ void WorkingIntegrationMethod::completeStep(const TIAParams &tia_params)
     if ((s_oracle.recrows++ & 63) == 0)
       std::fflush(s_oracle.f);
   }
+
+#if !defined(_WIN32)
+  if (s_oracle.shmbase && oracleDs_ && oracleSec_ && oracleDs_->currSolutionPtr)
+  {
+    int len = 0;
+    double * x = oracle_vec(*oracleDs_->currSolutionPtr, len);
+    long * h = (long *) s_oracle.shmbase;
+    unsigned long seq = (unsigned long) h[3];
+    double * slot = s_oracle.shmbase + 512
+                    + (seq % s_oracle.shmrows) * (size_t) (1 + len);
+    slot[0] = oracleSec_->currentTime;
+    std::memcpy(slot + 1, x, (size_t) len * sizeof(double));
+    __atomic_store_n(&h[3], (long) (seq + 1), __ATOMIC_RELEASE);
+  }
+#endif
 
   if (s_oracle.fsto && oracleDs_ && oracleSec_ && oracleDs_->currStorePtr)
   {
