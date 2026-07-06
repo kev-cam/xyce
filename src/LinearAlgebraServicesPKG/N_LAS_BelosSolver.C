@@ -151,6 +151,13 @@ bool BelosSolver::setOptions(const Util::OptionBlock& OB)
   belosParams_->set("Convergence Tolerance", tolerance_);
   belosParams_->set("Orthogonalization", "ICGS");
 
+  // Each ICGS pass is one global reduction per Krylov iteration — the
+  // dominant synchronization cost on SMP. Belos's own "fast" preset uses a
+  // single pass; expose that as an experiment knob without deck changes.
+  const char *orthoPasses = ::getenv("XYCE_ORTHO_PASSES");
+  if (orthoPasses)
+    belosParams_->set("Orthogonalization Passes", ::atoi(orthoPasses));
+
   Util::ParamList::const_iterator it_tpL = OB.begin();
   Util::ParamList::const_iterator end_tpL = OB.end();
   for (; it_tpL != end_tpL; ++it_tpL)

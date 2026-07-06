@@ -229,6 +229,7 @@ private:
   Loader &                              loader_;
   TimeIntg::WorkingIntegrationMethod &  wim_;
   Device::DeviceMgr &                   deviceManager_; ///< Device manager
+  int                                   innerDevicesGloballyAbsent_; ///< -1 unknown, else memoized (netlist constant)
 };
 
 } // namespace Loader

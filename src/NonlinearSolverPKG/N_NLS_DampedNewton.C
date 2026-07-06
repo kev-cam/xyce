@@ -52,6 +52,8 @@
 #include <N_LAS_SystemHelpers.h>
 #include <N_LAS_System.h>
 #include <N_LAS_Vector.h>
+#include <N_LAS_EpetraHelpers.h>
+#include <Epetra_MultiVector.h>
 #include <N_LOA_NonlinearEquationLoader.h>
 #include <N_NLS_DampedNewton.h>
 #include <N_NLS_NonLinearSolver.h>
@@ -1253,14 +1255,59 @@ int DampedNewton::converged_()
     return retCodes_.nanFail; // default = -6
   }
 
-  // Max RHS norm (maxNormRHS_) is used in converged_() and output by
-  // printStepInfo_().
+  // Max RHS norm (maxNormRHS_) and the weighted update norm (wtNormDX_) are
+  // used in converged_() and output by printStepInfo_().  The stock path
+  // computes them through two allgather-based max norms (four collectives);
+  // the max-norm indices they also produce are only consumed by the verbose
+  // step printout.  On the non-verbose path both local maxima are computed
+  // inline and combined in a single maxAll.
+  if (!VERBOSE_NONLINEAR)
+  {
+    /* local maxima mirror the stock accessors exactly: infNorm reads the
+       ASSEMBLED view, wMaxNorm reads the OVERLAPPED view over the assembled
+       length — reproducing both (per branch) keeps results bit-identical */
+    double lmax[2] = {0.0, 0.0};
+    int len = rhsVectorPtr_->localLength();
+    if (nlParams.getMaskingFlag())
+    {
+      Linear::Vector * pw = getPNormWeights();
+      for (int j = 0; j < len; ++j)
+      {
+        double v = std::fabs(*(*rhsVectorPtr_)(j, 0)) / *(*pw)(j, 0);
+        if (v > lmax[0]) lmax[0] = v;
+      }
+    }
+    else
+    {
+      const Epetra_MultiVector & R =
+        dynamic_cast<Linear::EpetraVectorAccess &>(*rhsVectorPtr_).epetraObj();
+      const double * rp = R.Pointers()[0];
+      for (int j = 0; j < len; ++j)
+      {
+        double v = std::fabs(rp[j]);
+        if (v > lmax[0]) lmax[0] = v;
+      }
+    }
+    len = searchDirectionPtr_->localLength();
+    for (int j = 0; j < len; ++j)
+    {
+      double v = std::fabs(*(*searchDirectionPtr_)(j, 0)) / *(*solWtVectorPtr_)(j, 0);
+      if (v > lmax[1]) lmax[1] = v;
+    }
+    double gmax[2];
+    pdsMgrPtr_->getPDSComm()->maxAll(lmax, gmax, 2);
+    maxNormRHS_ = gmax[0];
+    maxNormRHSindex_ = -1;
+    wtNormDX_ = gmax[1];
+  }
+  else
+  {
   if (nlParams.getMaskingFlag())
   {
     rhsVectorPtr_->wMaxNorm(*(getPNormWeights()), &maxNormRHS_, &maxNormRHSindex_);
   }
   else
-  { 
+  {
     rhsVectorPtr_->infNorm(&maxNormRHS_, &maxNormRHSindex_);
   }
 
@@ -1270,6 +1317,7 @@ int DampedNewton::converged_()
   // output by printStepInfo_().
 
   searchDirectionPtr_->wMaxNorm(*solWtVectorPtr_, &wtNormDX_);
+  }
 
   // If the RHS norm is so small already, just say we're converged,
   // and move on.  If we don't do this, we may wind up dividing by a

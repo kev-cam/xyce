@@ -76,7 +76,8 @@ NonlinearEquationLoader::NonlinearEquationLoader(
     ds_(ds),
     loader_(loader),
     wim_(wim),
-    deviceManager_(device_manager)
+    deviceManager_(device_manager),
+    innerDevicesGloballyAbsent_(-1)
 {
   residualTimerPtr_ = new Util::Timer();
   jacobianTimerPtr_ = new Util::Timer();
@@ -887,6 +888,19 @@ bool NonlinearEquationLoader::allDevicesConverged(Parallel::Machine comm)
 //-----------------------------------------------------------------------------
 bool NonlinearEquationLoader::innerDevicesConverged(Parallel::Machine comm)
 {
+  // Whether any ExternDevices exist anywhere is a netlist constant, but the
+  // stock path pays an AllReduce every Newton iteration to agree that an
+  // (almost always empty) set of them has converged.  Agree once, then
+  // answer locally forever.
+  if (innerDevicesGloballyAbsent_ < 0)
+  {
+    int absent = deviceManager_.getDevices(Device::ExternDevice::Traits::modelType()).empty() ? 1 : 0;
+    Parallel::AllReduce(comm, MPI_MIN, &absent, 1);
+    innerDevicesGloballyAbsent_ = absent;
+  }
+  if (innerDevicesGloballyAbsent_)
+    return true;
+
   return Device::devicesConverged(comm, deviceManager_.getDevices(Device::ExternDevice::Traits::modelType()));
 }
 
