@@ -40,11 +40,21 @@
 #include <Xyce_config.h>
 
 #include <N_ERH_ErrorMgr.h>
+#include <N_TIA_DataStore.h>
 #include <N_TIA_StepErrorControl.h>
 #include <N_TIA_TIAParams.h>
 #include <N_TIA_TimeIntegrationMethods.h>
 #include <N_TIA_WorkingIntegrationMethod.h>
 #include <N_UTL_FeatureTest.h>
+#include <N_LAS_Vector.h>
+#include <N_LAS_EpetraHelpers.h>
+#include <Epetra_MultiVector.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
 
 namespace Xyce {
 namespace TimeIntg {
@@ -149,6 +159,9 @@ void WorkingIntegrationMethod::createTimeIntegMethod(
   jacLimitFlag = tia_params.jacLimitFlag;
   jacLimit = tia_params.jacLimit;
 
+  oracleSec_ = &step_error_control;
+  oracleDs_ = &data_store;
+
   delete timeIntegrationMethod_;
   timeIntegrationMethod_ = createTimeIntegrationMethod(type, tia_params, step_error_control, data_store);
 
@@ -173,11 +186,228 @@ double WorkingIntegrationMethod::partialTimeDeriv() const
   return pdt;
 }
 
+//-----------------------------------------------------------------------------
+// Behavioral-oracle headroom hooks (dkc's observational-model direction).
+//
+// XYCE_ORACLE_RECORD=<file>  appends (time, accepted solution) after every
+//                            successful step — the "rotate to trainer" feed.
+// XYCE_ORACLE_REPLAY=<file>  interpolates a recorded trajectory at each new
+//                            step time and overlays it as Newton's initial
+//                            guess.  Only ds.nextSolutionPtr is touched:
+//                            ds.xn0Ptr keeps the polynomial predictor, so
+//                            LTE error estimation and step control are
+//                            untouched, and a wrong oracle costs iterations,
+//                            never correctness.
+// Replaying a run against its own recording measures the perfect-oracle
+// ceiling on Newton iterations — the number every real (cycle-behind,
+// observation-trained) model is judged against.
+//-----------------------------------------------------------------------------
+namespace {
+
+struct Oracle
+{
+  int mode = 0;                       // 0 off, 1 record, 2 replay
+  long n = 0;
+  FILE *f = 0;
+  FILE *fsto = 0;                     // XYCE_ORACLE_RECORD_STORE: store-vector
+  long m = -1;                        // channel (regime keys etc.); header
+                                      // written on first accepted step
+  std::vector<double> times;
+  std::vector<double> vals;           // times.size() rows x n, row-major
+  std::vector<double> ders;           // matching xdot rows (Hermite interp)
+  bool inited = false;
+  unsigned long overlays = 0;
+  double clamp = 0;                   // XYCE_ORACLE_CLAMP: per-node gate
+  // audit (XYCE_ORACLE_AUDIT=1): distance of each guess to the accepted
+  // solution — answers whether the oracle start is actually closer
+  bool audit = false;
+  std::vector<double> polyGuess, orcGuess;
+  double polyL2 = 0, orcL2 = 0, polyLinf = 0, orcLinf = 0;
+  unsigned long audits = 0;
+};
+Oracle s_oracle;
+
+void oracle_report()
+{
+  if (s_oracle.mode == 2)
+    std::fprintf(stderr, "[oracle] replay overlays applied: %lu\n",
+                 s_oracle.overlays);
+  if (s_oracle.audit && s_oracle.audits)
+  {
+    double n = (double) s_oracle.audits;
+    std::fprintf(stderr, "[oracle] audit over %lu steps: mean L2 poly %.3e "
+                 "oracle %.3e | worst Linf poly %.3e oracle %.3e\n",
+                 s_oracle.audits, s_oracle.polyL2 / n, s_oracle.orcL2 / n,
+                 s_oracle.polyLinf, s_oracle.orcLinf);
+  }
+  if (s_oracle.f) std::fclose(s_oracle.f);
+  if (s_oracle.fsto) std::fclose(s_oracle.fsto);
+  s_oracle.f = 0;
+  s_oracle.fsto = 0;
+}
+
+double * oracle_vec(Xyce::Linear::Vector & v, int & len)
+{
+  Epetra_MultiVector & m =
+    dynamic_cast<Xyce::Linear::EpetraVectorAccess &>(v).epetraObj();
+  len = m.MyLength();
+  return m.Pointers()[0];
+}
+
+void oracle_init(int n)
+{
+  s_oracle.inited = true;
+  const char * rec = std::getenv("XYCE_ORACLE_RECORD");
+  const char * rep = std::getenv("XYCE_ORACLE_REPLAY");
+  if (const char * rs = std::getenv("XYCE_ORACLE_RECORD_STORE"))
+  {
+    s_oracle.fsto = std::fopen(rs, "wb");
+    if (s_oracle.fsto) std::atexit(oracle_report);
+  }
+  if (rec)
+  {
+    s_oracle.f = std::fopen(rec, "wb");
+    if (s_oracle.f)
+    {
+      long nn = n;
+      std::fwrite(&nn, sizeof nn, 1, s_oracle.f);
+      s_oracle.mode = 1;
+      s_oracle.n = n;
+      std::atexit(oracle_report);
+    }
+  }
+  else if (rep)
+  {
+    FILE * f = std::fopen(rep, "rb");
+    if (!f) return;
+    long nn = 0;
+    if (std::fread(&nn, sizeof nn, 1, f) != 1 || nn != n)
+    {
+      std::fprintf(stderr, "[oracle] replay size mismatch (%ld vs %d)\n", nn, n);
+      std::fclose(f);
+      return;
+    }
+    double t;
+    std::vector<double> row(n);
+    while (std::fread(&t, sizeof t, 1, f) == 1 &&
+           std::fread(row.data(), sizeof(double), n, f) == (size_t) n)
+    {
+      s_oracle.times.push_back(t);
+      s_oracle.vals.insert(s_oracle.vals.end(), row.begin(), row.end());
+    }
+    // derivatives by non-uniform centered differences over the recorded
+    // grid (the integrator keeps history, not xdot; the adaptive grid is
+    // densest exactly where slopes are steep, so FD is accurate there)
+    {
+      size_t np = s_oracle.times.size();
+      s_oracle.ders.assign(np * (size_t) n, 0.0);
+      const std::vector<double> & T = s_oracle.times;
+      for (size_t i = 0; i < np; ++i)
+      {
+        size_t im = i ? i - 1 : i, ip = (i + 1 < np) ? i + 1 : i;
+        const double *xm = &s_oracle.vals[im * n], *xp = &s_oracle.vals[ip * n];
+        const double *xc = &s_oracle.vals[i * n];
+        double h0 = T[i] - T[im], h1 = T[ip] - T[i];
+        double *d = &s_oracle.ders[i * n];
+        for (long k = 0; k < n; ++k)
+        {
+          if (h0 > 0 && h1 > 0)
+            d[k] = (h0 * (xp[k] - xc[k]) / h1 + h1 * (xc[k] - xm[k]) / h0) /
+                   (h0 + h1);
+          else if (h1 > 0) d[k] = (xp[k] - xc[k]) / h1;
+          else if (h0 > 0) d[k] = (xc[k] - xm[k]) / h0;
+        }
+      }
+    }
+    std::fclose(f);
+    s_oracle.n = n;
+    s_oracle.mode = 2;
+    s_oracle.audit = std::getenv("XYCE_ORACLE_AUDIT") != 0;
+    if (const char * c = std::getenv("XYCE_ORACLE_CLAMP"))
+      s_oracle.clamp = std::atof(c);
+    std::atexit(oracle_report);
+    std::fprintf(stderr, "[oracle] replay loaded: %zu points x %ld\n",
+                 s_oracle.times.size(), s_oracle.n);
+  }
+}
+
+} // namespace
+
 void WorkingIntegrationMethod::obtainPredictor()
 {
 //  Stats::TimeBlock x(predictorStat_);
 
   timeIntegrationMethod_->obtainPredictor();
+
+  if (oracleDs_ && oracleSec_ && oracleDs_->nextSolutionPtr)
+  {
+    if (!s_oracle.inited)
+    {
+      int len = 0;
+      oracle_vec(*oracleDs_->nextSolutionPtr, len);
+      oracle_init(len);
+    }
+    if (s_oracle.mode == 2 && !s_oracle.times.empty())
+    {
+      const std::vector<double> & T = s_oracle.times;
+      double t = oracleSec_->nextTime;
+      if (t >= T.front() && t <= T.back())
+      {
+        if (s_oracle.audit)
+        {
+          int len = 0;
+          double * p = oracle_vec(*oracleDs_->nextSolutionPtr, len);
+          s_oracle.polyGuess.assign(p, p + len);
+        }
+        size_t hi = std::lower_bound(T.begin(), T.end(), t) - T.begin();
+        if (hi == 0) hi = 1;
+        if (hi >= T.size()) hi = T.size() - 1;
+        size_t lo = hi - 1;
+        double dt = T[hi] - T[lo];
+        double w = (dt > 0) ? (t - T[lo]) / dt : 0.0;
+        int len = 0;
+        double * x = oracle_vec(*oracleDs_->nextSolutionPtr, len);
+        const double * a  = &s_oracle.vals[lo * s_oracle.n];
+        const double * b  = &s_oracle.vals[hi * s_oracle.n];
+        const double * da = &s_oracle.ders[lo * s_oracle.n];
+        const double * db = &s_oracle.ders[hi * s_oracle.n];
+        // cubic Hermite: linear interp of samples is cruder than the
+        // integrator's own 2nd-order representation at switching edges and
+        // hands Newton nonphysical mid-swing states; with the recorded
+        // derivatives the interpolant's error is far below LTE
+        double h00 = (1 + 2 * w) * (1 - w) * (1 - w);
+        double h10 = w * (1 - w) * (1 - w);
+        double h01 = w * w * (3 - 2 * w);
+        double h11 = w * w * (w - 1);
+        long m = (len < s_oracle.n) ? len : s_oracle.n;
+        // Per-node safety gate: the audit showed the oracle is 2.1x closer
+        // in mean L2 but its rare mid-swing errors (nonphysical crowbar
+        // states on drifted edges) cost more than its accuracy earns —
+        // Newton and the limiters answer to the worst node, not the mean.
+        // Where oracle and polynomial disagree beyond the clamp, keep the
+        // physically-benign polynomial value.
+        if (s_oracle.clamp > 0)
+        {
+          for (long i = 0; i < m; ++i)
+          {
+            double o = h00 * a[i] + h10 * dt * da[i] + h01 * b[i] +
+                       h11 * dt * db[i];
+            double d = o - x[i];
+            if (d > -s_oracle.clamp && d < s_oracle.clamp)
+              x[i] = o;
+          }
+        }
+        else
+        {
+          for (long i = 0; i < m; ++i)
+            x[i] = h00 * a[i] + h10 * dt * da[i] + h01 * b[i] + h11 * dt * db[i];
+        }
+        ++s_oracle.overlays;
+        if (s_oracle.audit)
+          s_oracle.orcGuess.assign(x, x + len);
+      }
+    }
+  }
 }
 
 void WorkingIntegrationMethod::obtainPredictorDeriv()
@@ -265,7 +495,56 @@ void WorkingIntegrationMethod::completeStep(const TIAParams &tia_params)
 
 //  Stats::TimeBlock x(completeStepStat_);
 
-  return timeIntegrationMethod_->completeStep(tia_params);
+  timeIntegrationMethod_->completeStep(tia_params);
+
+  if (s_oracle.mode == 1 && oracleDs_ && oracleSec_ && oracleDs_->currSolutionPtr)
+  {
+    int len = 0;
+    double * x = oracle_vec(*oracleDs_->currSolutionPtr, len);
+    double t = oracleSec_->currentTime;
+    std::fwrite(&t, sizeof t, 1, s_oracle.f);
+    std::fwrite(x, sizeof(double), len, s_oracle.f);
+  }
+
+  if (s_oracle.fsto && oracleDs_ && oracleSec_ && oracleDs_->currStorePtr)
+  {
+    int m = 0;
+    double * sto = oracle_vec(*oracleDs_->currStorePtr, m);
+    if (s_oracle.m < 0)
+    {
+      s_oracle.m = m;
+      long mm = m;
+      std::fwrite(&mm, sizeof mm, 1, s_oracle.fsto);
+    }
+    double t = oracleSec_->currentTime;
+    std::fwrite(&t, sizeof t, 1, s_oracle.fsto);
+    std::fwrite(sto, sizeof(double), m, s_oracle.fsto);
+  }
+
+  if (s_oracle.audit && oracleDs_ && oracleDs_->currSolutionPtr &&
+      !s_oracle.polyGuess.empty() && !s_oracle.orcGuess.empty())
+  {
+    int len = 0;
+    double * x = oracle_vec(*oracleDs_->currSolutionPtr, len);
+    double pl2 = 0, ol2 = 0;
+    size_t m = s_oracle.polyGuess.size() < (size_t) len
+                 ? s_oracle.polyGuess.size() : (size_t) len;
+    for (size_t i = 0; i < m; ++i)
+    {
+      double dp = s_oracle.polyGuess[i] - x[i];
+      double dor = s_oracle.orcGuess[i] - x[i];
+      pl2 += dp * dp;
+      ol2 += dor * dor;
+      double ap = dp < 0 ? -dp : dp, ao = dor < 0 ? -dor : dor;
+      if (ap > s_oracle.polyLinf) s_oracle.polyLinf = ap;
+      if (ao > s_oracle.orcLinf) s_oracle.orcLinf = ao;
+    }
+    s_oracle.polyL2 += std::sqrt(pl2);
+    s_oracle.orcL2 += std::sqrt(ol2);
+    ++s_oracle.audits;
+    s_oracle.polyGuess.clear();
+    s_oracle.orcGuess.clear();
+  }
 }
 
 

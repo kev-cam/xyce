@@ -195,7 +195,13 @@ private:
   Stats::Stat                   jacobianStat_;
   Stats::Stat                   initializeStat_;
 
-  Stats::Stat                   updateLeadStat_; 
+  Stats::Stat                   updateLeadStat_;
+
+  // behavioral-oracle hooks (XYCE_ORACLE_RECORD / XYCE_ORACLE_REPLAY):
+  // stashed at method creation so the dispatcher-level hooks can reach the
+  // solution vectors and step times
+  StepErrorControl *            oracleSec_ = 0;
+  DataStore *                   oracleDs_ = 0;
 };
 
 } // namespace TimeIntg
