@@ -242,6 +242,10 @@ private:
   // without re-evaluating the model equations.
   double bypV_[6] = {0, 0, 0, 0, 0, 0};
   bool bypValid_ = false;
+  bool bypassedNow_ = false;  // this iteration's eval was a bypass hit
+  bool accInAcc_ = false;     // stamps currently summed into the frozen acc
+  double frzF_[6] = {0, 0, 0, 0, 0, 0};  // exact values added to the acc
+  double frzQ_[4] = {0, 0, 0, 0};        // (subtracted verbatim on wake)
 
   bool IC_GIVEN;
 
@@ -799,6 +803,21 @@ public:
   {}
 
   virtual bool updateState (double * solVec, double * staVec, double * stoVec);
+
+  // Frozen-sum residual loads (XYCE_FROZEN_LOADS, needs XYCE_BYPASS):
+  // per-Master accumulator of the bypassed instances' F/Q contributions,
+  // rebuilt only on membership change; stampFQ is the per-instance stamping
+  // body shared by the accumulator build, the active-minority loop, and the
+  // stock path.
+  std::vector<double> accF_, accQ_;
+  bool accValid_ = false;
+  static void stampFQ (Instance & mi, double gmin1, bool newMeyer, bool dcop,
+                       bool gcOn, double * solVec, double * fVec,
+                       double * qVec, double * leadF, double * leadQ,
+                       double * junctionV);
+  static bool frozen (const Instance & mi);
+  void frozenJoin (Instance & mi);   // compute+cache stamps, add to acc
+  void frozenLeave (Instance & mi);  // subtract the cached stamps
 
   // new DAE stuff:
   // new DAE load functions, residual:

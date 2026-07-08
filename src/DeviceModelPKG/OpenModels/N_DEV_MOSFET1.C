@@ -55,6 +55,7 @@
 
 #include <atomic>
 #include <cstdlib>
+#include <vector>
 
 namespace Xyce {
 namespace Device {
@@ -65,12 +66,17 @@ namespace MOSFET1 {
 namespace {
 std::atomic<unsigned long> s_bypHits(0);
 std::atomic<unsigned long> s_bypEvals(0);
+unsigned long s_frzRebuilds = 0;
+unsigned long s_frzIters = 0;
 void bypReport()
 {
   unsigned long h = s_bypHits.load(), e = s_bypEvals.load();
   if (e + h)
     std::fprintf(stderr, "[bypass] MOSFET1: %lu bypassed / %lu eval calls "
                  "(%.1f%%)\n", h, e + h, 100.0 * h / (double) (e + h));
+  if (s_frzIters)
+    std::fprintf(stderr, "[frozen-loads] MOSFET1: %lu accumulator rebuilds "
+                 "over %lu load calls\n", s_frzRebuilds, s_frzIters);
 }
 double bypTolInit()
 {
@@ -81,6 +87,25 @@ double bypTolInit()
   return t;
 }
 const double s_bypTol = bypTolInit();
+
+// Frozen-sum residual loads (XYCE_FROZEN_LOADS=1, needs XYCE_BYPASS): the
+// summed F/Q contributions of bypassed instances are kept in a persistent
+// accumulator, rebuilt only when the frozen membership changes (rare — the
+// active set is bimodal). Each load call then costs one vector add plus
+// stamps for the active minority.
+const bool s_frzLoads = [] {
+  const char * e = std::getenv("XYCE_FROZEN_LOADS");
+  return e && std::atoi(e) != 0;
+}();
+
+// XYCE_FROZEN_STATE=1: decide the bypass up in the updateState sweep and
+// skip the whole per-instance body (eval call + state/store writes). A
+// frozen device's state history is constant, so the state carried forward
+// by the integrator reproduces the skipped writes exactly.
+const bool s_frzSkipState = [] {
+  const char * e = std::getenv("XYCE_FROZEN_STATE");
+  return e && std::atoi(e) != 0;
+}();
 }
 
 void Traits::loadInstanceParameters(ParametricData<MOSFET1::Instance> &p)
@@ -2790,12 +2815,14 @@ bool Instance::updateIntermediateVars ()
         && std::fabs(Vsp - bypV_[4]) <= s_bypTol
         && std::fabs(Vdp - bypV_[5]) <= s_bypTol)
     {
+      bypassedNow_ = true;
       s_bypHits.fetch_add(1, std::memory_order_relaxed);
       return true;
     }
     bypV_[0] = Vd;  bypV_[1] = Vg;  bypV_[2] = Vs;
     bypV_[3] = Vb;  bypV_[4] = Vsp; bypV_[5] = Vdp;
     bypValid_ = true;
+    bypassedNow_ = false;
     s_bypEvals.fetch_add(1, std::memory_order_relaxed);
   }
 
@@ -4319,6 +4346,29 @@ bool Master::updateState (double * solVec, double * staVec, double * stoVec)
       __builtin_prefetch(pf + 128);
     }
     Instance & mi = *(instBegin[kInst]);
+
+    // XYCE_FROZEN_STATE: hoisted bypass — skip the eval call and the
+    // state/store rewrites entirely when no terminal has moved. The
+    // rewrites are exactly redundant for a frozen device (constant state
+    // history), and the 136M-call overhead is the residual-load mass.
+    if (s_frzSkipState && s_bypTol > 0.0 && mi.bypValid_ && mi.origFlag
+        && !mi.loadLeadCurrent && !getSolverState().dcopFlag
+        && !getDeviceOptions().newMeyerFlag)
+    {
+      double * sv = mi.extData.nextSolVectorRawPtr;
+      if (   std::fabs(sv[mi.li_Drain]       - mi.bypV_[0]) <= s_bypTol
+          && std::fabs(sv[mi.li_Gate]        - mi.bypV_[1]) <= s_bypTol
+          && std::fabs(sv[mi.li_Source]      - mi.bypV_[2]) <= s_bypTol
+          && std::fabs(sv[mi.li_Bulk]        - mi.bypV_[3]) <= s_bypTol
+          && std::fabs(sv[mi.li_SourcePrime] - mi.bypV_[4]) <= s_bypTol
+          && std::fabs(sv[mi.li_DrainPrime]  - mi.bypV_[5]) <= s_bypTol)
+      {
+        mi.bypassedNow_ = true;
+        s_bypHits.fetch_add(1, std::memory_order_relaxed);
+        continue;
+      }
+    }
+
     double * oldstaVec = mi.extData.currStaVectorRawPtr;
     double * stoVec = mi.extData.nextStoVectorRawPtr;
     double * oldstoVec = mi.extData.currStoVectorRawPtr;
@@ -4415,22 +4465,21 @@ bool Master::updateState (double * solVec, double * staVec, double * stoVec)
 // Creator       : Eric Keiter, SNL
 // Creation Date : 11/26/08
 //-----------------------------------------------------------------------------
-bool Master::loadDAEVectors (double * solVec, double * fVec, double *qVec,  double * bVec, double * leadF, double * leadQ, double * junctionV)
+// Per-instance F/Q stamping, extracted verbatim from the load loop so the
+// frozen-sum path can retarget it at the accumulator arrays.
+void Master::stampFQ (Instance & mi, double gmin1, bool newMeyer, bool dcop,
+                      bool gcOn, double * solVec, double * fVec, double * qVec,
+                      double * leadF, double * leadQ, double * junctionV)
 {
-  double gmin1 = getDeviceOptions().gmin;
-  for (InstanceVector::const_iterator it = getInstanceBegin(); it != getInstanceEnd(); ++it)
-  {
-    Instance & mi = *(*it);
-
     int Dtype=mi.getModel().dtype;
     double ceqbs(0.0),ceqbd(0.0),ceqgb(0.0), ceqgs(0.0), ceqgd(0.0);
     double Qeqbs(0.0),Qeqbd(0.0),Qeqgb(0.0), Qeqgs(0.0), Qeqgd(0.0);
     double coef(0.0);
 
     // F-Vector:
-    if (getDeviceOptions().newMeyerFlag)
+    if (newMeyer)
     {
-      if (!getSolverState().dcopFlag)
+      if (!dcop)
       {
         double vbsdot = Dtype*(mi.Vbdot - mi.Vspdot);
         double vbddot = Dtype*(mi.Vbdot - mi.Vdpdot);
@@ -4487,7 +4536,7 @@ bool Master::loadDAEVectors (double * solVec, double * fVec, double *qVec,  doub
 
     // Q-Vector:
      //Here's where we do the new Meyer stuff if selected:
-    if (getDeviceOptions().newMeyerFlag)
+    if (newMeyer)
     {
       //The first 6 eqns---representing the equations for the gate, drain, bulk,
       //source, drain', and source' nodes---are all zero here, so we don't need
@@ -4573,10 +4622,10 @@ bool Master::loadDAEVectors (double * solVec, double * fVec, double *qVec,  doub
       dFdxdVp[mi.li_SourcePrime] += coef_Jdxp6*mi.numberParallel;
 
       // Q-limiters:
-      if (!getDeviceOptions().newMeyerFlag)
+      if (!newMeyer)
       {
         double gcgd(0.0), gcgs(0.0), gcgb(0.0), gcbs(0.0), gcbd(0.0);
-        if ( getSolverState().tranopFlag || getSolverState().acopFlag || getSolverState().transientFlag)
+        if (gcOn)
         {
           gcgd = mi.Capgd;
           gcgs = mi.Capgs;
@@ -4644,8 +4693,128 @@ bool Master::loadDAEVectors (double * solVec, double * fVec, double *qVec,  doub
       junctionV[mi.li_branch_dev_id] = solVec[mi.li_Drain] - solVec[mi.li_Source];
       junctionV[mi.li_branch_dev_ig] = solVec[mi.li_Gate] - solVec[mi.li_Source];
       junctionV[mi.li_branch_dev_is] = 0.0;
-      junctionV[mi.li_branch_dev_ib] = 0.0 ; 
+      junctionV[mi.li_branch_dev_ib] = 0.0 ;
     }
+}
+
+// A frozen instance's stamps are constant: bypassed this iteration, not
+// voltage-limiting (its jdxp terms go to a vector the accumulator doesn't
+// cover), and not publishing lead currents.
+bool Master::frozen (const Instance & mi)
+{
+  return mi.bypassedNow_ && mi.origFlag && !mi.loadLeadCurrent;
+}
+
+// Incremental membership: the non-newMeyer F/Q contributions are 10 simple
+// expressions of cached instance members, so joining adds them (and caches
+// the exact values) and waking subtracts the cache verbatim — no rebuild.
+void Master::frozenJoin (Instance & mi)
+{
+  const int Dtype = mi.getModel().dtype;
+  const double np = mi.numberParallel;
+  const double ceqbs = Dtype * mi.cbs, ceqbd = Dtype * mi.cbd;
+  mi.frzF_[0] = (mi.drainConductance != 0.0) ? mi.Idrain * np : 0.0;
+  mi.frzF_[1] = 0.0;                                   // gate (ceqg* == 0)
+  mi.frzF_[2] = (mi.sourceConductance != 0.0) ? mi.Isource * np : 0.0;
+  mi.frzF_[3] = (ceqbs + ceqbd) * np;
+  mi.frzF_[4] = (-mi.Idrain - (ceqbd - mi.cdreq)) * np;
+  mi.frzF_[5] = (-mi.Isource - (ceqbs + mi.cdreq)) * np;
+  const double Qeqbs = Dtype * mi.qbs, Qeqbd = Dtype * mi.qbd;
+  const double Qeqgb = Dtype * mi.qgb, Qeqgs = Dtype * mi.qgs;
+  const double Qeqgd = Dtype * mi.qgd;
+  mi.frzQ_[0] = (Qeqgs + Qeqgd + Qeqgb) * np;
+  mi.frzQ_[1] = (Qeqbs + Qeqbd - Qeqgb) * np;
+  mi.frzQ_[2] = -(Qeqbd + Qeqgd) * np;
+  mi.frzQ_[3] = -(Qeqbs + Qeqgs) * np;
+  accF_[mi.li_Drain]       += mi.frzF_[0];
+  accF_[mi.li_Gate]        += mi.frzF_[1];
+  accF_[mi.li_Source]      += mi.frzF_[2];
+  accF_[mi.li_Bulk]        += mi.frzF_[3];
+  accF_[mi.li_DrainPrime]  += mi.frzF_[4];
+  accF_[mi.li_SourcePrime] += mi.frzF_[5];
+  accQ_[mi.li_Gate]        += mi.frzQ_[0];
+  accQ_[mi.li_Bulk]        += mi.frzQ_[1];
+  accQ_[mi.li_DrainPrime]  += mi.frzQ_[2];
+  accQ_[mi.li_SourcePrime] += mi.frzQ_[3];
+  mi.accInAcc_ = true;
+}
+
+void Master::frozenLeave (Instance & mi)
+{
+  accF_[mi.li_Drain]       -= mi.frzF_[0];
+  accF_[mi.li_Gate]        -= mi.frzF_[1];
+  accF_[mi.li_Source]      -= mi.frzF_[2];
+  accF_[mi.li_Bulk]        -= mi.frzF_[3];
+  accF_[mi.li_DrainPrime]  -= mi.frzF_[4];
+  accF_[mi.li_SourcePrime] -= mi.frzF_[5];
+  accQ_[mi.li_Gate]        -= mi.frzQ_[0];
+  accQ_[mi.li_Bulk]        -= mi.frzQ_[1];
+  accQ_[mi.li_DrainPrime]  -= mi.frzQ_[2];
+  accQ_[mi.li_SourcePrime] -= mi.frzQ_[3];
+  mi.accInAcc_ = false;
+}
+
+bool Master::loadDAEVectors (double * solVec, double * fVec, double *qVec,  double * bVec, double * leadF, double * leadQ, double * junctionV)
+{
+  double gmin1 = getDeviceOptions().gmin;
+  const bool newMeyer = getDeviceOptions().newMeyerFlag;
+  const bool dcop = getSolverState().dcopFlag;
+  const bool gcOn = getSolverState().tranopFlag || getSolverState().acopFlag
+                    || getSolverState().transientFlag;
+
+  if (s_frzLoads && s_bypTol > 0.0 && !dcop && !newMeyer
+      && getInstanceBegin() != getInstanceEnd())
+  {
+    ++s_frzIters;
+    static unsigned long s_transitions = 0;
+    size_t len = (size_t)
+      (*getInstanceBegin())->extData.daeFVectorPtr->localLength();
+    if (accF_.size() != len || !accValid_
+        || s_transitions >= 1000000)          // FP-drift insurance rebuild
+    {
+      ++s_frzRebuilds;
+      s_transitions = 0;
+      accF_.assign(len, 0.0);
+      accQ_.assign(len, 0.0);
+      for (InstanceVector::const_iterator it = getInstanceBegin();
+           it != getInstanceEnd(); ++it)
+        (*it)->accInAcc_ = false;
+      accValid_ = true;
+    }
+    // incremental membership: joins add cached stamps, wakes subtract them
+    for (InstanceVector::const_iterator it = getInstanceBegin();
+         it != getInstanceEnd(); ++it)
+    {
+      Instance & mi = *(*it);
+      const bool frz = frozen(mi);
+      if (frz && !mi.accInAcc_)
+      {
+        frozenJoin(mi);
+        ++s_transitions;
+      }
+      else if (!frz && mi.accInAcc_)
+      {
+        frozenLeave(mi);
+        ++s_transitions;
+      }
+    }
+    for (size_t i = 0; i < len; ++i)
+    {
+      fVec[i] += accF_[i];
+      qVec[i] += accQ_[i];
+    }
+    for (InstanceVector::const_iterator it = getInstanceBegin();
+         it != getInstanceEnd(); ++it)
+      if (!(*it)->accInAcc_)
+        stampFQ(*(*it), gmin1, newMeyer, dcop, gcOn, solVec,
+                fVec, qVec, leadF, leadQ, junctionV);
+    return true;
+  }
+
+  for (InstanceVector::const_iterator it = getInstanceBegin(); it != getInstanceEnd(); ++it)
+  {
+    stampFQ(*(*it), gmin1, newMeyer, dcop, gcOn, solVec,
+            fVec, qVec, leadF, leadQ, junctionV);
   }
   return true;
 }
