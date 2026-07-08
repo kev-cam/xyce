@@ -236,6 +236,13 @@ private:
 
   bool limitedFlag;  // for convergence testing.
 
+  // Quiescence bypass (XYCE_BYPASS): terminal voltages at this instance's
+  // last full evaluation. When none has moved more than the threshold the
+  // cached linearization (ids/gm/gds, Meyer caps, charges) is restamped
+  // without re-evaluating the model equations.
+  double bypV_[6] = {0, 0, 0, 0, 0, 0};
+  bool bypValid_ = false;
+
   bool IC_GIVEN;
 
   //end of 3f5 outtakes
