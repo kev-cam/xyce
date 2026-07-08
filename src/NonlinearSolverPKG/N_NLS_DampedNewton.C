@@ -60,6 +60,7 @@
 #include <N_NLS_ParamMgr.h>
 #include <N_NLS_TwoLevelNewton.h>
 #include <N_PDS_Comm.h>
+#include <N_PDS_ParMap.h>
 #include <N_TIA_DataStore.h>
 #include <N_UTL_FeatureTest.h>
 #include <N_UTL_OptionBlock.h>
@@ -1258,15 +1259,19 @@ int DampedNewton::converged_()
   // Max RHS norm (maxNormRHS_) and the weighted update norm (wtNormDX_) are
   // used in converged_() and output by printStepInfo_().  The stock path
   // computes them through two allgather-based max norms (four collectives);
-  // the max-norm indices they also produce are only consumed by the verbose
-  // step printout.  On the non-verbose path both local maxima are computed
-  // inline and combined in a single maxAll.
+  // on the non-verbose path both local maxima are computed inline and
+  // combined in a single maxAll.  The RHS argmax index must survive: the
+  // transient failure history reports the worst node per step through it
+  // (Certification_Tests/BUG_360_SON/nand8 guards exactly that).  Serial
+  // gets it free from the local argmax; parallel pays one extra fused
+  // maxAll to resolve the owning index — still 2 collectives vs 4.
   if (!VERBOSE_NONLINEAR)
   {
     /* local maxima mirror the stock accessors exactly: infNorm reads the
        ASSEMBLED view, wMaxNorm reads the OVERLAPPED view over the assembled
        length — reproducing both (per branch) keeps results bit-identical */
     double lmax[2] = {0.0, 0.0};
+    int lidx = -1;
     int len = rhsVectorPtr_->localLength();
     if (nlParams.getMaskingFlag())
     {
@@ -1274,7 +1279,7 @@ int DampedNewton::converged_()
       for (int j = 0; j < len; ++j)
       {
         double v = std::fabs(*(*rhsVectorPtr_)(j, 0)) / *(*pw)(j, 0);
-        if (v > lmax[0]) lmax[0] = v;
+        if (v > lmax[0]) { lmax[0] = v; lidx = j; }
       }
     }
     else
@@ -1285,7 +1290,7 @@ int DampedNewton::converged_()
       for (int j = 0; j < len; ++j)
       {
         double v = std::fabs(rp[j]);
-        if (v > lmax[0]) lmax[0] = v;
+        if (v > lmax[0]) { lmax[0] = v; lidx = j; }
       }
     }
     len = searchDirectionPtr_->localLength();
@@ -1295,10 +1300,24 @@ int DampedNewton::converged_()
       if (v > lmax[1]) lmax[1] = v;
     }
     double gmax[2];
-    pdsMgrPtr_->getPDSComm()->maxAll(lmax, gmax, 2);
+    Parallel::Communicator * comm = pdsMgrPtr_->getPDSComm();
+    comm->maxAll(lmax, gmax, 2);
     maxNormRHS_ = gmax[0];
-    maxNormRHSindex_ = -1;
     wtNormDX_ = gmax[1];
+    if (comm->numProc() == 1)
+    {
+      maxNormRHSindex_ = lidx;
+    }
+    else
+    {
+      // owner(s) of the global max nominate their global index; ties pick
+      // the highest (the stock allgather path is owner-order dependent too)
+      double lnom = (lmax[0] == gmax[0] && lidx >= 0)
+        ? (double) rhsVectorPtr_->pmap()->localToGlobalIndex(lidx) : -1.0;
+      double gnom = -1.0;
+      comm->maxAll(&lnom, &gnom, 1);
+      maxNormRHSindex_ = (int) gnom;
+    }
   }
   else
   {
