@@ -246,6 +246,11 @@ private:
   bool accInAcc_ = false;     // stamps currently summed into the frozen acc
   double frzF_[6] = {0, 0, 0, 0, 0, 0};  // exact values added to the acc
   double frzQ_[4] = {0, 0, 0, 0};        // (subtracted verbatim on wake)
+  bool inAccJ_ = false;       // matrix stamps summed into the jac acc
+  double frzJF_[17] = {};     // captured dFdx contributions (by differencing)
+  double frzJQ_[14] = {};     // captured dQdx contributions
+  int frzJFoff_[17] = {};     // offsets into the CRS values arrays
+  int frzJQoff_[14] = {};
 
   bool IC_GIVEN;
 
@@ -818,6 +823,13 @@ public:
   static bool frozen (const Instance & mi);
   void frozenJoin (Instance & mi);   // compute+cache stamps, add to acc
   void frozenLeave (Instance & mi);  // subtract the cached stamps
+
+  // matrix-side frozen sum (XYCE_FROZEN_JAC): CRS-offset accumulators;
+  // contributions captured generically by differencing around the stamp
+  std::vector<double> accJF_, accJQ_;
+  bool accJValid_ = false;
+  static void jacPtrs (Instance & mi, double * pf[17], double * pq[14]);
+  void jacLeave (Instance & mi);
 
   // new DAE stuff:
   // new DAE load functions, residual:

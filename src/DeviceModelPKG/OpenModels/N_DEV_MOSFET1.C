@@ -50,6 +50,8 @@
 #include <N_ERH_ErrorMgr.h>
 #include <N_LAS_Matrix.h>
 #include <N_LAS_Vector.h>
+#include <N_LAS_EpetraHelpers.h>
+#include <Epetra_CrsMatrix.h>
 #include <N_UTL_FeatureTest.h>
 #include <N_ANP_NoiseData.h>
 
@@ -68,6 +70,9 @@ std::atomic<unsigned long> s_bypHits(0);
 std::atomic<unsigned long> s_bypEvals(0);
 unsigned long s_frzRebuilds = 0;
 unsigned long s_frzIters = 0;
+unsigned long s_frzJIters = 0;
+unsigned long s_frzJRebuilds = 0;
+unsigned long s_jacTrans = 0;
 void bypReport()
 {
   unsigned long h = s_bypHits.load(), e = s_bypEvals.load();
@@ -77,6 +82,10 @@ void bypReport()
   if (s_frzIters)
     std::fprintf(stderr, "[frozen-loads] MOSFET1: %lu accumulator rebuilds "
                  "over %lu load calls\n", s_frzRebuilds, s_frzIters);
+  if (s_frzJIters)
+    std::fprintf(stderr, "[frozen-jac] MOSFET1: %lu rebuilds, %lu "
+                 "transitions over %lu matrix loads\n",
+                 s_frzJRebuilds, s_jacTrans, s_frzJIters);
 }
 double bypTolInit()
 {
@@ -104,6 +113,12 @@ const bool s_frzLoads = [] {
 // by the integrator reproduces the skipped writes exactly.
 const bool s_frzSkipState = [] {
   const char * e = std::getenv("XYCE_FROZEN_STATE");
+  return e && std::atoi(e) != 0;
+}();
+
+// XYCE_FROZEN_JAC=1: matrix-side frozen sum over the CRS values arrays.
+const bool s_frzJac = [] {
+  const char * e = std::getenv("XYCE_FROZEN_JAC");
   return e && std::atoi(e) != 0;
 }();
 }
@@ -4754,6 +4769,57 @@ void Master::frozenLeave (Instance & mi)
   mi.accInAcc_ = false;
 }
 
+// Matrix-side frozen sum. The dFdx/dQdx contribution of a frozen instance
+// is captured generically: read its stamp targets, let the stock stamping
+// run, read again — the difference is exactly its contribution (linearity
+// of +=), with no duplication of the stamp formulas. Offsets into the CRS
+// values arrays are cached so a waking instance subtracts verbatim.
+void Master::jacPtrs (Instance & mi, double * pf[17], double * pq[14])
+{
+  pf[0]  = mi.f_DrainEquDrainNodePtr;
+  pf[1]  = mi.f_DrainEquDrainPrimeNodePtr;
+  pf[2]  = mi.f_SourceEquSourceNodePtr;
+  pf[3]  = mi.f_SourceEquSourcePrimeNodePtr;
+  pf[4]  = mi.f_BulkEquBulkNodePtr;
+  pf[5]  = mi.f_BulkEquDrainPrimeNodePtr;
+  pf[6]  = mi.f_BulkEquSourcePrimeNodePtr;
+  pf[7]  = mi.f_DrainPrimeEquDrainNodePtr;
+  pf[8]  = mi.f_DrainPrimeEquGateNodePtr;
+  pf[9]  = mi.f_DrainPrimeEquBulkNodePtr;
+  pf[10] = mi.f_DrainPrimeEquDrainPrimeNodePtr;
+  pf[11] = mi.f_DrainPrimeEquSourcePrimeNodePtr;
+  pf[12] = mi.f_SourcePrimeEquGateNodePtr;
+  pf[13] = mi.f_SourcePrimeEquSourceNodePtr;
+  pf[14] = mi.f_SourcePrimeEquBulkNodePtr;
+  pf[15] = mi.f_SourcePrimeEquDrainPrimeNodePtr;
+  pf[16] = mi.f_SourcePrimeEquSourcePrimeNodePtr;
+  pq[0]  = mi.q_GateEquGateNodePtr;
+  pq[1]  = mi.q_GateEquBulkNodePtr;
+  pq[2]  = mi.q_GateEquDrainPrimeNodePtr;
+  pq[3]  = mi.q_GateEquSourcePrimeNodePtr;
+  pq[4]  = mi.q_BulkEquGateNodePtr;
+  pq[5]  = mi.q_BulkEquBulkNodePtr;
+  pq[6]  = mi.q_BulkEquDrainPrimeNodePtr;
+  pq[7]  = mi.q_BulkEquSourcePrimeNodePtr;
+  pq[8]  = mi.q_DrainPrimeEquGateNodePtr;
+  pq[9]  = mi.q_DrainPrimeEquBulkNodePtr;
+  pq[10] = mi.q_DrainPrimeEquDrainPrimeNodePtr;
+  pq[11] = mi.q_SourcePrimeEquGateNodePtr;
+  pq[12] = mi.q_SourcePrimeEquBulkNodePtr;
+  pq[13] = mi.q_SourcePrimeEquSourcePrimeNodePtr;
+}
+
+void Master::jacLeave (Instance & mi)
+{
+  for (int k = 0; k < 17; ++k)
+    if (mi.frzJFoff_[k] >= 0)
+      accJF_[mi.frzJFoff_[k]] -= mi.frzJF_[k];
+  for (int k = 0; k < 14; ++k)
+    if (mi.frzJQoff_[k] >= 0)
+      accJQ_[mi.frzJQoff_[k]] -= mi.frzJQ_[k];
+  mi.inAccJ_ = false;
+}
+
 bool Master::loadDAEVectors (double * solVec, double * fVec, double *qVec,  double * bVec, double * leadF, double * leadQ, double * junctionV)
 {
   double gmin1 = getDeviceOptions().gmin;
@@ -4830,9 +4896,71 @@ bool Master::loadDAEVectors (double * solVec, double * fVec, double *qVec,  doub
 //-----------------------------------------------------------------------------
 bool Master::loadDAEMatrices (Linear::Matrix & dFdx, Linear::Matrix & dQdx)
 {
+  const bool frzJ = s_frzJac && s_bypTol > 0.0
+      && !getSolverState().dcopFlag && !getDeviceOptions().newMeyerFlag
+      && getInstanceBegin() != getInstanceEnd();
+  double * jfBase = 0;
+  double * jqBase = 0;
+  if (frzJ)
+  {
+    ++s_frzJIters;
+    Epetra_CrsMatrix & eF =
+      dynamic_cast<Linear::EpetraMatrixAccess &>(dFdx).epetraObj();
+    Epetra_CrsMatrix & eQ =
+      dynamic_cast<Linear::EpetraMatrixAccess &>(dQdx).epetraObj();
+    int * rp = 0;
+    int * ci = 0;
+    eF.ExtractCrsDataPointers(rp, ci, jfBase);
+    eQ.ExtractCrsDataPointers(rp, ci, jqBase);
+    size_t nnzF = (size_t) eF.NumMyNonzeros();
+    size_t nnzQ = (size_t) eQ.NumMyNonzeros();
+    if (accJF_.size() != nnzF || accJQ_.size() != nnzQ || !accJValid_
+        || s_jacTrans >= 1000000)           // FP-drift insurance rebuild
+    {
+      ++s_frzJRebuilds;
+      s_jacTrans = 0;
+      accJF_.assign(nnzF, 0.0);
+      accJQ_.assign(nnzQ, 0.0);
+      for (InstanceVector::const_iterator it = getInstanceBegin();
+           it != getInstanceEnd(); ++it)
+        (*it)->inAccJ_ = false;
+      accJValid_ = true;
+    }
+    // wakes subtract their cached contribution before the accumulator add
+    for (InstanceVector::const_iterator it = getInstanceBegin();
+         it != getInstanceEnd(); ++it)
+      if (!frozen(**it) && (*it)->inAccJ_)
+      {
+        jacLeave(**it);
+        ++s_jacTrans;
+      }
+    for (size_t i = 0; i < nnzF; ++i) jfBase[i] += accJF_[i];
+    for (size_t i = 0; i < nnzQ; ++i) jqBase[i] += accJQ_[i];
+  }
+
   for (InstanceVector::const_iterator it = getInstanceBegin(); it != getInstanceEnd(); ++it)
   {
     Instance & mi = *(*it);
+
+    double * capPf[17];
+    double * capPq[14];
+    double capBefore[31];
+    bool capturing = false;
+    if (frzJ)
+    {
+      const bool frz = frozen(mi);
+      if (frz && mi.inAccJ_)
+        continue;                            // covered by the accumulator
+      if (frz && !mi.inAccJ_)
+      {
+        jacPtrs(mi, capPf, capPq);
+        for (int k = 0; k < 17; ++k)
+          capBefore[k] = capPf[k] ? *capPf[k] : 0.0;
+        for (int k = 0; k < 14; ++k)
+          capBefore[17 + k] = capPq[k] ? *capPq[k] : 0.0;
+        capturing = true;
+      }
+    }
 
     //introduce terms for capacitances, partial derivs. of capacitances,
     //and derivatives of differential voltages.  "l" stands for "local"
@@ -5106,6 +5234,26 @@ bool Master::loadDAEMatrices (Linear::Matrix & dFdx, Linear::Matrix & dQdx)
       +gcbs*mi.numberParallel;
       *mi.q_SourcePrimeEquSourcePrimeNodePtr+=
       (+gcbs+gcgs)*mi.numberParallel;
+    }
+
+    if (capturing)
+    {
+      for (int k = 0; k < 17; ++k)
+      {
+        mi.frzJF_[k] = capPf[k] ? *capPf[k] - capBefore[k] : 0.0;
+        mi.frzJFoff_[k] = capPf[k] ? (int) (capPf[k] - jfBase) : -1;
+        if (capPf[k])
+          accJF_[mi.frzJFoff_[k]] += mi.frzJF_[k];
+      }
+      for (int k = 0; k < 14; ++k)
+      {
+        mi.frzJQ_[k] = capPq[k] ? *capPq[k] - capBefore[17 + k] : 0.0;
+        mi.frzJQoff_[k] = capPq[k] ? (int) (capPq[k] - jqBase) : -1;
+        if (capPq[k])
+          accJQ_[mi.frzJQoff_[k]] += mi.frzJQ_[k];
+      }
+      mi.inAccJ_ = true;
+      ++s_jacTrans;
     }
   }
   return true;
