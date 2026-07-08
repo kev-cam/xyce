@@ -97,14 +97,20 @@ double bypTolInit()
 }
 const double s_bypTol = bypTolInit();
 
-// Frozen-sum residual loads (XYCE_FROZEN_LOADS=1, needs XYCE_BYPASS): the
-// summed F/Q contributions of bypassed instances are kept in a persistent
-// accumulator, rebuilt only when the frozen membership changes (rare — the
-// active set is bimodal). Each load call then costs one vector add plus
-// stamps for the active minority.
+// Frozen-sum residual loads (XYCE_FROZEN_LOADS): the summed F/Q
+// contributions of bypassed instances kept in a persistent accumulator.
+// DISABLED — KNOWN BUG. The dense accumulator is correct on digital decks
+// (cmos3000: 6.6e-12) but wrong and memory-unsafe on analog topologies:
+// (1) grounded-terminal LIDs index past the accumulator, and (2) devices
+// that freeze *mid-Newton-iteration* (analog, slow-moving nodes) contribute
+// stale residuals, so Newton converges off (opamp: 6e-2 error + segfault).
+// The matrix-side XYCE_FROZEN_JAC has neither flaw (it captures by
+// differencing the real stamps, touching only valid pointers), so the
+// validated stack is XYCE_BYPASS + XYCE_FROZEN_STATE + XYCE_FROZEN_JAC.
+// Left in place (env still readable) for a future sparse-accumulator fix.
 const bool s_frzLoads = [] {
   const char * e = std::getenv("XYCE_FROZEN_LOADS");
-  return e && std::atoi(e) != 0;
+  return false && e && std::atoi(e) != 0;   // force-off: see note above
 }();
 
 // XYCE_FROZEN_STATE=1: decide the bypass up in the updateState sweep and
