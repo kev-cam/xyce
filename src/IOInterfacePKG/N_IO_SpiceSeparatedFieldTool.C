@@ -712,27 +712,44 @@ bool SpiceSeparatedFieldTool::NextChar_(char& c)
   //       it may be a continuation line if the first non-blank character is a '+'.
   while ( (c == '*') || (c == ' ') || (c == ';') )
   {
-    // blankCont will keep track of if the initial characters in the line are blank. 
+    // blankCont will keep track of if the initial characters in the line are blank.
     bool blankCont = (c==' ');
+    int got = 1;   // characters of this physical line consumed so far
     while ( c != '\r' && c != '\n' )
     {
       if (in_.eof()) return false;
       in_.get(c);
+      ++got;
       if ( blankCont )
       {
         if (in_.eof()) return false;
 
         if (c == ' ') {}  // All whitespace so far, keep reading the line.
-        else if (c == '+') 
+        else if (c == '+')
         {
           // First character is a continuation character, return blank for the continuation.
           c = ' ';
           return true;
         }
+        else if (c == '*' || c == ';')
+        {
+          // Indented comment line -- keep skipping it as before.
+          blankCont = false;
+        }
         else
         {
-          // First character is not a continuation character, this is a comment line.
-          blankCont = false;
+          // First non-blank character starts a real netlist statement: an
+          // INDENTED device/directive line (ubiquitous in netlists written
+          // for other SPICE dialects -- ngspice/HSpice/LTspice all ignore
+          // leading whitespace). Historically this path silently swallowed
+          // the whole line as a comment. Rewind to the START of the line
+          // (not a one-char putback: pass 2 re-reads from recorded stream
+          // positions, so both passes must see identical bytes) and end the
+          // current logical line; skipCommentsAndBlankLines_ hands the
+          // indented statement to the next getLine().
+          in_.clear();
+          in_.seekg(-static_cast<std::streamoff>(got), std::ios::cur);
+          return false;
         }
       }
     }
@@ -825,9 +842,43 @@ void SpiceSeparatedFieldTool::skipCommentsAndBlankLines_()
     in_.get(c);
     if (in_.eof())
       continue;
-    if ( c == '*' || c == ' ' || c == '\t' || c ==';')
+    if ( c == ' ' || c == '\t' )
     {
-      // comment lines can start with * or ; or white space
+      // Leading whitespace: scan to the first non-blank. An indented '*' or
+      // ';' is a comment (skip), an indented '+' keeps its historical
+      // comment-skip behavior, and line terminators mean a blank line -- but
+      // any other character starts a REAL (indented) netlist statement:
+      // rewind to the line start and let the statement parse. This must
+      // mirror NextChar_'s handling exactly: pass 2 re-reads the deck from
+      // recorded stream positions, so both readers have to agree on what an
+      // indented line is.
+      int got = 1;
+      while ( !in_.eof() && (c == ' ' || c == '\t') )
+      {
+        in_.get(c);
+        ++got;
+      }
+      if (in_.eof())
+        continue;
+      if ( c == '*' || c == ';' || c == '+' )
+      {
+        skipToEndOfLine();
+        continue;
+      }
+      if ( c == '\r' )
+        continue;
+      if ( c == '\n' )
+      {
+        ++cursorLineNum_ ;
+        continue;
+      }
+      in_.clear();
+      in_.seekg(-static_cast<std::streamoff>(got), std::ios::cur);
+      return;
+    }
+    if ( c == '*' || c ==';')
+    {
+      // comment lines can start with * or ;
       skipToEndOfLine();
       continue;
     }
