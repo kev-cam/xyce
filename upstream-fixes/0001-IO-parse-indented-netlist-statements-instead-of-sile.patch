@@ -1,0 +1,142 @@
+From f5cea5f96fdb3e25e9e2995138c9a2662367823e Mon Sep 17 00:00:00 2001
+From: Kevin Cameron <kc@ieee.org>
+Date: Mon, 13 Jul 2026 13:21:59 -0700
+Subject: [PATCH] IO: parse indented netlist statements instead of silently
+ eating them
+
+Both netlist readers treated any line whose first character is a space as a
+comment (skipCommentsAndBlankLines_ also swallowed tabs), so a device or
+directive line with leading whitespace was SILENTLY dropped -- e.g. the whole
+gate hierarchy of an indented deck vanished, leaving only the top-level
+column-0 sources, with the first symptom being "undefined symbols in .PRINT".
+Indented device lines are ubiquitous in netlists written for other SPICE
+dialects (ngspice/HSpice/LTspice all ignore leading whitespace).
+
+Fix, applied consistently to BOTH readers (pass 2 re-reads the deck from
+recorded stream positions, so they must agree byte-for-byte):
+
+- NextChar_: when a blank-led line's first non-blank is not '+' (continuation)
+  and not '*'/';' (indented comment), rewind to the START of the line
+  (seekg, not a one-char putback -- keeps recorded positions consistent) and
+  end the logical line; the next getLine() parses the indented statement.
+- skipCommentsAndBlankLines_: scan leading blanks (space AND tab) to the
+  first non-blank; '*'/';' stay comments, '+' keeps its historical
+  comment-skip, terminators mean a blank line; anything else rewinds to the
+  line start and returns so the statement parses.
+
+Verified: indented R/C/X lines after device, dot, and blank lines; chained
+indented instances; indented comments still skipped; column-0 and indented
+'+' continuations unchanged; whitespace-only lines; and a fully indented
+10112-FET C6288 deck now parses and computes 0xFFFF x 0xFFFF = 0xFFFE0001.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ .../N_IO_SpiceSeparatedFieldTool.C            | 63 +++++++++++++++++--
+ 1 file changed, 57 insertions(+), 6 deletions(-)
+ mode change 100644 => 100755 src/IOInterfacePKG/N_IO_SpiceSeparatedFieldTool.C
+
+diff --git a/src/IOInterfacePKG/N_IO_SpiceSeparatedFieldTool.C b/src/IOInterfacePKG/N_IO_SpiceSeparatedFieldTool.C
+old mode 100644
+new mode 100755
+index be094cc7..e99d42c8
+--- a/src/IOInterfacePKG/N_IO_SpiceSeparatedFieldTool.C
++++ b/src/IOInterfacePKG/N_IO_SpiceSeparatedFieldTool.C
+@@ -712,28 +712,45 @@ bool SpiceSeparatedFieldTool::NextChar_(char& c)
+   //       it may be a continuation line if the first non-blank character is a '+'.
+   while ( (c == '*') || (c == ' ') || (c == ';') )
+   {
+-    // blankCont will keep track of if the initial characters in the line are blank. 
++    // blankCont will keep track of if the initial characters in the line are blank.
+     bool blankCont = (c==' ');
++    int got = 1;   // characters of this physical line consumed so far
+     while ( c != '\r' && c != '\n' )
+     {
+       if (in_.eof()) return false;
+       in_.get(c);
++      ++got;
+       if ( blankCont )
+       {
+         if (in_.eof()) return false;
+ 
+         if (c == ' ') {}  // All whitespace so far, keep reading the line.
+-        else if (c == '+') 
++        else if (c == '+')
+         {
+           // First character is a continuation character, return blank for the continuation.
+           c = ' ';
+           return true;
+         }
+-        else
++        else if (c == '*' || c == ';')
+         {
+-          // First character is not a continuation character, this is a comment line.
++          // Indented comment line -- keep skipping it as before.
+           blankCont = false;
+         }
++        else
++        {
++          // First non-blank character starts a real netlist statement: an
++          // INDENTED device/directive line (ubiquitous in netlists written
++          // for other SPICE dialects -- ngspice/HSpice/LTspice all ignore
++          // leading whitespace). Historically this path silently swallowed
++          // the whole line as a comment. Rewind to the START of the line
++          // (not a one-char putback: pass 2 re-reads from recorded stream
++          // positions, so both passes must see identical bytes) and end the
++          // current logical line; skipCommentsAndBlankLines_ hands the
++          // indented statement to the next getLine().
++          in_.clear();
++          in_.seekg(-static_cast<std::streamoff>(got), std::ios::cur);
++          return false;
++        }
+       }
+     }
+ 
+@@ -825,9 +842,43 @@ void SpiceSeparatedFieldTool::skipCommentsAndBlankLines_()
+     in_.get(c);
+     if (in_.eof())
+       continue;
+-    if ( c == '*' || c == ' ' || c == '\t' || c ==';')
++    if ( c == ' ' || c == '\t' )
++    {
++      // Leading whitespace: scan to the first non-blank. An indented '*' or
++      // ';' is a comment (skip), an indented '+' keeps its historical
++      // comment-skip behavior, and line terminators mean a blank line -- but
++      // any other character starts a REAL (indented) netlist statement:
++      // rewind to the line start and let the statement parse. This must
++      // mirror NextChar_'s handling exactly: pass 2 re-reads the deck from
++      // recorded stream positions, so both readers have to agree on what an
++      // indented line is.
++      int got = 1;
++      while ( !in_.eof() && (c == ' ' || c == '\t') )
++      {
++        in_.get(c);
++        ++got;
++      }
++      if (in_.eof())
++        continue;
++      if ( c == '*' || c == ';' || c == '+' )
++      {
++        skipToEndOfLine();
++        continue;
++      }
++      if ( c == '\r' )
++        continue;
++      if ( c == '\n' )
++      {
++        ++cursorLineNum_ ;
++        continue;
++      }
++      in_.clear();
++      in_.seekg(-static_cast<std::streamoff>(got), std::ios::cur);
++      return;
++    }
++    if ( c == '*' || c ==';')
+     {
+-      // comment lines can start with * or ; or white space
++      // comment lines can start with * or ;
+       skipToEndOfLine();
+       continue;
+     }
+-- 
+2.53.0
+
