@@ -154,6 +154,13 @@ class GiNaCEmitter:
         self.var_values: dict[str, float] = {}
         # Track declared variables: name → type ('ex' or 'double')
         self._declared_vars: dict[str, str] = {}
+        # All names the module declares as real/integer locals. A declared var
+        # referenced with no value on the reached path is 0 in Verilog-A
+        # (reals zero-init). Its assignment may have been compile-time skipped
+        # (e.g. binning guarded by `if(BULKMOD!=0)`, or `qinv` behind an
+        # undefined `ifdef`) — emit 0 rather than leaking a bare identifier the
+        # generated C++ can't resolve (K1_i, ETA0R_i, qinv, ...).
+        self._declared_var_names: set[str] = {v.name for v in module.variables}
         # Nesting depth of unresolved runtime conditions
         self._runtime_cond_depth: int = 0
         # CSE: track symbol versions for non-constant variables
@@ -357,6 +364,9 @@ class GiNaCEmitter:
             # Use versioned symbol name for non-constant variables
             if name in self._var_sym_name:
                 return self._var_sym_name[name]
+            # Declared local with no value on this path → 0 (VA zero-init).
+            if name in self._declared_var_names:
+                return '0.0'
             return name
         return re.sub(r'\b[A-Za-z_]\w*\b', _sub, expr)
 
@@ -408,6 +418,9 @@ class GiNaCEmitter:
                 return self._var_sym_name[nm]
             if nm in self.var_values:
                 return repr(self.var_values[nm])
+            # Declared local with no value on this path → 0 (VA zero-init).
+            if nm in self._declared_var_names:
+                return '0.0'
             return nm
         c = re.sub(r'\b[A-Za-z_]\w*\b', _idsub, c)
         return c
@@ -1641,6 +1654,12 @@ class GiNaCEmitter:
             # Use versioned symbol name for non-constant variables
             if name in self._var_sym_name:
                 return self._var_sym_name[name]
+            # Declared local with no value on any reached path → 0 (VA reals
+            # zero-init). Its assignment was compile-time skipped (guarded by a
+            # false `if`, or behind an undefined `ifdef); emitting the bare name
+            # would leave a dangling identifier the eval C++ can't resolve.
+            if name in self._declared_var_names:
+                return '0'
             return name
         result = re.sub(r'\b[A-Za-z_]\w*\b', _subst_known, result)
 
