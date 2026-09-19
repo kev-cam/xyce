@@ -189,7 +189,18 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
     type_variable = va_attrs.get('xyceTypeVariable', '')  # e.g. "TYPE"
 
     ports = [(p.name, p.direction.name) for p in mod.ports]
-    internals = list(mod.internal_nodes)
+    # Node collapse: drop internal nodes shorted via V(a,b)<+0 (e.g. ge->g when
+    # RGATEMOD=0, N when NQSMOD=0). The GiNaC math emitter excludes these from
+    # its node list, so the device shell MUST too — otherwise the shell keeps
+    # extra (gmin-padded, grounded) nodes and stamps e.g. the gate current
+    # I(ge,*) into a dead node instead of g, giving a singular DC Jacobian.
+    from vae.ginac_emitter import GiNaCEmitter as _CollapseGE
+    try:
+        _cge = _CollapseGE(mod, param_values={})
+        _shorted_internals = _cge._find_shorted_nodes(mod.analog_block)
+    except Exception:
+        _shorted_internals = set()
+    internals = [n for n in mod.internal_nodes if n not in _shorted_internals]
     all_nodes = [p.name for p in mod.ports] + internals
     n_ext = len(ports)
     n_int = len(internals)
@@ -623,6 +634,10 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
                      'PACKAGE_STRING', 'MAJOR', 'MINOR'):
         c.append(f'#ifdef {offender}\n#undef {offender}\n#endif')
     c.append('#include <cstdlib>')
+    c.append('#include <cstdio>')
+    c.append('#include <cctype>')
+    c.append('#include <functional>')
+    c.append('#include <sys/stat.h>')
     c.append('')
     c.append(f'namespace Xyce {{ namespace Device {{ namespace PYMS_{NAME} {{')
     c.append('')
@@ -732,23 +747,53 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
     c.append('}')
     c.append('')
 
+    _va_esc = (va_path or '').replace('\\', '\\\\').replace('"', '\\"')
     c.append('bool Instance::processParams() {')
     c.append('  if (!vae_eval_) {')
-    c.append('    // Try VAE_SO_PATH (single .so) or VAE_SO_DIR/<modelname>.so')
+    c.append('    // (1) explicit override: VAE_SO_PATH, or VAE_SO_DIR/<MODEL>.so')
     c.append('    std::string so_path;')
     c.append('    const char *so = getenv("VAE_SO_PATH");')
     c.append('    const char *dir = getenv("VAE_SO_DIR");')
-    c.append('    if (so) {')
-    c.append('      so_path = so;')
-    c.append('    } else if (dir) {')
-    c.append('      so_path = std::string(dir) + "/" + model_.getName() + ".so";')
-    c.append('    }')
+    c.append('    if (so) so_path = so;')
+    c.append('    else if (dir) so_path = std::string(dir) + "/" + model_.getName() + ".so";')
     c.append('    if (!so_path.empty()) {')
     c.append('      vae_dl_ = dlopen(so_path.c_str(), RTLD_NOW);')
-    c.append('      if (vae_dl_) {')
-    c.append('        vae_eval_ = (VaeEvalFn)dlsym(vae_dl_, "vae_eval");')
-    c.append('        vae_jac_ = (VaeEvalFn)dlsym(vae_dl_, "vae_jacobian");')
+    c.append('      if (vae_dl_) { vae_eval_ = (VaeEvalFn)dlsym(vae_dl_, "vae_eval");')
+    c.append('                     vae_jac_ = (VaeEvalFn)dlsym(vae_dl_, "vae_jacobian"); }')
+    c.append('    }')
+    c.append('    // (2) JIT per-instance build: bake THIS instance\'s params into a')
+    c.append('    // GiNaC vae_eval .so via build_vae_so.py, cached by (va, params) hash.')
+    c.append('    if (!vae_eval_) {')
+    c.append(f'      const char *_va = "{_va_esc}";')
+    c.append('      std::string _p; char _pb[96];')
+    for pname, pdefault, is_inst, cxx in params:
+        ref = f'{cxx}' if is_inst else f'model_.{cxx}'
+        c.append(f'      snprintf(_pb,sizeof(_pb),"{pname.upper()}=%.12g\\n",(double)({ref})); _p += _pb;')
+    # Serialize the set of params the user actually supplied (Xyce given()),
+    # so build_vae_so.py can drive $param_given() correctly. Baking every
+    # default as "given" mis-selects model branches (e.g. nVtm = NVTM = 0).
+    c.append('      std::string _gv;')
+    for pname, pdefault, is_inst, cxx in params:
+        guard = (f'given("{pname.upper()}")' if is_inst
+                 else f'model_.given("{pname.upper()}")')
+        c.append(f'      if ({guard}) _gv += "{pname.upper()},";')
+    c.append('      _p += "__GIVEN__=" + _gv + "\\n";')
+    c.append('      std::size_t _key = std::hash<std::string>{}(std::string(_va) + "|" + _p);')
+    c.append('      const char *_cd = getenv("PYMS_VAE_CACHE");')
+    c.append('      std::string _cache = _cd ? _cd : "/tmp/pyms_vae_cache";')
+    c.append('      { std::string _mk = "mkdir -p \'" + _cache + "\'"; if(system(_mk.c_str())){} }')
+    c.append(f'      char _sob[1024]; snprintf(_sob,sizeof(_sob),"%s/vae_%s_%zx.so",_cache.c_str(),"{mod.name}",_key);')
+    c.append('      std::string _sopath = _sob; struct stat _st;')
+    c.append('      if (stat(_sopath.c_str(), &_st) != 0) {')
+    c.append('        std::string _bld; const char *_pd = getenv("PYMS_DIR");')
+    c.append('        if (_pd) { std::string t = std::string(_pd)+"/vae/build_vae_so.py"; if(stat(t.c_str(),&_st)==0) _bld=t; }')
+    c.append('        if (_bld.empty()) { const char* cds[]={"/usr/local/share/xyce/PyMS/vae/build_vae_so.py","/usr/local/src/xyce/utils/PyMS/vae/build_vae_so.py"}; for(auto cc:cds){ if(stat(cc,&_st)==0){_bld=cc;break;} } }')
+    c.append('        std::string _pf = _sopath + ".params"; FILE* _f=fopen(_pf.c_str(),"w"); if(_f){ fwrite(_p.data(),1,_p.size(),_f); fclose(_f); }')
+    c.append('        if (!_bld.empty()) { std::string _cmd = "python3 \'" + _bld + "\' \'" + std::string(_va) + "\' \'" + _sopath + "\' \'" + _pf + "\' 1>&2"; if(system(_cmd.c_str())){} }')
     c.append('      }')
+    c.append('      vae_dl_ = dlopen(_sopath.c_str(), RTLD_NOW);')
+    c.append('      if (vae_dl_) { vae_eval_ = (VaeEvalFn)dlsym(vae_dl_, "vae_eval");')
+    c.append('                     vae_jac_ = (VaeEvalFn)dlsym(vae_dl_, "vae_jacobian"); }')
     c.append('    }')
     c.append('  }')
     c.append('  return true;')
@@ -1214,6 +1259,15 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
             dval = _resolve_default(pdefault)
             c.append(f'  {_cxx} = {dval};')
     c.append('  setModParams(mb.params);')
+    # Wire the MOSFET channel-type variable (xyceTypeVariable, e.g. TYPE) from
+    # the .model nmos/pmos keyword. Xyce registers both model types but leaves
+    # the TYPE var at its +1 default; without this a `pmos` model bakes TYPE=+1
+    # into the JIT math and simulates as an nmos.
+    _tv = _cxx_safe(type_variable) if type_variable else ''
+    if _tv and any(_cxx == _tv for (_pn, _pd, _ii, _cxx) in params if not _ii):
+        c.append('  { std::string _mt = getType(); for(auto &ch:_mt) ch = tolower(ch);')
+        c.append(f'    if (_mt.find("pmos") != std::string::npos || _mt == "p") {_tv} = -1.0;')
+        c.append(f'    else if (_mt.find("nmos") != std::string::npos || _mt == "n") {_tv} = 1.0; }}')
     c.append('  processParams();')
     c.append('}')
     c.append('')

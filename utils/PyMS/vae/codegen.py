@@ -121,7 +121,22 @@ class CodeGen:
     def generate(self) -> str:
         """Generate complete C++ source file."""
         self._process_analog_block(self.mod.analog_block)
+        # Verilog-A locals are function-scoped; assignments inside if/else must not
+        # be re-declared per branch (that block-scopes them). Hoist every
+        # `double X = ...` to a single declaration at function top + plain assign.
+        self.eval_stmts = self._hoist_decls(self.eval_stmts)
+        self.jac_stmts = self._hoist_decls(self.jac_stmts)
         return self._emit_cpp()
+
+    def _hoist_decls(self, stmts):
+        names, seen = [], set()
+        for s in stmts:
+            m = re.match(r'\s*double (\w+) = ', s)
+            if m and m.group(1) not in seen:
+                seen.add(m.group(1)); names.append(m.group(1))
+        decls = ['    double %s = 0.0;' % n for n in names]
+        body = [re.sub(r'^(\s*)double (\w+) = ', r'\1\2 = ', s) for s in stmts]
+        return decls + body
 
     # --- AST walking ---
 
@@ -303,6 +318,9 @@ class CodeGen:
 
         # Clean up spacing
         result = re.sub(r'\s+', ' ', result).strip()
+        for a, b in (('! =', '!='), ('> =', '>='), ('< =', '<='),
+                     ('= =', '=='), ('& &', '&&'), ('| |', '||')):  # un-split multi-char ops
+            result = result.replace(a, b)
 
         return result
 

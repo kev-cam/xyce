@@ -70,7 +70,8 @@ class GiNaCEmitter:
                  forced_conditions: Optional[dict[int, bool]] = None,
                  forced_nodes: Optional[dict[int, bool]] = None,
                  assume_true: Optional[set[str]] = None,
-                 collapse_nodes: bool = True):
+                 collapse_nodes: bool = True,
+                 given_params: Optional[set[str]] = None):
         """
         Args:
             module: Parsed Verilog-A module AST.
@@ -136,9 +137,17 @@ class GiNaCEmitter:
         # No instance params — everything is constant at compile time
         self.instance_params: set[str] = set()
 
-        # Track explicitly given params (for $param_given)
+        # Track explicitly given params (for $param_given). The JIT builder
+        # bakes ALL params (given + defaulted) into param_values, so
+        # param_values.keys() OVER-reports given-ness — e.g. NVTM=0 (a default)
+        # would make $param_given(NVTM) true and select `nVtm = NVTM = 0`,
+        # collapsing every /nVtm term. When the caller knows the true
+        # user-given set (from Xyce's given()), it passes given_params and we
+        # use exactly that; otherwise fall back to the legacy keys() behavior.
         self._given_params: set[str] = set()
-        if param_values:
+        if given_params is not None:
+            self._given_params = set(given_params)
+        elif param_values:
             self._given_params = set(param_values.keys())
 
         # Variable values resolved during elaboration
@@ -157,6 +166,12 @@ class GiNaCEmitter:
         self._assume_true = assume_true or set()
         # Registry of voltage-dependent conditions encountered during walk
         self._condition_registry: list[str] = []
+        # Voltage-dependent conditional handling via indicator-select.
+        # _cond_stack holds metaprogram ex-strings (indicator factors, e.g.
+        # "_sel_3" or "(1 - _sel_3)"); an assignment inside is gated by their
+        # product. _sel_counter names the runtime 0/1 indicator symbols.
+        self._cond_stack: list[str] = []
+        self._sel_counter: int = 0
 
     def emit(self) -> str:
         """Generate the GiNaC C++ program source."""
@@ -345,6 +360,234 @@ class GiNaCEmitter:
             return name
         return re.sub(r'\b[A-Za-z_]\w*\b', _sub, expr)
 
+    def _cond_final_cpp(self, cond: str, active_nodes: list[str]) -> str:
+        """Lower a Verilog-A condition to a C++ boolean over the FINAL-eval
+        doubles: node voltages V(a,b) -> (V_a - V_b), current variable symbol
+        names, and resolved parameter values. Used as the runtime test of an
+        indicator-select. (This is where the guard's V() gets lowered — the old
+        _condition_to_cpp path leaked raw V(p,n) into the emitted code.)"""
+        c = self._preprocess_sys_funcs(cond)
+        for a, b in (('= =', '=='), ('! =', '!='), ('> =', '>='), ('< =', '<='),
+                     ('& &', '&&'), ('| |', '||')):
+            c = c.replace(a, b)
+        branch_neg = getattr(self.mod, 'branch_neg_map', {}) or {}
+        def repl_v(m):
+            p1 = m.group(1).strip()
+            p2 = m.group(2).strip() if m.group(2) else None
+            if p2 is None and p1 in self.branch_map and p1 in branch_neg:
+                p2 = branch_neg[p1]
+            if p1 in self.branch_map:
+                p1 = self.branch_map[p1]
+            if p2 and p2 in self.branch_map:
+                p2 = self.branch_map[p2]
+            if p1 not in active_nodes and p1 in self.internal_nodes:
+                p1 = self._resolve_shorted_node(p1, active_nodes)
+            if p2 and p2 not in active_nodes and p2 in self.internal_nodes:
+                p2 = self._resolve_shorted_node(p2, active_nodes)
+            a = '0.0' if p1 is None else f'V_{p1}'
+            b = None if not p2 else ('0.0' if p2 is None else f'V_{p2}')
+            return f'({a} - {b})' if b is not None else a
+        c = re.sub(r'V\s*\(\s*(\w+)\s*(?:,\s*(\w+)\s*)?\)', repl_v, c)
+        c = c.replace('$vt', 'Vt').replace('$temperature', 'temperature')
+        # Verilog-A math funcs -> C++ (double) equivalents for the runtime test
+        for va, cpp in (('limexp', 'std::exp'), ('lexp', 'std::exp'),
+                        ('lln', 'std::log'), ('ln', 'std::log'),
+                        ('sqrt', 'std::sqrt'), ('abs', 'std::fabs'),
+                        ('min', 'std::fmin'), ('max', 'std::fmax')):
+            c = re.sub(r'\b' + va + r'\b', cpp, c)
+        # Substitute params/vars (leave V_x, std::*, and already-lowered tokens)
+        def _idsub(m):
+            nm = m.group(0)
+            if nm.startswith('V_') or nm in ('V_', 'Vt', 'temperature', 'std'):
+                return nm
+            if nm in self.param_values and nm not in self.instance_params:
+                return repr(self.param_values[nm])
+            if nm in self.instance_params and nm in self.param_values:
+                return repr(self.param_values[nm])
+            if nm in self._var_sym_name:
+                return self._var_sym_name[nm]
+            if nm in self.var_values:
+                return repr(self.var_values[nm])
+            return nm
+        c = re.sub(r'\b[A-Za-z_]\w*\b', _idsub, c)
+        return c
+
+    def _alloc_indicator(self, lines: list[str], cond_cpp: str, pfx: str) -> str:
+        """Emit a runtime 0/1 indicator symbol for a voltage-dependent condition.
+        The symbol is declared in the FINAL eval/jacobian as a raw C++ ternary
+        (via int_raw), and participates in GiNaC expressions as an independent
+        symbol so forward-AD gives dS/dV = 0 -> the correct branch-selected
+        derivative for the selects that reference it."""
+        self._sel_counter += 1
+        name = f'_sel_{self._sel_counter}'
+        esc = cond_cpp.replace('\\', '\\\\').replace('"', '\\"')
+        lines.append(f'{pfx}symbol {name}("{name}");')
+        lines.append(f'{pfx}int_raw[int_syms.size()] = "({esc}) ? 1.0 : 0.0";')
+        lines.append(f'{pfx}int_syms.push_back({name});')
+        lines.append(f'{pfx}int_exprs.push_back({name});')
+        lines.append(f'{pfx}int_names.push_back("{name}");')
+        return name
+
+    # GiNaC/C++ identifiers a Verilog-A variable name must not collide with when
+    # used verbatim as a symbol (e.g. PSP103 has `real ex, inv_ex, ...`; a bare
+    # `symbol ex` collides with the GiNaC `ex` type -> compile errors).
+    _GINAC_RESERVED = frozenset({
+        'ex', 'symbol', 'numeric', 'lst', 'matrix', 'function', 'relational',
+        'I', 'Pi', 'Euler', 'Catalan', 'conjugate', 'N',
+        'pow', 'sqrt', 'exp', 'log', 'abs', 'sin', 'cos', 'tan',
+        'asin', 'acos', 'atan', 'atan2', 'sinh', 'cosh', 'tanh',
+        'step', 'csgn', 'double', 'int', 'float', 'return', 'const',
+    })
+
+    def _safe_sym(self, name: str) -> str:
+        """Mangle a VA variable name that would collide with a GiNaC/C++ identifier."""
+        return name + '_va' if name in self._GINAC_RESERVED else name
+
+    def _var_current_ex_str(self, name: str) -> str:
+        """Metaprogram ex-string for a variable's current value (its value
+        BEFORE a gated reassignment). Precedence matches _subst_known_cpp:
+        constant value, then current symbol, then 0 (unset VA var reads as 0)."""
+        if name in self.var_values:
+            return repr(self.var_values[name])
+        if name in self._var_sym_name:
+            return self._var_sym_name[name]
+        return 'ex(0)'
+
+    def _find_call2(self, expr: str, fname: str):
+        """Find an innermost 2-arg fname(A,B) call (args free of nested
+        min/max). Returns (start, end, A, B) or None."""
+        i = 0
+        while True:
+            m = re.search(r'\b' + fname + r'\s*\(', expr[i:])
+            if not m:
+                return None
+            popen = i + m.end() - 1
+            depth = 0
+            args = []
+            argstart = popen + 1
+            j = popen
+            end = None
+            while j < len(expr):
+                ch = expr[j]
+                if ch == '(':
+                    depth += 1
+                elif ch == ')':
+                    depth -= 1
+                    if depth == 0:
+                        args.append(expr[argstart:j])
+                        end = j + 1
+                        break
+                elif ch == ',' and depth == 1:
+                    args.append(expr[argstart:j])
+                    argstart = j + 1
+                j += 1
+            if end is None:
+                return None
+            inner = expr[popen + 1:end - 1]
+            if len(args) == 2 and not re.search(r'\b(min|max)\s*\(', inner):
+                return (i + m.start(), end, args[0].strip(), args[1].strip())
+            i = popen + 1  # search deeper for a truly-innermost call
+
+    def _find_ternary(self, expr: str):
+        """Find a top-level (depth-0) ternary  cond ? A : B  in expr; returns
+        (cond, A, B) or None. Handles nested ?: when locating the matching ':'."""
+        depth = 0
+        q = -1
+        for i, ch in enumerate(expr):
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+            elif ch == '?' and depth == 0:
+                q = i
+                break
+        if q < 0:
+            return None
+        depth = 0
+        nest = 0
+        for j in range(q + 1, len(expr)):
+            ch = expr[j]
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+            elif depth == 0:
+                if ch == '?':
+                    nest += 1
+                elif ch == ':':
+                    if nest == 0:
+                        return (expr[:q].strip(), expr[q + 1:j].strip(), expr[j + 1:].strip())
+                    nest -= 1
+        return None
+
+    def _emit_select_temp(self, lines, pfx, base_g, alt_g, cond_cpp, alt_cpp, base_cpp, active_nodes) -> str:
+        """Emit a select intermediate  temp = (cond) ? alt : base. The VALUE is a
+        C++ ternary (via int_raw) so the non-taken branch is NOT evaluated — this
+        preserves domain guards like max(x,tiny) that avoid 1/0, log(<=0), etc.
+        (a branchless base+(alt-base)*S would compute inf and hit inf*0 = NaN).
+        The int_expr carries the arithmetic form base+(alt-base)*S purely so
+        forward-AD produces the branch-selected derivative (S has dS/dV = 0)."""
+        S = self._alloc_indicator(lines, cond_cpp, pfx)
+        temp = f'_mm_{self._sel_counter}'
+        sel_g = f'(({base_g}) + ((({alt_g})) - ({base_g})) * {S})'
+        tern = f'(({cond_cpp}) ? ({alt_cpp}) : ({base_cpp}))'
+        esc = tern.replace('\\', '\\\\').replace('"', '\\"')
+        lines.append(f'{pfx}symbol {temp}("{temp}");')
+        lines.append(f'{pfx}int_raw[int_syms.size()] = "{esc}";')
+        lines.append(f'{pfx}int_syms.push_back({temp});')
+        lines.append(f'{pfx}int_exprs.push_back(_safe_ex([&]() -> ex {{ return ({sel_g}); }}));')
+        lines.append(f'{pfx}int_names.push_back("{temp}");')
+        return temp
+
+    def _hoist_selects(self, expr: str, lines: list[str], active_nodes: list[str], pfx: str) -> str:
+        """Lower voltage-dependent min()/max()/ternary in an expression to
+        indicator selects, hoisted to intermediate symbols so the surrounding
+        expression stays symbolic (autodiff-friendly) while the choice is a
+        genuine runtime decision. min(A,B)=B+(A-B)*[A<B], max(A,B)=B+(A-B)*[A>B],
+        (cond?A:B)=B+(A-B)*[cond]. One innermost site per pass, rescanning."""
+        while True:
+            progressed = False
+            # min/max anywhere (innermost first), before ternary so a ternary's
+            # branch min/max becomes a symbol first.
+            for fname, op in (('min', '<'), ('max', '>')):
+                found = self._find_call2(expr, fname)
+                if not found:
+                    continue
+                start, end, A, B = found
+                Acpp = self._cond_final_cpp(A, active_nodes)
+                Bcpp = self._cond_final_cpp(B, active_nodes)
+                temp = self._emit_select_temp(
+                    lines, pfx,
+                    self._to_ginac_expr(B, active_nodes), self._to_ginac_expr(A, active_nodes),
+                    f'({Acpp}) {op} ({Bcpp})', Acpp, Bcpp, active_nodes)
+                expr = expr[:start] + temp + expr[end:]
+                progressed = True
+                break
+            if progressed:
+                continue
+            tern = self._find_ternary(expr)
+            if tern and not re.search(r'\b(min|max)\s*\(', tern[1] + ' ' + tern[2]):
+                cond, A, B = tern
+                temp = self._emit_select_temp(
+                    lines, pfx,
+                    self._to_ginac_expr(B, active_nodes), self._to_ginac_expr(A, active_nodes),
+                    self._cond_final_cpp(cond, active_nodes),
+                    self._cond_final_cpp(A, active_nodes), self._cond_final_cpp(B, active_nodes),
+                    active_nodes)
+                expr = temp
+                progressed = True
+            if not progressed:
+                break
+        return expr
+
+    def _maybe_hoist(self, expr: str, lines: list[str], active_nodes: list[str], pfx: str) -> str:
+        """Hoist min/max/ternary selects only when the expression is
+        voltage-dependent (constant cases fold numerically via _try_eval_expr)."""
+        if expr and (re.search(r'\b(min|max)\s*\(', expr) or '?' in expr) \
+                and self._expr_uses_voltage(expr):
+            return self._hoist_selects(expr, lines, active_nodes, pfx)
+        return expr
+
     # --- GiNaC C++ emission ---
 
     def _emit_ginac_program(self) -> str:
@@ -360,6 +603,8 @@ class GiNaCEmitter:
         lines.append('#include <string>')
         lines.append('#include <set>')
         lines.append('#include <vector>')
+        lines.append('#include <map>')
+        lines.append('#include <functional>')
         lines.append('using namespace GiNaC;')
         lines.append('using namespace std;')
         lines.append('')
@@ -414,6 +659,11 @@ class GiNaCEmitter:
         # Safe wrappers to avoid GiNaC exact-arithmetic pole errors
         lines.append('// Use double-precision numerics to get IEEE behavior (inf, not throw)')
         lines.append('ex N(double v) { return numeric(v); }')
+        lines.append('// Build an intermediate expression, tolerating GiNaC pole errors')
+        lines.append('// (e.g. IMAX/(idsatsti*LS) when idsatsti is baked to 0 inside a')
+        lines.append('// guarded branch): the VALUE comes from the int_raw ternary, and the')
+        lines.append('// derivative of a guard-false constant branch is correctly 0.')
+        lines.append('ex _safe_ex(const std::function<ex()>& f) { try { return f(); } catch (...) { return ex(0); } }')
         lines.append('')
         # Condition helpers for runtime checks on GiNaC expressions
         lines.append('// Runtime condition checks — if numeric, compare; if symbolic, return default')
@@ -494,6 +744,10 @@ class GiNaCEmitter:
         lines.append(f'    vector<symbol> int_syms;')
         lines.append(f'    vector<ex> int_exprs;')
         lines.append(f'    vector<string> int_names;')
+        # Raw C++ declarations for indicator intermediates (voltage-dependent
+        # condition -> 0/1). Keyed by index into int_syms; when present, the
+        # resolver emits this verbatim instead of (int_raw.count(i) ? int_raw[i] : to_cpp(int_exprs[i])).
+        lines.append(f'    std::map<int,std::string> int_raw;')
         lines.append('')
 
         # Branch/contribution vectors
@@ -523,6 +777,19 @@ class GiNaCEmitter:
         I = '    '  # base indent
 
         # --- vae_eval ---
+        # NaN/Inf guard for Jacobian entries: a derivative that goes non-finite
+        # through a param-false domain guard (e.g. d(.../Isbs) with Isbs=0) has
+        # true value 0 there (the guarded block is constant), so clamp to 0.
+        lines.append(f'{I}cout << "static inline double _san(double x){{ return (x==x && x*0.0==0.0) ? x : 0.0; }}" << endl;')
+        # VA smoothing helpers may appear verbatim in ternary/select values that
+        # were lowered as C++ text (not expanded through GiNaC); define them.
+        lines.append(f'{I}cout << "static inline double hypsmooth(double x,double c){{ return (x+std::sqrt(x*x+4*c*c))/2; }}" << endl;')
+        lines.append(f'{I}cout << "static inline double hypmax(double x,double xmin,double c){{ double d=x-xmin-c; return xmin+(d+std::sqrt(d*d-4*xmin*c))/2; }}" << endl;')
+        lines.append(f'{I}cout << "static inline double Tempdep(double PARAML,double PARAMT,double DELTEMP,double TEMPMOD){{ return (TEMPMOD!=0.0) ? (PARAML+hypmax(PARAMT*DELTEMP,-PARAML,1e-6)) : (PARAML*hypsmooth(1+PARAMT*DELTEMP-1e-6,1e-3)); }}" << endl;')
+        # ddx(expr, V_node) = small-signal OP-output derivative (gm/gds/caps).
+        # These are report-only quantities, never in the large-signal I<+/Q<+
+        # contributions, so stub to 0 for the DC/transient solve.
+        lines.append(f'{I}cout << "static inline double ddx(double,double){{ return 0.0; }}" << endl;')
         lines.append(f'{I}cout << "void vae_eval(VaeState* s, double* F, double* Q) {{" << endl;')
         for i, n in enumerate(active_nodes):
             lines.append(f'{I}cout << "    double V_{n} = s->V[{i}];" << endl;')
@@ -536,10 +803,10 @@ class GiNaCEmitter:
         lines.append(f'{I}for (int i = 0; i < (int)int_syms.size(); i++) {{')
         lines.append(f'{I}    string sn = int_syms[i].get_name();')
         lines.append(f'{I}    if (declared.count(sn) == 0) {{')
-        lines.append(f'{I}        cout << "    double " << sn << " = " << to_cpp(int_exprs[i]) << ";" << endl;')
+        lines.append(f'{I}        cout << "    double " << sn << " = " << (int_raw.count(i) ? int_raw[i] : to_cpp(int_exprs[i])) << ";" << endl;')
         lines.append(f'{I}        declared.insert(sn);')
         lines.append(f'{I}    }} else {{')
-        lines.append(f'{I}        cout << "    " << sn << " = " << to_cpp(int_exprs[i]) << ";" << endl;')
+        lines.append(f'{I}        cout << "    " << sn << " = " << (int_raw.count(i) ? int_raw[i] : to_cpp(int_exprs[i])) << ";" << endl;')
         lines.append(f'{I}    }}')
         lines.append(f'{I}}}')
 
@@ -567,10 +834,10 @@ class GiNaCEmitter:
         lines.append(f'{I}for (int i = 0; i < (int)int_syms.size(); i++) {{')
         lines.append(f'{I}    string sn = int_syms[i].get_name();')
         lines.append(f'{I}    if (declared.count(sn) == 0) {{')
-        lines.append(f'{I}        cout << "    double " << sn << " = " << to_cpp(int_exprs[i]) << ";" << endl;')
+        lines.append(f'{I}        cout << "    double " << sn << " = " << (int_raw.count(i) ? int_raw[i] : to_cpp(int_exprs[i])) << ";" << endl;')
         lines.append(f'{I}        declared.insert(sn);')
         lines.append(f'{I}    }} else {{')
-        lines.append(f'{I}        cout << "    " << sn << " = " << to_cpp(int_exprs[i]) << ";" << endl;')
+        lines.append(f'{I}        cout << "    " << sn << " = " << (int_raw.count(i) ? int_raw[i] : to_cpp(int_exprs[i])) << ";" << endl;')
         lines.append(f'{I}    }}')
         lines.append(f'{I}}}')
         lines.append(f'{I}cout << endl;')
@@ -597,10 +864,10 @@ class GiNaCEmitter:
         lines.append(f'{I}            symbol ds(dname);')
         lines.append(I + '            deriv_pairs.push_back({int_syms[i], ds});')
         lines.append(f'{I}            if (declared.count(dname) == 0) {{')
-        lines.append(f'{I}                cout << "    double " << dname << " = " << to_cpp(d) << ";" << endl;')
+        lines.append(f'{I}                cout << "    double " << dname << " = _san(" << to_cpp(d) << ");" << endl;')
         lines.append(f'{I}                declared.insert(dname);')
         lines.append(f'{I}            }} else {{')
-        lines.append(f'{I}                cout << "    " << dname << " = " << to_cpp(d) << ";" << endl;')
+        lines.append(f'{I}                cout << "    " << dname << " = _san(" << to_cpp(d) << ");" << endl;')
         lines.append(f'{I}            }}')
         lines.append(f'{I}        }}')
         lines.append(f'{I}    }}')
@@ -615,7 +882,7 @@ class GiNaCEmitter:
         lines.append(f'{I}        }}')
         lines.append(f'{I}        if (!dF.is_zero())')
         lines.append(f'{I}            cout << "    dFdV[" << br << " * " << n_nodes << " + " << col')
-        lines.append(f'{I}                 << "] = " << to_cpp(dF) << ";" << endl;')
+        lines.append(f'{I}                 << "] = _san(" << to_cpp(dF) << ");" << endl;')
         lines.append(f'{I}        ex dQ = Q_contribs[br].diff(nodes[col]);')
         lines.append(f'{I}        for (auto& [dep_sym, dep_dsym] : deriv_pairs) {{')
         lines.append(f'{I}            ex pd = Q_contribs[br].diff(dep_sym);')
@@ -623,7 +890,7 @@ class GiNaCEmitter:
         lines.append(f'{I}        }}')
         lines.append(f'{I}        if (!dQ.is_zero())')
         lines.append(f'{I}            cout << "    dQdV[" << br << " * " << n_nodes << " + " << col')
-        lines.append(f'{I}                 << "] = " << to_cpp(dQ) << ";" << endl;')
+        lines.append(f'{I}                 << "] = _san(" << to_cpp(dQ) << ");" << endl;')
         lines.append(f'{I}    }}')
         lines.append(f'{I}}}')
         lines.append(f'{I}cout << "}}" << endl << endl;')
@@ -691,6 +958,38 @@ class GiNaCEmitter:
 
         elif node.kind == NodeKind.ASSIGN:
             self._emit_line_directive(lines, node, pfx)
+
+            # Gated assignment inside a voltage-dependent conditional: emit as
+            # an arithmetic select  lhs = lhs_prev + (rhs - lhs_prev) * Sprod
+            # (Sprod = product of enclosing indicator factors). The branch is a
+            # genuine runtime decision, and forward-AD gives the branch-selected
+            # derivative because each indicator has dS/dV = 0.
+            if self._cond_stack:
+                prev = self._var_current_ex_str(node.lhs)
+                rhs_expr = self._maybe_hoist(node.expr, lines, active_nodes, pfx)
+                rhs = self._to_ginac_expr(rhs_expr, active_nodes)
+                sprod = ' * '.join(f'({s})' for s in self._cond_stack)
+                # arithmetic form for forward-AD (indicators have dS/dV=0 ->
+                # branch-selected derivative); ternary form for the VALUE so the
+                # non-taken RHS is not evaluated (preserves domain guards like
+                # `if (Isbs>0) x = .../Isbs`).
+                gated = f'(({prev}) + ((({rhs})) - ({prev})) * ({sprod}))'
+                rhs_cpp = self._cond_final_cpp(rhs_expr, active_nodes)
+                prev_cpp = '0.0' if prev == 'ex(0)' else prev
+                tern = f'((({sprod}) != 0.0) ? ({rhs_cpp}) : ({prev_cpp}))'
+                esc = tern.replace('\\', '\\\\').replace('"', '\\"')
+                self._var_versions[node.lhs] = self._var_versions.get(node.lhs, 0) + 1
+                sym_name = f'{self._safe_sym(node.lhs)}__sel{self._var_versions[node.lhs]}'
+                self.var_values.pop(node.lhs, None)
+                self._var_sym_name[node.lhs] = sym_name
+                self._declared_vars[node.lhs] = 'sym'
+                lines.append(f'{pfx}symbol {sym_name}("{sym_name}");')
+                lines.append(f'{pfx}int_raw[int_syms.size()] = "{esc}";')
+                lines.append(f'{pfx}int_syms.push_back({sym_name});')
+                lines.append(f'{pfx}int_exprs.push_back(_safe_ex([&]() -> ex {{ return ({gated}); }}));')
+                lines.append(f'{pfx}int_names.push_back("{node.lhs}");')
+                return
+
             uses_voltage = self._expr_uses_voltage(node.expr)
 
             # Try constant evaluation
@@ -709,11 +1008,12 @@ class GiNaCEmitter:
                 self.var_values.pop(node.lhs, None)
 
             # Non-constant: create a GiNaC symbol for CSE
-            ginac_expr = self._to_ginac_expr(node.expr, active_nodes)
+            expr_h = self._maybe_hoist(node.expr, lines, active_nodes, pfx)
+            ginac_expr = self._to_ginac_expr(expr_h, active_nodes)
 
             if node.lhs not in self._declared_vars:
                 # First assignment — create new symbol
-                sym_name = node.lhs
+                sym_name = self._safe_sym(node.lhs)
                 self._var_versions[node.lhs] = 0
                 self._var_sym_name[node.lhs] = sym_name
                 self._declared_vars[node.lhs] = 'sym'
@@ -724,12 +1024,12 @@ class GiNaCEmitter:
             else:
                 # Reassignment outside condition — new version
                 self._var_versions[node.lhs] += 1
-                sym_name = f'{node.lhs}__{self._var_versions[node.lhs]}'
+                sym_name = f'{self._safe_sym(node.lhs)}__{self._var_versions[node.lhs]}'
                 self._var_sym_name[node.lhs] = sym_name
                 lines.append(f'{pfx}symbol {sym_name}("{sym_name}");')
 
             lines.append(f'{pfx}int_syms.push_back({sym_name});')
-            lines.append(f'{pfx}int_exprs.push_back({ginac_expr});')
+            lines.append(f'{pfx}int_exprs.push_back(_safe_ex([&]() -> ex {{ return ({ginac_expr}); }}));')
             lines.append(f'{pfx}int_names.push_back("{node.lhs}");')
 
         elif node.kind == NodeKind.CONTRIB:
@@ -793,21 +1093,28 @@ class GiNaCEmitter:
                                     self._walk_analog_block(lines, node.else_body,
                                                            active_nodes, indent)
                         else:
-                            # No forced outcome — emit C++ if/else with GiNaC runtime check
-                            self._predeclare_vars(lines, node, pfx)
-                            cpp_cond = self._condition_to_cpp(node.condition)
-                            lines.append(f'{pfx}// RUNTIME CONDITION [{cond_idx}]: {node.condition}')
-                            lines.append(f'{pfx}if ({cpp_cond}) {{')
+                            # Voltage-dependent condition -> indicator-select.
+                            # Emit one runtime 0/1 indicator S; each assignment
+                            # inside the branch is gated by the product of
+                            # enclosing indicators (see NodeKind.ASSIGN). True
+                            # children gate by S, else children by (1 - S). This
+                            # keeps everything symbolic (so forward-AD works) while
+                            # the clamp/branch is a genuine runtime decision.
+                            cond_cpp = self._cond_final_cpp(node.condition, active_nodes)
+                            S = self._alloc_indicator(lines, cond_cpp, pfx)
+                            lines.append(f'{pfx}// SELECT [{cond_idx}] via {S}: {node.condition}')
+                            self._cond_stack.append(S)
                             self._runtime_cond_depth += 1
                             for child in node.children:
-                                self._walk_analog_block(lines, child, active_nodes, indent + 4)
+                                self._walk_analog_block(lines, child, active_nodes, indent)
                             self._runtime_cond_depth -= 1
+                            self._cond_stack.pop()
                             if node.else_body:
-                                lines.append(f'{pfx}}} else {{')
+                                self._cond_stack.append(f'(1 - {S})')
                                 self._runtime_cond_depth += 1
-                                self._walk_analog_block(lines, node.else_body, active_nodes, indent + 4)
+                                self._walk_analog_block(lines, node.else_body, active_nodes, indent)
                                 self._runtime_cond_depth -= 1
-                            lines.append(f'{pfx}}}')
+                                self._cond_stack.pop()
 
         elif node.kind == NodeKind.INITIAL_STEP:
             pass  # Skip initial_step
@@ -940,7 +1247,15 @@ class GiNaCEmitter:
                 ddt_arg = expr_str[start:i-1]
                 inner_expr = expr_str[:m.start()] + ddt_arg + expr_str[i:]
 
+        inner_expr = self._maybe_hoist(inner_expr, lines, active_nodes, pfx)
         ginac_expr = self._to_ginac_expr(inner_expr, active_nodes)
+        # Gate contributions inside a voltage-dependent conditional, exactly like
+        # assignments: e.g. `if(sigvds>0) I(di,si)<+ids; else I(si,di)<+ids;`
+        # must put ids on ONE branch at runtime. Without this both branches get
+        # the full ids and cancel at the shared node -> zero terminal current.
+        if self._cond_stack:
+            sprod = ' * '.join(f'({s})' for s in self._cond_stack)
+            ginac_expr = f'(({ginac_expr}) * ({sprod}))'
         branch_label = f'{node.contrib_kind.name}({",".join(node.branch)})'
 
         br_p = node.branch[0]
@@ -1312,7 +1627,12 @@ class GiNaCEmitter:
         _skip |= self.instance_params
         def _subst_known(m):
             name = m.group(0)
-            if name in _skip:
+            is_call = m.string[m.end():m.end() + 1] == '('
+            # A reserved GiNaC/C++ identifier used as a CALL — ex(0), exp(x),
+            # _vae_min(...) — stays verbatim; but the SAME name used as a
+            # VARIABLE (e.g. PSP103's `real ex`) must map to its (mangled)
+            # symbol, else `1.0 / ex` collides with the GiNaC `ex` type.
+            if name in _skip and is_call:
                 return name
             if name in self.param_values:
                 return repr(self.param_values[name])
@@ -2117,7 +2437,8 @@ class GiNaCEmitter:
 
 def emit_ginac_program(module: Module,
                        param_values: Optional[dict[str, float]] = None,
-                       line_directives: Optional[bool] = None) -> str:
+                       line_directives: Optional[bool] = None,
+                       given_params: Optional[set[str]] = None) -> str:
     """Generate GiNaC C++ source from a parsed Verilog-A module.
 
     All parameters (model card + instance) must be supplied as constants.
@@ -2129,6 +2450,12 @@ def emit_ginac_program(module: Module,
         module: Parsed Verilog-A module.
         param_values: All parameter values (model + instance). Merged over AST defaults.
         line_directives: None=off, True=#line (active), False=//line (inactive).
+        given_params: The set of parameter names the USER explicitly supplied
+                      (from Xyce's given()). Drives $param_given(). If None,
+                      falls back to param_values.keys() (legacy). Must be passed
+                      by the JIT builder, which bakes defaults into param_values
+                      and would otherwise mis-report every default as "given".
     """
     return GiNaCEmitter(module, param_values=param_values,
-                        line_directives=line_directives).emit()
+                        line_directives=line_directives,
+                        given_params=given_params).emit()
