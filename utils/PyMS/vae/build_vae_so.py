@@ -81,6 +81,19 @@ def main():
         _run("g++ -O2 -std=c++17 -o %s %s -lginac -lcln" % (g_bin, g_cpp))
         _run("%s > %s" % (g_bin, eval_cpp), timeout=900)
         # 3. wrap (VaeState ABI + C exports); compile the loadable .so.
+        # vae_jacobian is computed by FINITE DIFFERENCE of the eval, NOT the
+        # emitted analytic jacobian. The analytic (forward-AD) jacobian can be
+        # INCONSISTENT with the eval's value path — the indicator-select value is
+        # a short-circuit C++ ternary while its derivative is AD of the arithmetic
+        # `base+(alt-base)*S` form, and at some geometries (e.g. narrow-W + long-L)
+        # these diverge (charge derivatives came out wrong magnitude AND sign).
+        # DC tolerates a wrong jacobian (Newton still finds F=0), but TRANSIENT's
+        # stiff C*dV/dt term with a sign-wrong dQ/dV makes Newton diverge
+        # ("time step too small"). FD of the eval is consistent with F/Q by
+        # construction, so transient converges for every geometry; it costs
+        # (n_nodes+1) evals per jacobian, which is the right trade for a model
+        # whose priority is numerical correctness over speed. F/Q (and hence the
+        # solved values) are unchanged — only the jacobian used to get there.
         wrapper = (
             '#include <cmath>\n#include <cstdio>\n#include <cstring>\n'
             'struct VaeState { double V[16]; double Vt; };\n'
@@ -91,7 +104,19 @@ def main():
             '#include "%s"\n'
             '#undef vae_eval\n#undef vae_jacobian\n'
             'extern "C" void vae_eval(VaeState* s, double* F, double* Q){ _vae_eval_impl(s,F,Q); }\n'
-            'extern "C" void vae_jacobian(VaeState* s, double* dFdV, double* dQdV){ _vae_jacobian_impl(s,dFdV,dQdV); }\n'
+            'extern "C" void vae_jacobian(VaeState* s, double* dFdV, double* dQdV){\n'
+            '  int N = vae_n_nodes(); int NB = vae_n_branches();\n'
+            '  static double F0[256], Q0[256], Fp[256], Qp[256];\n'
+            '  _vae_eval_impl(s, F0, Q0);\n'
+            '  for (int j = 0; j < N; ++j) {\n'
+            '    VaeState sp = *s; double dv = 1e-4 * (std::fabs(s->V[j]) + 1.0);\n'
+            '    sp.V[j] += dv; _vae_eval_impl(&sp, Fp, Qp); double inv = 1.0 / dv;\n'
+            '    for (int i = 0; i < NB; ++i) {\n'
+            '      dFdV[i*N + j] = (Fp[i] - F0[i]) * inv;\n'
+            '      dQdV[i*N + j] = (Qp[i] - Q0[i]) * inv;\n'
+            '    }\n'
+            '  }\n'
+            '}\n'
             % eval_cpp
         )
         with open(wrap_cpp, "w") as f:
