@@ -44,6 +44,12 @@ def main():
     # $param_given() in the emitter; without it every baked default would read
     # as "given" and select the wrong model branch (e.g. nVtm = NVTM = 0).
     given = None  # None => legacy shells with no marker => keys()-based fallback
+    # Callback (runtime) params: kept symbolic and fetched via _pcb() at eval
+    # time, so Xyce .SAMPLING/AGAUSS can vary them (e.g. PSP103 DELVTO for MC
+    # mismatch) through ONE .so build. The shell names them with a __CALLBACK__
+    # marker; PYMS_CALLBACK_PARAMS (comma-separated) adds to that set for
+    # manual/experimental builds. Empty by default => byte-identical to before.
+    callback = set()
     try:
         with open(pfile) as f:
             for line in f:
@@ -55,12 +61,17 @@ def main():
                 if k == '__GIVEN__':
                     given = {n.strip().upper() for n in v.split(',') if n.strip()}
                     continue
+                if k == '__CALLBACK__':
+                    callback |= {n.strip().upper() for n in v.split(',') if n.strip()}
+                    continue
                 try:
                     params[k.upper()] = float(v.strip())
                 except ValueError:
                     pass
     except OSError:
         pass
+    _env_cb = os.environ.get('PYMS_CALLBACK_PARAMS', '')
+    callback |= {n.strip().upper() for n in _env_cb.split(',') if n.strip()}
 
     mod = parse_file(va)
 
@@ -74,7 +85,8 @@ def main():
         # CONSTCtoK (Celsius->Kelvin): define if the preprocessor didn't expand
         # it (include not found). Harmless when already a literal.
         src = "#define CONSTCtoK 273.15\n" + emit_ginac_program(
-            mod, param_values=pvals, given_params=given)
+            mod, param_values=pvals, given_params=given,
+            callback_params=callback)
         with open(g_cpp, "w") as f:
             f.write(src)
         # 1. compile GiNaC metaprogram; 2. run it to emit the specialized eval.
@@ -98,6 +110,16 @@ def main():
             '#include <cmath>\n#include <cstdio>\n#include <cstring>\n'
             'struct VaeState { double V[16]; double Vt; };\n'
             'inline double conjugate(double x){ return x; }\n'
+            '// Runtime (callback) params: the eval fetches these via _pcb("NAME")\n'
+            '// instead of a baked literal, so the compiler cannot const-fold them\n'
+            '// and Xyce .SAMPLING/AGAUSS reaches them live (no per-sample rebuild).\n'
+            '// The device shell installs _pms_cb via vae_set_param_cb; it returns\n'
+            '// the value for whichever instance is currently being evaluated. Until\n'
+            '// installed (or for an unknown name) we return 0.0, the Verilog-A\n'
+            '// default for a shift param like DELVTO.\n'
+            'static double (*_pms_cb)(const char*) = 0;\n'
+            'extern "C" void vae_set_param_cb(double (*f)(const char*)){ _pms_cb = f; }\n'
+            'static inline double _pcb(const char* n){ return _pms_cb ? _pms_cb(n) : 0.0; }\n'
             '#define vae_eval _vae_eval_impl\n'
             '#define vae_jacobian _vae_jacobian_impl\n'
             'static const double temperature = 300.15;\n'

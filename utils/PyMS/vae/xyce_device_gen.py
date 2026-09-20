@@ -499,6 +499,7 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
     # VAE function pointer types
     h.append('struct VaeState { double V[16]; double Vt; };')
     h.append('typedef void (*VaeEvalFn)(VaeState*, double*, double*);')
+    h.append('typedef void (*VaeSetCbFn)(double(*)(const char*));')
     h.append('')
 
     # Traits
@@ -541,6 +542,7 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
     h.append('  const std::vector< std::vector<int> > &jacobianStamp() const;')
     h.append('  void registerJacLIDs(const std::vector< std::vector<int> > &jacLIDVec);')
     h.append('  bool processParams();')
+    h.append('  double getCbParam(const char* nm) const;  // runtime-callback param fetch')
     h.append('  bool updateIntermediateVars();')
     h.append('  bool updatePrimaryState();')
     h.append('  bool loadDAEFVector();')
@@ -748,6 +750,26 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
     c.append('')
 
     _va_esc = (va_path or '').replace('\\', '\\\\').replace('"', '\\"')
+    # --- Runtime-callback param support ---------------------------------
+    # A param kept SYMBOLIC in the vae .so (callback param, e.g. PSP103
+    # DELVTO) is fetched per-eval via pyms_param_cb(name) instead of a baked
+    # literal, so Xyce .SAMPLING/AGAUSS on that instance param reaches the
+    # math live through ONE .so (no per-sample rebuild). g_pyms_cur names the
+    # instance currently being evaluated; the shell sets it before each
+    # vae_eval_/vae_jac_ call, so per-device local mismatch resolves to the
+    # right instance's sampled value.
+    c.append('double Instance::getCbParam(const char* nm) const {')
+    for pname, pdefault, is_inst, cxx in params:
+        if is_inst:
+            c.append(f'  if (!strcmp(nm, "{pname.upper()}")) return {cxx};')
+    for pname, pdefault, is_inst, cxx in params:
+        if not is_inst:
+            c.append(f'  if (!strcmp(nm, "{pname.upper()}")) return model_.{cxx};')
+    c.append('  return 0.0;')
+    c.append('}')
+    c.append('static Instance* g_pyms_cur = nullptr;')
+    c.append('static double pyms_param_cb(const char* nm) { return g_pyms_cur ? g_pyms_cur->getCbParam(nm) : 0.0; }')
+    c.append('')
     c.append('bool Instance::processParams() {')
     c.append('  if (!vae_eval_) {')
     c.append('    // (1) explicit override: VAE_SO_PATH, or VAE_SO_DIR/<MODEL>.so')
@@ -766,9 +788,18 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
     c.append('    if (!vae_eval_) {')
     c.append(f'      const char *_va = "{_va_esc}";')
     c.append('      std::string _p; char _pb[96];')
+    # Callback (runtime) params are fetched live via the callback, not baked, so
+    # their VALUE must not fork the .so cache — two instances differing only in a
+    # callback param (e.g. per-device DELVTO in a Monte-Carlo run) must share ONE
+    # .so. Serialize them with a fixed placeholder so the (va,params) hash is
+    # independent of the sampled value.
+    c.append('      std::string _cbwrap;')
+    c.append('      { const char* _cbe = getenv("PYMS_CALLBACK_PARAMS");')
+    c.append('        if (_cbe) { std::string _s=_cbe; for(char&ch:_s) ch=toupper((unsigned char)ch); _cbwrap = "," + _s + ","; } }')
     for pname, pdefault, is_inst, cxx in params:
         ref = f'{cxx}' if is_inst else f'model_.{cxx}'
-        c.append(f'      snprintf(_pb,sizeof(_pb),"{pname.upper()}=%.12g\\n",(double)({ref})); _p += _pb;')
+        NM = pname.upper()
+        c.append(f'      snprintf(_pb,sizeof(_pb),"{NM}=%.12g\\n",(_cbwrap.find(",{NM},")!=std::string::npos)?0.0:(double)({ref})); _p += _pb;')
     # Serialize the set of params the user actually supplied (Xyce given()),
     # so build_vae_so.py can drive $param_given() correctly. Baking every
     # default as "given" mis-selects model branches (e.g. nVtm = NVTM = 0).
@@ -778,6 +809,12 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
                  else f'model_.given("{pname.upper()}")')
         c.append(f'      if ({guard}) _gv += "{pname.upper()},";')
     c.append('      _p += "__GIVEN__=" + _gv + "\\n";')
+    # Callback (runtime) params for Monte-Carlo etc.: kept symbolic in the .so
+    # and fetched via pyms_param_cb so .SAMPLING/AGAUSS reaches them. Appended
+    # ONLY when set, so non-MC builds keep an identical hash (cache hit, no
+    # rebuild) and behave byte-identically to before.
+    c.append('      const char* _cbp = getenv("PYMS_CALLBACK_PARAMS");')
+    c.append('      if (_cbp && _cbp[0]) _p += std::string("__CALLBACK__=") + _cbp + "\\n";')
     c.append('      std::size_t _key = std::hash<std::string>{}(std::string(_va) + "|" + _p);')
     c.append('      const char *_cd = getenv("PYMS_VAE_CACHE");')
     c.append('      std::string _cache = _cd ? _cd : "/tmp/pyms_vae_cache";')
@@ -795,6 +832,12 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
     c.append('      if (vae_dl_) { vae_eval_ = (VaeEvalFn)dlsym(vae_dl_, "vae_eval");')
     c.append('                     vae_jac_ = (VaeEvalFn)dlsym(vae_dl_, "vae_jacobian"); }')
     c.append('    }')
+    c.append('  }')
+    # Install the runtime-param callback (idempotent; skipped for legacy .so')
+    # files that predate vae_set_param_cb).
+    c.append('  if (vae_dl_) {')
+    c.append('    VaeSetCbFn _setcb = (VaeSetCbFn)dlsym(vae_dl_, "vae_set_param_cb");')
+    c.append('    if (_setcb) _setcb(&pyms_param_cb);')
     c.append('  }')
     c.append('  return true;')
     c.append('}')
@@ -933,6 +976,7 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
     else:
         c.append('  if (vae_eval_ && vae_jac_) {')
     c.append('    VaeState state = {};')
+    c.append('    g_pyms_cur = this;  // callback params resolve to THIS instance')
     for i, n in enumerate(all_nodes):
         if i < n_ext and i >= num_nodes_required:
             # Optional external port — netlist may not have supplied it.

@@ -71,7 +71,8 @@ class GiNaCEmitter:
                  forced_nodes: Optional[dict[int, bool]] = None,
                  assume_true: Optional[set[str]] = None,
                  collapse_nodes: bool = True,
-                 given_params: Optional[set[str]] = None):
+                 given_params: Optional[set[str]] = None,
+                 callback_params: Optional[set[str]] = None):
         """
         Args:
             module: Parsed Verilog-A module AST.
@@ -136,6 +137,20 @@ class GiNaCEmitter:
 
         # No instance params — everything is constant at compile time
         self.instance_params: set[str] = set()
+
+        # Callback (runtime) params: kept SYMBOLIC (never baked as a literal), and
+        # fetched at eval time through a shell-provided callback `_pcb("NAME")`.
+        # A compiler cannot const-fold an opaque external call, so the value stays
+        # live — Xyce .SAMPLING/AGAUSS on such a param (e.g. PSP103 DELVTO) flows
+        # through a SINGLE .so build without a per-sample rebuild, and the shell's
+        # callback returns the value for whichever instance is currently being
+        # evaluated (per-device local mismatch). Move them out of the baked
+        # param_values and into instance_params so every substitution path leaves
+        # them as bare symbols (defined via _pcb in the eval preamble).
+        self._callback_params: set[str] = set(callback_params) if callback_params else set()
+        for cp in self._callback_params:
+            self.instance_params.add(cp)
+            self.param_values.pop(cp, None)
 
         # Track explicitly given params (for $param_given). The JIT builder
         # bakes ALL params (given + defaulted) into param_values, so
@@ -717,7 +732,13 @@ class GiNaCEmitter:
         for node in self.all_nodes:
             lines.append(f'    symbol V_{node}("V_{node}");')
 
-        # No parameter symbols — all params are constants at compile time
+        # No parameter symbols — all params are constants at compile time,
+        # EXCEPT callback (runtime) params, which stay symbolic so they are not
+        # folded into constants and are fetched via _pcb() in the eval.
+        if self._callback_params:
+            lines.append('    // Callback (runtime) parameter symbols')
+            for cp in sorted(self._callback_params):
+                lines.append(f'    symbol {cp}("{cp}");')
 
         # Special symbols — skip if the model declares them as variables
         _model_vars = {v.name for v in self.mod.variables}
@@ -809,6 +830,9 @@ class GiNaCEmitter:
         _mvars = {v.name for v in self.mod.variables}
         if 'Vt' not in _mvars:
             lines.append(f'{I}cout << "    double Vt = s->Vt;" << endl;')
+        # Runtime (callback) params — fetched live so .SAMPLING reaches them.
+        for cp in sorted(self._callback_params):
+            lines.append(f'{I}cout << "    double {cp} = _pcb(\\"{cp}\\");" << endl;')
         lines.append(f'{I}cout << endl;')
 
         # Print intermediate computations using symbol names
@@ -840,6 +864,9 @@ class GiNaCEmitter:
         _mvars = {v.name for v in self.mod.variables}
         if 'Vt' not in _mvars:
             lines.append(f'{I}cout << "    double Vt = s->Vt;" << endl;')
+        # Runtime (callback) params — fetched live so .SAMPLING reaches them.
+        for cp in sorted(self._callback_params):
+            lines.append(f'{I}cout << "    double {cp} = _pcb(\\"{cp}\\");" << endl;')
         lines.append(f'{I}cout << endl;')
 
         # Print intermediate computations (same as eval, with dedup)
@@ -2457,7 +2484,8 @@ class GiNaCEmitter:
 def emit_ginac_program(module: Module,
                        param_values: Optional[dict[str, float]] = None,
                        line_directives: Optional[bool] = None,
-                       given_params: Optional[set[str]] = None) -> str:
+                       given_params: Optional[set[str]] = None,
+                       callback_params: Optional[set[str]] = None) -> str:
     """Generate GiNaC C++ source from a parsed Verilog-A module.
 
     All parameters (model card + instance) must be supplied as constants.
@@ -2474,7 +2502,14 @@ def emit_ginac_program(module: Module,
                       falls back to param_values.keys() (legacy). Must be passed
                       by the JIT builder, which bakes defaults into param_values
                       and would otherwise mis-report every default as "given".
+        callback_params: Parameter names to keep SYMBOLIC and fetch at eval time
+                      via the shell callback _pcb("NAME") instead of baking a
+                      literal. A compiler cannot const-fold an opaque call, so
+                      the value stays live and Xyce .SAMPLING/AGAUSS can vary it
+                      (e.g. PSP103 DELVTO for Monte-Carlo Vt mismatch) through a
+                      single .so build. Empty by default (byte-identical output).
     """
     return GiNaCEmitter(module, param_values=param_values,
                         line_directives=line_directives,
-                        given_params=given_params).emit()
+                        given_params=given_params,
+                        callback_params=callback_params).emit()
