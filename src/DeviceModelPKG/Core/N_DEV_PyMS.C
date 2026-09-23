@@ -596,11 +596,24 @@ bool pyms_register_hdl(const std::string &va_path) {
     std::string cpp_file = cache_dir + "/N_DEV_PYMS_" + NAME + ".C";
     std::string so_file = cache_dir + "/pyms_" + module_name + ".so";
 
-    // Check if .so already exists and is newer than the .va
-    struct stat va_stat, so_stat;
-    if (stat(va_path.c_str(), &va_stat) == 0 &&
-        stat(so_file.c_str(), &so_stat) == 0 &&
-        so_stat.st_mtime > va_stat.st_mtime) {
+    // Check if the cached device-shell .so is up to date. It must be newer than
+    // BOTH the .va (the model input) AND the generator xyce_device_gen.py (the code
+    // that emits the shell, incl. the runtime-callback-param install). The generated
+    // .C is rewritten every run (step 3 above), so its mtime is NOT a valid
+    // dependency — compare against the generator script instead. Omitting the
+    // generator check silently reuses a stale shell when the generator changes
+    // (e.g. adding DELVTO runtime-callback support): the old shell never installs
+    // the param callback, so per-device DELVTO no longer varies and .SAMPLING/MC
+    // reports a FALSELY-ZERO sigma (a silent wrong answer).
+    struct stat va_stat, so_stat, gen_stat;
+    bool up_to_date = false;
+    if (stat(so_file.c_str(), &so_stat) == 0) {
+        bool va_ok  = stat(va_path.c_str(), &va_stat) == 0;
+        bool gen_ok = stat(gen_script.c_str(), &gen_stat) == 0;
+        up_to_date = (!va_ok  || so_stat.st_mtime > va_stat.st_mtime) &&
+                     (!gen_ok || so_stat.st_mtime > gen_stat.st_mtime);
+    }
+    if (up_to_date) {
         // Cached .so is up to date — just load it
     } else {
         // Compile
