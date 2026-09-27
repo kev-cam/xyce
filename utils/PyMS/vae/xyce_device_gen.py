@@ -639,6 +639,8 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
     c.append('#include <cstdio>')
     c.append('#include <cctype>')
     c.append('#include <functional>')
+    c.append('#include <fstream>')
+    c.append('#include <sstream>')
     c.append('#include <sys/stat.h>')
     c.append('')
     c.append(f'namespace Xyce {{ namespace Device {{ namespace PYMS_{NAME} {{')
@@ -815,7 +817,14 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '') -> tuple[str,
     # rebuild) and behave byte-identically to before.
     c.append('      const char* _cbp = getenv("PYMS_CALLBACK_PARAMS");')
     c.append('      if (_cbp && _cbp[0]) _p += std::string("__CALLBACK__=") + _cbp + "\\n";')
-    c.append('      std::size_t _key = std::hash<std::string>{}(std::string(_va) + "|" + _p);')
+    # The cache key must include the .va CONTENT, not just its path: keying on
+    # (path, params) alone silently reuses a stale vae .so after the .va is
+    # edited without changing its parameter list (the 2026-09-26 qal_gate
+    # "toolchain regression" trap class — same-name/same-params, different
+    # model equations). An unreadable .va degrades to the old (path, params)
+    # key rather than failing the build.
+    c.append('      std::string _vc; { std::ifstream _vf(_va, std::ios::binary); std::ostringstream _vs; _vs << _vf.rdbuf(); _vc = _vs.str(); }')
+    c.append('      std::size_t _key = std::hash<std::string>{}(std::string(_va) + "|" + _p + "|" + _vc);')
     c.append('      const char *_cd = getenv("PYMS_VAE_CACHE");')
     c.append('      std::string _cache = _cd ? _cd : "/tmp/pyms_vae_cache";')
     c.append('      { std::string _mk = "mkdir -p \'" + _cache + "\'"; if(system(_mk.c_str())){} }')

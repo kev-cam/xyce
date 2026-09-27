@@ -26,6 +26,7 @@
 #include <vector>
 #include <fstream>
 #include <sstream>
+#include <functional>
 #include <dirent.h>
 #include <sys/stat.h>
 
@@ -596,22 +597,49 @@ bool pyms_register_hdl(const std::string &va_path) {
     std::string cpp_file = cache_dir + "/N_DEV_PYMS_" + NAME + ".C";
     std::string so_file = cache_dir + "/pyms_" + module_name + ".so";
 
-    // Check if the cached device-shell .so is up to date. It must be newer than
-    // BOTH the .va (the model input) AND the generator xyce_device_gen.py (the code
-    // that emits the shell, incl. the runtime-callback-param install). The generated
-    // .C is rewritten every run (step 3 above), so its mtime is NOT a valid
-    // dependency — compare against the generator script instead. Omitting the
-    // generator check silently reuses a stale shell when the generator changes
-    // (e.g. adding DELVTO runtime-callback support): the old shell never installs
-    // the param callback, so per-device DELVTO no longer varies and .SAMPLING/MC
-    // reports a FALSELY-ZERO sigma (a silent wrong answer).
-    struct stat va_stat, so_stat, gen_stat;
+    // Check if the cached device-shell .so is up to date. The cache slot is
+    // keyed by MODULE NAME (pyms_<module>.so), so two different .va FILES that
+    // declare the same module name COLLIDE on one slot. A pure mtime check
+    // against the current deck's va_path cannot see that collision: it
+    // compares the CURRENT .va against a .so that may have been generated
+    // from the OTHER file — and the stale shell then carries its baked _va
+    // path into processParams(), so even the freshly JIT-built vae eval .so
+    // is compiled from the WRONG .va. MEASURED 2026-09-26 (stat-sim qal_gate
+    // v3 "toolchain regression"): a scratchpad copy of qal_gate.va (pre-
+    // softplus) regenerated pyms_qal_gate.so at 11:47; every later run of the
+    // repo's qal_gate.va (mtime 11:14 < 11:47 → "up to date") silently
+    // reverted the model to the v1 hard clamp — a silent wrong answer.
+    //
+    // Fix: record beside the .so WHICH .va (absolute path) and WHAT CONTENT
+    // (hash of the file bytes) the shell was generated from (sidecar
+    // <so>.src), and reuse only on an exact match of both. Content identity
+    // also replaces the old .va-mtime ordering (which missed content changes
+    // with reordered mtimes, e.g. a restored/older file). The generator-
+    // script dependency stays mtime-based (see 71d0b770): the .C is rewritten
+    // every run (step 3 above), so its mtime is NOT a valid dependency.
+    std::string va_hash;
+    {
+        std::ifstream vf(va_path.c_str(), std::ios::binary);
+        std::ostringstream vs;
+        vs << vf.rdbuf();
+        char hb[32];
+        snprintf(hb, sizeof(hb), "%zx",
+                 std::hash<std::string>{}(vs.str()));
+        va_hash = hb;
+    }
+    std::string src_file = so_file + ".src";
+    struct stat so_stat, gen_stat;
     bool up_to_date = false;
     if (stat(so_file.c_str(), &so_stat) == 0) {
-        bool va_ok  = stat(va_path.c_str(), &va_stat) == 0;
         bool gen_ok = stat(gen_script.c_str(), &gen_stat) == 0;
-        up_to_date = (!va_ok  || so_stat.st_mtime > va_stat.st_mtime) &&
-                     (!gen_ok || so_stat.st_mtime > gen_stat.st_mtime);
+        bool gen_fresh = (!gen_ok || so_stat.st_mtime > gen_stat.st_mtime);
+        std::string rec_path, rec_hash;
+        std::ifstream sf(src_file.c_str());
+        if (sf) {
+            std::getline(sf, rec_path);
+            std::getline(sf, rec_hash);
+        }
+        up_to_date = gen_fresh && rec_path == va_path && rec_hash == va_hash;
     }
     if (up_to_date) {
         // Cached .so is up to date — just load it
@@ -658,6 +686,11 @@ bool pyms_register_hdl(const std::string &va_path) {
                 << module_name << "\n" << output;
             return false;
         }
+
+        // Record the identity (path + content hash) of the .va this shell
+        // was generated from — the reuse check above requires an exact match.
+        std::ofstream sf(src_file.c_str(), std::ios::trunc);
+        if (sf) sf << va_path << "\n" << va_hash << "\n";
     }
 
     // Step 5: dlopen the .so — constructor auto-registers the device
