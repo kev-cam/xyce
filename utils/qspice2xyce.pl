@@ -705,14 +705,15 @@ sub _vdmos_subckt {
     my $S = $pol > 0 ? '' : '-';                       # current sign
     my $vgs = $pol > 0 ? 'V(gi,si)' : 'V(si,gi)';      # polarity-folded senses
     my $vds = $pol > 0 ? 'V(di,si)' : 'V(si,di)';
-    my $vov = sprintf '(%s-%.6g)', $vgs, $vto;
-    my $kpks2 = sprintf '%.6g', $kp * $ks * $ks;
-    my $sub_t = sprintf '%s*ln(1+exp(%s/%.6g))*ln(1+exp(%s/%.6g))', $kpks2, $vov, $ks, $vov, $ks;
-    my $tri_t = sprintf '%.6g*(%s*%s-%.6g*pow(max(%s,0),%.6g)*pow(max(%s,0),%.6g))*(1+%.6g*%s)',
+    # Smooth overdrive Ks*ln(1+exp(Vov/Ks)) in every region (written so exp()
+    # cannot overflow). A separate subthreshold term below Vto jumped by
+    # Kp*Ks^2*ln(2)^2 at Vgs=Vto and did not vanish at Vds=0.
+    my $x   = sprintf '(%s-%.6g)', $vgs, $vto;
+    my $vov = sprintf '(max(%s,0)+%.6g*ln(1+exp(-abs(%s)/%.6g)))', $x, $ks, $x, $ks;
+    my $tri_t = sprintf '%.6g*(%s*%s-%.6g*pow(max(%s,0),%.6g)*pow(%s,%.6g))*(1+%.6g*%s)',
                         $kp * $ronx, $vov, $vds, 0.5 * $ronx, $vds, $mt, $vov, 2 - $mt, $lam, $vds;
     my $sat_t = sprintf '0.5*%.6g*%s*%s*(1+%.6g*%s)', $kp, $vov, $vov, $lam, $vds;
-    my $ich = sprintf 'IF(%s<=0,%s,IF(%s<%s/%.6g,%s,%s))',
-                      $vov, $sub_t, $vds, $vov, $ronx, $tri_t, $sat_t;
+    my $ich = sprintf 'IF(%s<%s/%.6g,%s,%s)', $vds, $vov, $ronx, $tri_t, $sat_t;
 
     my ($ba, $bk) = $pol > 0 ? ('si', 'di') : ('di', 'si');   # body diode anode/cathode
     my $bd_rs = $rb > 0 ? sprintf(' RS=%.6g', $rb) : '';

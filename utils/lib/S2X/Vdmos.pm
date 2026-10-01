@@ -7,10 +7,21 @@ package S2X::Vdmos;
 # different academic short-channel model with none of the power-MOS parameters
 # (KP/CGDMAX/CGDMIN/...). So both simetrix2xyce.pl (analog) and
 # simetrix_cosim.pl (analog-on-top cosim) remap a LEVEL=17 model to the same
-# behavioral subckt macromodel synthesised here. The analytical form is the one
-# ltspice2xyce.pl uses and that was validated against QSPICE64 gold: smooth
-# subthreshold Kp*Ks^2*ln(1+exp(Vov/Ks))^2, standard triode, Lambda CLM, body
-# diode, fixed Cgs/Cgd, Rd/Rs/Rg, p-channel folding.
+# behavioral subckt macromodel synthesised here: the channel current of the
+# LTspice-compatible VDMOS as ngspice implements it (vdmosload.c), body diode,
+# fixed Cgs/Cgd, Rd/Rs/Rg, p-channel folding.
+#
+# Channel (forward, Vds>=0; for Vds<0 Vgd replaces Vgs and the current is
+# negated, the device is symmetric):
+#   Vgst  = Ks*ln(1+exp((Vgs-Vto-Subshift)/Ks))   smooth overdrive, all regions
+#   Vdss  = Vds*Mtriode
+#   Betap = Kp*(1+Lambda*Vds)/(1+Theta*max(Vgs-Vto,0))
+#   Id    = Betap*Vgst^2/2                  Vgst <= Vdss   (saturation)
+#         = Betap*Vdss*(Vgst-Vdss/2)        otherwise      (triode)
+# It is continuous with continuous derivatives and Id(Vds=0)=0. (The previous
+# form switched to a separate subthreshold term below Vto, which jumped by
+# Kp*Ks^2*ln(2)^2 at Vgs=Vto and did not vanish at Vds=0, and took Mtriode as
+# an exponent; with default parameters above threshold the two agree.)
 #
 use strict;
 use warnings;
@@ -49,8 +60,10 @@ sub vdmos_subckt {
     my $rd  = $num->('rd', 0) || 1e-6;
     my $rs  = $num->('rs', 0) || 1e-6;
     my $rg  = $num->('rg', 0) || 1e-6;
-    my $mt  = $num->('mtriode', 2);
+    my $mt  = $num->('mtriode', 1);
     my $ks  = $num->('ksubthres', 0.1);
+    my $th  = $num->('theta', 0);
+    my $ssh = $num->('subshift', 0);
     my $cgs = $num->('cgs', 0);
     my $cgdmin = $num->('cgdmin', 0);
     my $is  = $num->('is', 1e-14);
@@ -61,13 +74,17 @@ sub vdmos_subckt {
     my $S = $pol > 0 ? '' : '-';
     my $vgs = $pol > 0 ? 'V(gi,si)' : 'V(si,gi)';
     my $vds = $pol > 0 ? 'V(di,si)' : 'V(si,di)';
-    my $vov = sprintf '(%s-%.6g)', $vgs, $vto;
-    my $kpks2 = sprintf '%.6g', $kp * $ks * $ks;
-    my $sub_t = sprintf '%s*ln(1+exp(%s/%.6g))*ln(1+exp(%s/%.6g))', $kpks2, $vov, $ks, $vov, $ks;
-    my $tri_t = sprintf '%.6g*(%s*%s-0.5*pow(max(%s,0),%.6g)*pow(max(%s,0),%.6g))*(1+%.6g*%s)',
-                        $kp, $vov, $vds, $vds, $mt, $vov, 2 - $mt, $lam, $vds;
-    my $sat_t = sprintf '0.5*%.6g*%s*%s*(1+%.6g*%s)', $kp, $vov, $vov, $lam, $vds;
-    my $ich = sprintf 'IF(%s<=0,%s,IF(%s<%s,%s,%s))', $vov, $sub_t, $vds, $vov, $tri_t, $sat_t;
+    # Forward/reverse: Vgs or Vgd, |Vds|, sign of the result (see the header)
+    my $vgx  = sprintf 'IF(%s>=0,%s,%s-%s)', $vds, $vgs, $vgs, $vds;
+    my $x    = sprintf '(%s-%.6g)', $vgx, $vto + $ssh;
+    # Ks*ln(1+exp(x/Ks)) written so that exp() cannot overflow
+    my $vgst = sprintf '(max(%s,0)+%.6g*ln(1+exp(-abs(%s)/%.6g)))', $x, $ks, $x, $ks;
+    my $vdss = sprintf '(abs(%s)*%.6g)', $vds, $mt;
+    my $betap = sprintf '(%.6g*(1+%.6g*%s)', $kp, $lam, $vds;
+    $betap .= $th != 0 ? sprintf('/(1+%.6g*max(%s-%.6g,0)))', $th, $vgx, $vto) : ')';
+    my $id = sprintf 'IF(%s<=%s,0.5*%s*%s*%s,%s*%s*(%s-0.5*%s))',
+                     $vgst, $vdss, $betap, $vgst, $vgst, $betap, $vdss, $vgst, $vdss;
+    my $ich = sprintf 'IF(%s>=0,1,-1)*%s', $vds, $id;
     my ($ba, $bk) = $pol > 0 ? ('si', 'di') : ('di', 'si');
     my $bd_rs = $rb > 0 ? sprintf(' RS=%.6g', $rb) : '';
     my $bd_cj = $cjo > 0 ? sprintf(' CJO=%.6g', $cjo) : '';

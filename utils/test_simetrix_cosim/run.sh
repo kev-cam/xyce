@@ -14,11 +14,12 @@ XYCE_LIBDIR=${XYCE_LIBDIR:-$HOME/xyce-libs}
 XCI=${XCI:-/usr/local/src/xyce-build/utils/XyceCInterface}
 export LD_LIBRARY_PATH=$NVCB:$NVCB/lib:$XYCE_LIBDIR:$XCI:/usr/local/src/xyce-build/src
 
-TEST=${1:-min}   # 'min' (D2A square wave) or 'a2d' (A2D round trip)
+TEST=${1:-min}   # 'min' (D2A square wave), 'a2d' (A2D round trip), 'glitch' (D2A change mid-ramp)
 case $TEST in
+  glitch) VHD=cosim_glitch.vhd; TOP=cosim_glitch; CIR=glitch.cir; BND=glitch.boundary;;
   min) VHD=cosim_min.vhd; TOP=cosim_min; CIR=min.cir; BND=min.boundary;;
   a2d) VHD=cosim_a2d.vhd; TOP=cosim_a2d; CIR=a2d.cir; BND=a2d.boundary;;
-  *) echo "usage: $0 [min|a2d]"; exit 1;;
+  *) echo "usage: $0 [min|a2d|glitch]"; exit 1;;
 esac
 W=work_$TEST; rm -rf $W
 $NVC --std=2040 --work=$W:$W -L $LIBS -a $VHD
