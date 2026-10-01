@@ -1762,7 +1762,11 @@ void Gear12::completeStep(const TIAParams &tia_params)
   // should not adjust currentStepSize because that would result in
   // currentStepSize == 0.
   //  if (sec.currentTime < sec.stopTime)
-  if ((sec.stopTime - sec.currentTime) >= sec.minTimeStep) 
+  // (minTimeStep is 0 at the initial time, so the test must also exclude
+  // currentTime == stopTime explicitly: a breakpoint reached by the very
+  // first step otherwise zeroes the next one.)
+  if ((sec.stopTime - sec.currentTime) > 0.0 &&
+      (sec.stopTime - sec.currentTime) >= sec.minTimeStep)
   {
     // If the step needs to be adjusted:
     if (adjustStep)
