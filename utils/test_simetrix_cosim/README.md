@@ -50,8 +50,11 @@ same `.boundary` and VHDL, see `VACASK/demo/cosim`).
   dac_bridge) co-simulating with the analog SMPS. Exercises the full translator:
   multi-input gates, bridge-generic propagation, the D2A series-R, SIMetrix
   syntactic cleanup, and the NMOS LEVEL=17 → VDMOS macromodel remap (IRFR420).
-  Binds 7/7 boundaries. On VACASK the full 8 ms (183 kHz switching, Vout
-  settling at 4.7 V) runs in about 12 s.
+  Binds 7/7 boundaries. The controller comes alive at ~6 ms (UVLO on the slow
+  Vcc charge) and switches at 183 kHz, Vout settling at 4.7 V. 7 ms run in
+  53 s on Xyce (113 k time points, one per ms while nothing switches); the
+  full 8 ms in about 12 s on VACASK. Both engines agree to <1 % on the 6-7 ms
+  window.
 
 ## Tuning and tracing
 
