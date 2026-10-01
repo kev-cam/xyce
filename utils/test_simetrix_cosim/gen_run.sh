@@ -13,7 +13,7 @@ ENGINE=${ENGINE:-xyce}
 NVCB=${NVCB:-/usr/local/src/nvc-build}; NVC=$NVCB/bin/nvc; LIBS=$NVCB/lib
 XYCE_LIBDIR=${XYCE_LIBDIR:-$HOME/xyce-libs}
 XCI=${XCI:-/usr/local/src/xyce-build/utils/XyceCInterface}
-VCB=${VCB:-/opt/build.VACASK/cosim}
+VCB=${VCB:-/opt/build.VACASK/Release}
 UTILS=/usr/local/src/xyce/utils
 export LD_LIBRARY_PATH=$NVCB:$NVCB/lib:$XYCE_LIBDIR:$XCI:/usr/local/src/xyce-build/src:$VCB/cinterface
 export SIM_MODULE_PATH=${SIM_MODULE_PATH:-$VCB/devices}
