@@ -1726,8 +1726,39 @@ void PWLinData::getSensitivityParams (
   }
 }
 
+// Candidate-step functions of the libraries bound through code: URIs (see
+// cosimCandidateStep in N_DEV_SourceData.h), one entry per library.
+typedef int (*CosimStepFn)(double t, double * tEvt);
+static std::vector<std::pair<void *, CosimStepFn> > cosimStepFns;
+
+static void registerCosimStepFn(void * handle)
+{
+  for (size_t i = 0; i < cosimStepFns.size(); ++i)
+    if (cosimStepFns[i].first == handle)
+      return;
+  CosimStepFn fn = (CosimStepFn)dlsym(handle, "xyce_bridge_step");
+  if (fn != NULL)
+    cosimStepFns.push_back(std::make_pair(handle, fn));
+}
+
+bool cosimCandidateStep(double t, double & tEvt)
+{
+  bool veto = false;
+  for (size_t i = 0; i < cosimStepFns.size(); ++i)
+  {
+    double te = -1.0;
+    if ((*cosimStepFns[i].second)(t, &te) != 0 && te >= 0.0)
+    {
+      if (!veto || te < tEvt)
+        tEvt = te;
+      veto = true;
+    }
+  }
+  return veto;
+}
+
 extern "C" {
-    
+
 static int NoConnection(PWLinDynData *,void *ext_data, PWLinDynData::BridgeOP op, void *op_data)
 {
     return -1; // fatal error
@@ -1884,6 +1915,7 @@ PWLinDynData::Callback PWLinDynData::BindCB(const char *lib_name,const char *fn_
     
     if (NULL != (fn = (fn_p)dlsym(handle, fn_name))) {
         cbk = (Callback)(*fn)(this,cb_data,args);
+        registerCosimStepFn(handle);
     } else {
         Report::DevelWarning() << "Call-back not given";
     }

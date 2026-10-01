@@ -491,6 +491,16 @@ private:
 // Creator       : Kevin Cameron
 // Creation Date : 4/28/20
 //-----------------------------------------------------------------------------
+
+// Co-simulation (analog on top): a library bound through a code: URI may
+// export `int xyce_bridge_step(double t, double *tEvt)`. The transient loop
+// calls it (through cosimCandidateStep) for every converged step before the
+// step is accepted, with t the end of the step; the library advances the
+// digital side to t. A nonzero return with *tEvt >= 0 means the digital
+// changed an analog input at *tEvt (in [currentTime, t)): the step is not
+// accepted but redone so that it ends at *tEvt.
+bool cosimCandidateStep(double t, double & tEvt);
+
 class PWLinDynData : public PWLinData
 {
  public:

@@ -83,6 +83,14 @@
 #include <N_ANP_OutputConductanceFile.h>
 
 namespace Xyce {
+namespace Device {
+// Co-simulation candidate-step hook of code: URI bridged sources
+// (N_DEV_SourceData.h)
+bool cosimCandidateStep(double t, double & tEvt);
+}
+}
+
+namespace Xyce {
 namespace Analysis {
 
 //-----------------------------------------------------------------------------
@@ -1275,6 +1283,34 @@ bool Transient::doLoopProcess()
     takeAnIntegrationStep_();
 
     // ------------------------------------------------------------------------
+    // Co-simulation (analog on top): a step that passed error control is
+    // offered to the digital side before it is accepted. The digital advances
+    // to the end of the step; if it changes an analog input on the way, at
+    // tEvt, the step is not accepted but redone so that it ends at tEvt (the
+    // input starts changing there). A change at the very start of the step
+    // (tEvt == currentTime, the digital reacting to the step-start values)
+    // redoes the same step. Mirrors the Habanero provisional-step reject.
+    if (analysisManager_.getStepErrorControl().stepAttemptStatus)
+    {
+      TimeIntg::StepErrorControl & sec = analysisManager_.getStepErrorControl();
+      double tEvt = -1.0;
+      if (Device::cosimCandidateStep(sec.nextTime, tEvt))
+      {
+        sec.stepAttemptStatus = false;
+        loader_.stepFailure(analysisManager_.getTwoLevelMode());
+        analysisManager_.getWorkingIntegrationMethod().rejectStepForHabanero();
+        if (tEvt > sec.currentTime + 2.0*sec.minTimeStep && tEvt < sec.nextTime)
+        {
+          sec.setBreakPoint(tEvt);
+          sec.updateStopTime(comm_, tiaParams_.bpEnable, tiaParams_.initialTime,
+                             tiaParams_.minTimeStepsBPGiven, tiaParams_.minTimeStepsBP);
+          // overshoot so that the stopTime clamp lands exactly on tEvt
+          sec.setTimeStep(2.0*(tEvt - sec.currentTime));
+        }
+        continue;
+      }
+    }
+
     if (analysisManager_.getStepErrorControl().stepAttemptStatus)
     {
       // ERK: why not call doProcessSuccessfulStep here?  everyone else does it
