@@ -1741,20 +1741,36 @@ static void registerCosimStepFn(void * handle)
     cosimStepFns.push_back(std::make_pair(handle, fn));
 }
 
-bool cosimCandidateStep(double t, double & tEvt)
+// Every library sees every candidate step (each advances its own digital
+// side), whatever the others answer.
+int cosimCandidateStep(double t, double & tEvt)
 {
   bool veto = false;
+  bool finish = false;
   for (size_t i = 0; i < cosimStepFns.size(); ++i)
   {
     double te = -1.0;
-    if ((*cosimStepFns[i].second)(t, &te) != 0 && te >= 0.0)
+    const int r = (*cosimStepFns[i].second)(t, &te);
+    if (r == COSIM_FINISH)
+      finish = true;
+    else if (r != COSIM_ACCEPT && te >= 0.0)
     {
       if (!veto || te < tEvt)
         tEvt = te;
       veto = true;
     }
   }
-  return veto;
+  if (veto)
+    return COSIM_VETO;
+  return finish ? COSIM_FINISH : COSIM_ACCEPT;
+}
+
+// See N_DEV_SourceData.h.  Raise it with every change to the protocol between
+// the transient loop and the code: URI libraries (xyce_bridge_step results,
+// BindCB's contract).
+extern "C" int xyce_lib_cosim_abi(void)
+{
+  return 2;
 }
 
 extern "C" {
@@ -1915,7 +1931,19 @@ PWLinDynData::Callback PWLinDynData::BindCB(const char *lib_name,const char *fn_
     
     if (NULL != (fn = (fn_p)dlsym(handle, fn_name))) {
         cbk = (Callback)(*fn)(this,cb_data,args);
-        registerCosimStepFn(handle);
+        if (NULL == cbk) {
+            // The library could not bind this source (an unknown name, bad
+            // arguments) and gave no callback: a fatal input error, never a
+            // call through NULL.  NoConnection fails the source's Init call,
+            // which aborts ("Failed to connect URI").
+            Report::UserError() << "code: URI function " << fn_name << "() in "
+                                << (lib_name ? lib_name : "the Xyce executable")
+                                << " returned no callback for '" << args
+                                << "': the source is not connected";
+            cbk = NoConnection;
+        } else {
+            registerCosimStepFn(handle);
+        }
     } else {
         Report::DevelWarning() << "Call-back not given";
     }

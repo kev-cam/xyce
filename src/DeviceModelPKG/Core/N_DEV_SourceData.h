@@ -496,10 +496,36 @@ private:
 // export `int xyce_bridge_step(double t, double *tEvt)`. The transient loop
 // calls it (through cosimCandidateStep) for every converged step before the
 // step is accepted, with t the end of the step; the library advances the
-// digital side to t. A nonzero return with *tEvt >= 0 means the digital
-// changed an analog input at *tEvt (in [currentTime, t)): the step is not
-// accepted but redone so that it ends at *tEvt.
-bool cosimCandidateStep(double t, double & tEvt);
+// digital side to t, and answers:
+//   COSIM_ACCEPT  accept the step;
+//   COSIM_VETO    the digital changed an analog input at *tEvt (in
+//                 [currentTime, t)): the step is not accepted but redone so
+//                 that it ends at *tEvt.  Any other nonzero answer with
+//                 *tEvt >= 0 is a veto too (and one with *tEvt < 0 is an
+//                 accept), as before the finish protocol;
+//   COSIM_FINISH  the digital side has stopped ($finish, $stop, a fatal
+//                 error): accept this step, then end the transient there, as
+//                 at the deck's stop time (the output is finished); *tEvt is
+//                 not used.
+enum CosimStepResult
+{
+  COSIM_ACCEPT = 0,
+  COSIM_VETO   = 1,
+  COSIM_FINISH = 2
+};
+
+// One answer for every library bound through code: URIs: a veto from any
+// library wins (tEvt = the earliest *tEvt; a library that answered finish is
+// offered the redone step and answers again), else a finish from any
+// library, else accept.  tEvt is set only for a veto.
+int cosimCandidateStep(double t, double & tEvt);
+
+// The co-simulation ABI this library implements: 2 = the finish protocol
+// above.  The Xyce C interface reports it as xyce_cosim_abi(), which nvc
+// checks before a co-simulation starts: an engine without the finish protocol
+// reads COSIM_FINISH as "accept" and would keep simulating after the digital
+// side has stopped.
+extern "C" int xyce_lib_cosim_abi(void);
 
 class PWLinDynData : public PWLinData
 {

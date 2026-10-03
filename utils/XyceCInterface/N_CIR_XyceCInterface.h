@@ -55,6 +55,11 @@ int xyce_runSimulation(void ** ptr);
 int xyce_simulateUntil(  void ** ptr, double requestedUntilTime, double* completedUntilTime );
 bool xyce_simulationComplete( void ** ptr);
 
+// Co-simulation ABI of the Xyce library behind this interface: 2 = the
+// finish protocol of code: URI bridged sources, 1 = a Xyce library without
+// it.  Needs no simulator object.
+int xyce_cosim_abi(void);
+
 bool xyce_checkCircuitParameterExists(void **ptr, char * paramName );
 
 int xyce_getNumDevices(void **ptr, char * modelGroupName, int* numDevNames, int* maxDevNameLength);

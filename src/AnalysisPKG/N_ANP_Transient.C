@@ -82,13 +82,10 @@
 #include <N_ANP_HB.h>
 #include <N_ANP_OutputConductanceFile.h>
 
-namespace Xyce {
-namespace Device {
-// Co-simulation candidate-step hook of code: URI bridged sources
-// (N_DEV_SourceData.h)
-bool cosimCandidateStep(double t, double & tEvt);
-}
-}
+// Device::cosimCandidateStep, the co-simulation hook of code: URI bridged
+// sources.  Its own declaration, never a local copy: a copy that disagrees on
+// the return type still links (the return type is not part of the symbol).
+#include <N_DEV_SourceData.h>
 
 namespace Xyce {
 namespace Analysis {
@@ -1290,11 +1287,15 @@ bool Transient::doLoopProcess()
     // input starts changing there). A change at the very start of the step
     // (tEvt == currentTime, the digital reacting to the step-start values)
     // redoes the same step. Mirrors the Habanero provisional-step reject.
+    // Once the digital has stopped, the answer is a finish: the step is
+    // accepted and the transient ends there (below).
+    int cosimResult = Device::COSIM_ACCEPT;
     if (analysisManager_.getStepErrorControl().stepAttemptStatus)
     {
       TimeIntg::StepErrorControl & sec = analysisManager_.getStepErrorControl();
       double tEvt = -1.0;
-      if (Device::cosimCandidateStep(sec.nextTime, tEvt))
+      cosimResult = Device::cosimCandidateStep(sec.nextTime, tEvt);
+      if (cosimResult == Device::COSIM_VETO)
       {
         sec.stepAttemptStatus = false;
         loader_.stepFailure(analysisManager_.getTwoLevelMode());
@@ -1315,6 +1316,24 @@ bool Transient::doLoopProcess()
     {
       // ERK: why not call doProcessSuccessfulStep here?  everyone else does it
       processSuccessfulStep();
+
+      // Co-simulation finish: the step just accepted (and output) is the last
+      // one.  It becomes the end of the transient: finalTime, so the analysis
+      // reports itself complete and a later simulateUntil does nothing, and
+      // nextTime, the time simulateUntil reports reached.  Leave the loop
+      // here, ahead of the pause test, so that the output is finished as at
+      // a normal end even when a pause was due at this point, and a finish on
+      // the very first step ends the run too.
+      if (cosimResult == Device::COSIM_FINISH)
+      {
+        TimeIntg::StepErrorControl & sec = analysisManager_.getStepErrorControl();
+        sec.finalTime = sec.currentTime;
+        sec.nextTime = sec.currentTime;
+        lout() << "Co-simulation finish at " << sec.currentTime
+               << " s.  Exiting transient loop\n" << std::endl;
+        bsuccess = true;
+        break;
+      }
     }
     else if (passNLStall
              && !analysisManager_.getStepErrorControl().stepAttemptStatus

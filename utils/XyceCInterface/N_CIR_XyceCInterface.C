@@ -186,6 +186,46 @@ bool xyce_simulationComplete( void ** ptr)
   return simCompleteFlag;
 }
 
+// The Xyce library's co-simulation ABI (N_DEV_SourceData.h), referenced
+// weakly where the toolchain allows: this interface loaded with a Xyce
+// library older than the finish protocol must report that, not fail to load.
+namespace Xyce {
+namespace Device {
+#if defined(__GNUC__)
+extern "C" int xyce_lib_cosim_abi(void) __attribute__((weak));
+#else
+extern "C" int xyce_lib_cosim_abi(void);
+#endif
+}
+}
+
+//-----------------------------------------------------------------------------
+// Function      : xyce_cosim_abi
+// Purpose       : Report the co-simulation ABI of the Xyce library behind
+//                 this interface: 2 = the finish protocol of code: URI
+//                 bridged sources (a library's xyce_bridge_step may answer
+//                 "finish": the transient accepts that step and ends there),
+//                 1 = a Xyce library without it.
+// Special Notes : nvc calls it (through dlsym) before it starts a
+//                 co-simulation and refuses an answer below 2: such an
+//                 engine would read a finish as "accept" and keep simulating
+//                 after the digital side has stopped.  The protocol lives in
+//                 the Xyce library (N_DEV_SourceData.C, N_ANP_Transient.C),
+//                 so the answer is that library's.  No simulator object is
+//                 needed.
+// Scope         : public
+// Creator       : Kevin Cameron / cosim
+// Creation Date : 10/01/2026
+//-----------------------------------------------------------------------------
+int xyce_cosim_abi(void)
+{
+#if defined(__GNUC__)
+  if (!Xyce::Device::xyce_lib_cosim_abi)
+    return 1;
+#endif
+  return Xyce::Device::xyce_lib_cosim_abi();
+}
+
 //-----------------------------------------------------------------------------
 // Function      : xyce_checkCircuitParameterExists
 // Purpose       : Call the Xyce::Circuit::Simulator::checkCircuitParameterExists()
