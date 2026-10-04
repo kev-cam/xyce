@@ -1392,8 +1392,11 @@ bool Instance::updateIntermediateVars ()
     {
       double Czof2SW = CzeroSW / F2SW;
       double MotJctSWPot = MJSW / tJctSWPot;
+      // the sidewall's own F1 (FCS, PHP, MJSW), not the area's tF1: with the area's the charge
+      // is discontinuous at FCS*PHP unless FC=FCS, VJ=PHP and M=MJSW
+      double tF1SW = tJctSWPot * (1.0 - exp((1.0 - MJSW) * log(1.0 - model_.FCS))) / (1.0 - MJSW);
 
-      Qd += CzeroSW * tF1 +
+      Qd += CzeroSW * tF1SW +
             Czof2SW * (F3SW * (Vc - tDepSWCap) + (0.5 * MotJctSWPot) *
                        (Vc * Vc - tDepSWCap * tDepSWCap));
       Cd += Czof2SW * (F3SW + MotJctSWPot * Vc);
@@ -2477,8 +2480,11 @@ bool updateIntermediateVars (
     {
       ScalarT Czof2SW = CzeroSW / F2SW;
       ScalarT MotJctSWPot = MJSW / tJctSWPot;
+      // the sidewall's own F1 (FCS, PHP, MJSW), not the area's tF1: with the area's the charge
+      // is discontinuous at FCS*PHP unless FC=FCS, VJ=PHP and M=MJSW
+      ScalarT tF1SW = tJctSWPot * (1.0 - exp((1.0 - MJSW) * log(1.0 - tDepSWCap / tJctSWPot))) / (1.0 - MJSW);
 
-      Qd += CzeroSW * tF1 +
+      Qd += CzeroSW * tF1SW +
             Czof2SW * (F3SW * (Vc - tDepSWCap) + (0.5 * MotJctSWPot) *
                        (Vc * Vc - tDepSWCap * tDepSWCap));
       Cd += Czof2SW * (F3SW + MotJctSWPot * Vc);

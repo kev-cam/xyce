@@ -346,6 +346,11 @@ void Traits::loadModelParameters(ParametricData<MOSFET3::Model> &p)
    .setCategory(CAT_NONE)
    .setDescription("Saturation field factor");
 
+  p.addPar ("BADMOS3",0,&MOSFET3::Model::badmos3)
+   .setUnit(U_NONE)
+   .setCategory(CAT_CONTROL)
+   .setDescription("1: the original channel-length modulation of SPICE2 and HSPICE (SPICE3 .option badmos3): with VMAX>0 the pinch-off field Ep is not multiplied by KAPPA");
+
   p.addPar ("XJ",0.0,&MOSFET3::Model::junctionDepth)
    .setUnit(U_METER)
    .setCategory(CAT_GEOMETRY)
@@ -2213,12 +2218,11 @@ bool Instance::updateIntermediateVars ()
     // was detected and fixed in 3f2.  BADMOS3 enables the unfixed deal,
     // just in case parameter fitting is affected.
     // It has never been implemented in Xyce
-    //#ifdef BADMOS3_IMPLEMENTED
-    //    if (ckt->CKTbadMos3)
-    //      emax = cdsat*oneoverxl/gdsat;
-    //    else
-    //#endif
-    emax = model_.kappa * cdsat*oneoverxl/gdsat;
+    // Xyce has no .option badmos3; the BADMOS3 model parameter selects it per card.
+    if (model_.badmos3)
+      emax = cdsat*oneoverxl/gdsat;
+    else
+      emax = model_.kappa * cdsat*oneoverxl/gdsat;
     emoncd = emax/cdsat;
     emongd = emax/gdsat;
     demdvg = emoncd*gm-emongd*dgdvg;
@@ -3293,6 +3297,7 @@ Model::Model(
     maxDriftVel(0.0),
     alpha(0.0),
     kappa(0.0),
+    badmos3(0),
     fNcoef(0.0),
     fNexp(0.0),
     capBDGiven(0),

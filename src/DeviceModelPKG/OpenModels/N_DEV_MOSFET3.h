@@ -614,6 +614,7 @@ private:
   double maxDriftVel;         // vmax
   double alpha;               // alpha
   double kappa;               // kappa
+  int badmos3;                // 1: the original (SPICE2, HSPICE) emax without kappa
   double fNcoef;
   double fNexp;
 
