@@ -1,0 +1,20 @@
+Two ddt() terms in one contribution: openvaf-r/VACASK keeps only one of them.
+
+  I(p, n) <+ V(p, n)/r + ddt(c*V(p, n)) + ddt(c*V(p, n));   // twoddt.va
+  I(p, n) <+ V(p, n)/r + ddt(2*c*V(p, n));                   // oneddt.va (control)
+
+Both are r = 1k in parallel with C = 2c = 100n. In a divider with 1k to ground at
+1 kHz the output is analytically out = 1k/(1k + Z), Z = 1/(1/1k + j*w*100n):
+|out| = 0.563358 at 14.70 deg (w*C*r = 0.6283; (1 + j0.6283)/(2 + j0.6283)).
+
+Command (VACASK 2026-10 build, from this directory):
+  SIM_TEST=yes PYTHONPATH=<VACASK>/python SIM_MODULE_PATH=<build>/devices vacask test_two_ddt_terms.sim
+
+Observed (2026-10-25), exit 1:
+  two ddt() terms            |v| = 0.517745  phase = 8.51 deg   expected 0.563358 at 14.70 deg   WRONG
+  one ddt() term (control)   |v| = 0.563358  phase = 14.70 deg   expected 0.563358 at 14.70 deg   ok
+
+0.517745 at 8.51 deg is exactly the answer for C = c = 50n (w*C*r = 0.3142): the second,
+textually identical ddt() term is dropped (a common-subexpression merge of the two
+ddt() calls that counts their sum once is the likely place). Expected: exit 0.
+Xyce through PyMS 1.1.0 gives the analytic value.

@@ -29,6 +29,8 @@
 #include <functional>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <cerrno>
+#include <unistd.h>
 
 #ifdef HAVE_DLFCN_H
 #include <dlfcn.h>
@@ -550,12 +552,65 @@ bool pyms_register_hdl(const std::string &va_path) {
     }
     mkdir(cache_dir.c_str(), 0755);
 
-    // Step 3: Run xyce_device_gen.py to parse VA and generate C++
+    // Identity of the .va this registration builds from: its path plus a
+    // hash of its content. It names the private generator directory (Step 3)
+    // and the cache slot (Step 4), so that two Xyce processes which build
+    // DIFFERENT modules of the same name through one shared cache (two users,
+    // two parallel sweeps, a test harness) never write the same file. Before
+    // this the generator wrote N_DEV_PYMS_<MODULE>.C into the cache directory
+    // itself and the slot was pyms_<module>.so, both written in place: the
+    // loser of the race compiled the OTHER module's shell source, or
+    // dlopen'ed a .so the other process was still writing. MEASURED
+    // 2026-10-24, two concurrent runs of a1 (r=1k) and a1 (r=3k): 5 of 8
+    // pairs wrong, 4 of them SILENT (exit 0, the other module's value: the
+    // stale shell's baked _va path builds the other module's math library),
+    // 1 loud (".HDL: failed to load compiled plugin ...: file too short").
+    //
+    // The identity also covers the command-line macros the generator reads
+    // from PYMS_DEFINES (xyce_device_gen.py --define): they select `ifdef
+    // branches and are baked into the shell, so a shell generated with one
+    // set must never be reused for another (2026-10-25: without this, a run
+    // with PYMS_DEFINES=RVAL=3000 after a run without it reused the macro-less
+    // shell and silently gave the r = 1k value).
+    std::string va_hash;
+    {
+        std::ifstream vf(va_path.c_str(), std::ios::binary);
+        std::ostringstream vs;
+        vs << vf.rdbuf();
+        const char *defs = getenv("PYMS_DEFINES");
+        char hb[32];
+        snprintf(hb, sizeof(hb), "%zx",
+                 std::hash<std::string>{}(va_path + "\n" + vs.str() +
+                     "\nPYMS_DEFINES=" + (defs ? defs : "")));
+        va_hash = hb;
+    }
+    const std::string pid = std::to_string((long)getpid());
+
+    // Step 3: Run xyce_device_gen.py to parse VA and generate C++, into a
+    // directory private to this process (the generated file names carry
+    // only the module name).
+    std::string gen_dir = cache_dir + "/gen." + va_hash + "." + pid;
+    if (mkdir(gen_dir.c_str(), 0755) != 0) {
+        Report::UserError0() << ".HDL: cannot create " << gen_dir << ": "
+            << strerror(errno);
+        return false;
+    }
+    auto drop_gen_dir = [&gen_dir]() {
+        if (DIR *d = opendir(gen_dir.c_str())) {
+            struct dirent *e;
+            while ((e = readdir(d)) != nullptr)
+                if (e->d_name[0] != '.')
+                    unlink((gen_dir + "/" + e->d_name).c_str());
+            closedir(d);
+        }
+        rmdir(gen_dir.c_str());
+    };
     std::string cmd = "python3 " + gen_script + " " + va_path +
-                      " --output " + cache_dir + " 2>&1";
+                      " --output " + gen_dir + " 2>&1";
     FILE *fp = popen(cmd.c_str(), "r");
     if (!fp) {
         Report::UserError0() << ".HDL: failed to run PyMS: " << cmd;
+        drop_gen_dir();
         return false;
     }
 
@@ -569,22 +624,59 @@ bool pyms_register_hdl(const std::string &va_path) {
     if (rc != 0) {
         Report::UserError0() << ".HDL: PyMS compilation failed for " << va_path
             << "\n" << output;
+        drop_gen_dir();
         return false;
     }
 
-    // Parse module name from output: "Module: <name>, Ports: ..."
-    std::string module_name;
-    auto pos = output.find("Module: ");
-    if (pos != std::string::npos) {
-        auto end = output.find(",", pos + 8);
-        if (end != std::string::npos)
-            module_name = output.substr(pos + 8, end - pos - 8);
+    // Parse the module names from the output: one "Module: <name>, Ports: ..."
+    // line per module the generator built a device shell for.  A file with
+    // several modules is several devices (PyMS 1.1.4): every one is compiled
+    // and registered, so a netlist can name any of them.  Before, only the
+    // first line was read and a netlist naming another module of the file
+    // stopped with an unknown device (PyMS BUGS.md g4_two_modules_ground_leak).
+    std::vector<std::string> module_names;
+    {
+        size_t pos = 0;
+        while ((pos = output.find("Module: ", pos)) != std::string::npos) {
+            auto end = output.find(",", pos + 8);
+            if (end == std::string::npos) break;
+            module_names.push_back(output.substr(pos + 8, end - pos - 8));
+            pos = end;
+        }
+    }
+    // the generator's notes (a further module it could not build) are shown
+    {
+        size_t pos = 0;
+        while ((pos = output.find("xyce_device_gen: note: ", pos)) != std::string::npos) {
+            auto end = output.find("\n", pos);
+            Report::UserWarning0() << ".HDL: " << output.substr(pos + 23,
+                (end == std::string::npos ? output.size() : end) - pos - 23);
+            pos = (end == std::string::npos) ? output.size() : end;
+        }
     }
 
-    if (module_name.empty()) {
+    if (module_names.empty()) {
         Report::UserError0() << ".HDL: could not extract module name from "
             << va_path << "\nPyMS output: " << output;
+        drop_gen_dir();
         return false;
+    }
+
+    bool all_ok = true;
+    for (size_t mi = 0; mi < module_names.size(); ++mi) {
+    const std::string &module_name = module_names[mi];
+
+    // A module of the name of one another .va file registered before (two
+    // .hdl files that both define module X): the first stays, and the run
+    // says so (PyMS 1.1.5).  1.1.4 registered the second over the first,
+    // silently: the netlist's X was the later file's (the PYMS5 skeptic's
+    // m5_same_helper_two_files_use).
+    if (pyms_has_va(module_name) && pyms_get_va(module_name) != va_path) {
+        Report::UserWarning0() << ".HDL: module " << module_name << " of " << va_path
+            << " has the name of the module " << module_name << " of "
+            << pyms_get_va(module_name) << ", registered before: not registered; the netlist's "
+            << module_name << " is the one of " << pyms_get_va(module_name);
+        continue;
     }
 
     // Register the VA source for later VAE compilation
@@ -594,39 +686,53 @@ bool pyms_register_hdl(const std::string &va_path) {
     std::string NAME = module_name;
     for (auto &c : NAME) c = toupper(c);
 
-    std::string cpp_file = cache_dir + "/N_DEV_PYMS_" + NAME + ".C";
-    std::string so_file = cache_dir + "/pyms_" + module_name + ".so";
+    std::string cpp_file = gen_dir + "/N_DEV_PYMS_" + NAME + ".C";
+    std::string h_file = gen_dir + "/N_DEV_PYMS_" + NAME + ".h";
 
-    // Check if the cached device-shell .so is up to date. The cache slot is
-    // keyed by MODULE NAME (pyms_<module>.so), so two different .va FILES that
-    // declare the same module name COLLIDE on one slot. A pure mtime check
-    // against the current deck's va_path cannot see that collision: it
-    // compares the CURRENT .va against a .so that may have been generated
-    // from the OTHER file — and the stale shell then carries its baked _va
-    // path into processParams(), so even the freshly JIT-built vae eval .so
-    // is compiled from the WRONG .va. MEASURED 2026-09-26 (stat-sim qal_gate
-    // v3 "toolchain regression"): a scratchpad copy of qal_gate.va (pre-
-    // softplus) regenerated pyms_qal_gate.so at 11:47; every later run of the
-    // repo's qal_gate.va (mtime 11:14 < 11:47 → "up to date") silently
-    // reverted the model to the v1 hard clamp — a silent wrong answer.
-    //
-    // Fix: record beside the .so WHICH .va (absolute path) and WHAT CONTENT
-    // (hash of the file bytes) the shell was generated from (sidecar
-    // <so>.src), and reuse only on an exact match of both. Content identity
-    // also replaces the old .va-mtime ordering (which missed content changes
-    // with reordered mtimes, e.g. a restored/older file). The generator-
-    // script dependency stays mtime-based (see 71d0b770): the .C is rewritten
-    // every run (step 3 above), so its mtime is NOT a valid dependency.
-    std::string va_hash;
+    // The slot is keyed by what the shell is compiled FROM: the .va identity
+    // above and the generated shell source (.C and .h, which carry the PyMS
+    // version). A shell generated by another PyMS (another node list, another
+    // current-unknown layout) is never reused. Before, the .va identity alone
+    // keyed it: PyMS 1.1.0 then 1.1.1 through one PYMS_CACHE reused the 1.1.0
+    // shell with a 1.1.1 math library and gave 0 for 0.5, exit 0 (PyMS
+    // BUGS.md CHANGES 1.1.2). The generator output is deterministic (no path
+    // of the private directory, no pid), so an unchanged setup still hits.
+    std::string shell_hash;
     {
-        std::ifstream vf(va_path.c_str(), std::ios::binary);
-        std::ostringstream vs;
-        vs << vf.rdbuf();
+        std::ostringstream gs;
+        for (const std::string &f : {cpp_file, h_file}) {
+            std::ifstream gf(f.c_str(), std::ios::binary);
+            gs << gf.rdbuf() << "\n";
+        }
         char hb[32];
         snprintf(hb, sizeof(hb), "%zx",
-                 std::hash<std::string>{}(vs.str()));
-        va_hash = hb;
+                 std::hash<std::string>{}(va_hash + "\n" + gs.str()));
+        shell_hash = hb;
     }
+    std::string slot = cache_dir + "/pyms_" + module_name + "_" + shell_hash;
+    std::string so_file = slot + ".so";
+
+    // Check if the cached device-shell .so is up to date. The slot is keyed
+    // by the .va IDENTITY (module name plus the hash of path and content,
+    // above) and the shell source. Its history: keyed by MODULE NAME alone (pyms_<module>.so), two
+    // different .va FILES that declare the same module name COLLIDED on one
+    // slot, and a pure mtime check against the current deck's va_path could
+    // not see that collision: it compared the CURRENT .va against a .so that
+    // may have been generated from the OTHER file — and the stale shell then
+    // carried its baked _va path into processParams(), so even the freshly
+    // JIT-built vae eval .so was compiled from the WRONG .va. MEASURED
+    // 2026-09-26 (stat-sim qal_gate v3 "toolchain regression"): a temporary
+    // copy of qal_gate.va (pre-softplus) regenerated pyms_qal_gate.so at
+    // 11:47; every later run of the repo's qal_gate.va (mtime 11:14 < 11:47
+    // → "up to date") silently reverted the model to the v1 hard clamp.
+    //
+    // 1c36edca recorded beside the .so WHICH .va (absolute path) and WHAT
+    // CONTENT (hash of the file bytes) the shell was generated from (sidecar
+    // <so>.src) and reuses only on an exact match of both; the identity in
+    // the file name now keeps concurrent processes apart, and the sidecar
+    // stays as the guard against a hash collision. The generator-script
+    // dependency stays mtime-based (see 71d0b770): the .C is regenerated
+    // every run (step 3 above), so its mtime is NOT a valid dependency.
     std::string src_file = so_file + ".src";
     struct stat so_stat, gen_stat;
     bool up_to_date = false;
@@ -662,19 +768,27 @@ bool pyms_register_hdl(const std::string &va_path) {
         // into a process that already has libXyceLib loaded, so
         // --allow-shlib-undefined lets us link without resolving the
         // full Trilinos dependency chain.
+        // Compile to a name private to this process and rename() it into
+        // place: a concurrent run sees either no file or a complete one,
+        // never a partial write, whatever it is building itself.
+        std::string so_tmp = so_file + "." + pid + ".tmp";
         std::string compile_cmd =
             "g++ -shared -fPIC -O2 -std=c++17 "
             "-Wl,--allow-shlib-undefined "
-            "-I" + cache_dir + " " +
+            "-I" + gen_dir + " " +
             includes +
             "-L" + std::string(xyce_build) + "/src -lXyceLib "
-            "-o " + so_file + " " + cpp_file + " 2>&1";
+            "-o " + so_tmp + " " + cpp_file + " 2>&1";
 
         fp = popen(compile_cmd.c_str(), "r");
         if (!fp) {
-            Report::UserError0() << ".HDL: failed to compile plugin for "
-                << module_name;
-            return false;
+            if (mi == 0) {
+                Report::UserError0() << ".HDL: failed to compile plugin for " << module_name;
+                drop_gen_dir(); return false;
+            }
+            Report::UserWarning0() << ".HDL: failed to compile plugin for " << module_name
+                << " (a further module of " << va_path << "): not registered";
+            all_ok = false; continue;
         }
         output.clear();
         while (fgets(buf, sizeof(buf), fp))
@@ -682,23 +796,57 @@ bool pyms_register_hdl(const std::string &va_path) {
         rc = pclose(fp);
 
         if (rc != 0) {
-            Report::UserError0() << ".HDL: g++ compilation failed for "
-                << module_name << "\n" << output;
-            return false;
+            unlink(so_tmp.c_str());
+            if (mi == 0) {
+                Report::UserError0() << ".HDL: g++ compilation failed for "
+                    << module_name << "\n" << output;
+                drop_gen_dir(); return false;
+            }
+            Report::UserWarning0() << ".HDL: g++ compilation failed for " << module_name
+                << " (a further module of " << va_path << "): not registered\n" << output;
+            all_ok = false; continue;
+        }
+        if (rename(so_tmp.c_str(), so_file.c_str()) != 0) {
+            unlink(so_tmp.c_str());
+            if (mi == 0) {
+                Report::UserError0() << ".HDL: cannot install " << so_file
+                    << ": " << strerror(errno);
+                drop_gen_dir(); return false;
+            }
+            Report::UserWarning0() << ".HDL: cannot install " << so_file
+                << ": " << strerror(errno) << " (module " << module_name << " not registered)";
+            all_ok = false; continue;
         }
 
         // Record the identity (path + content hash) of the .va this shell
         // was generated from — the reuse check above requires an exact match.
-        std::ofstream sf(src_file.c_str(), std::ios::trunc);
-        if (sf) sf << va_path << "\n" << va_hash << "\n";
+        // Written the same way: a private name, then rename() into place.
+        std::string src_tmp = src_file + "." + pid + ".tmp";
+        {
+            std::ofstream sf(src_tmp.c_str(), std::ios::trunc);
+            if (sf) sf << va_path << "\n" << va_hash << "\n";
+        }
+        if (rename(src_tmp.c_str(), src_file.c_str()) != 0)
+            unlink(src_tmp.c_str());
     }
+
+    // Keep the generated shell source beside its .so for inspection (every
+    // process of this identity writes the same text and rename() is atomic),
+    // then drop the private directory.
+    rename(cpp_file.c_str(), (slot + ".C").c_str());
+    rename(h_file.c_str(), (slot + ".h").c_str());
 
     // Step 5: dlopen the .so — constructor auto-registers the device
     void *dl = dlopen(so_file.c_str(), RTLD_NOW);
     if (!dl) {
-        Report::UserError0() << ".HDL: failed to load compiled plugin "
-            << so_file << ": " << dlerror();
-        return false;
+        if (mi == 0) {
+            Report::UserError0() << ".HDL: failed to load compiled plugin "
+                << so_file << ": " << dlerror();
+            drop_gen_dir(); return false;
+        }
+        Report::UserWarning0() << ".HDL: failed to load compiled plugin "
+            << so_file << ": " << dlerror() << " (module " << module_name << " not registered)";
+        all_ok = false; continue;
     }
 
     // Step 6: Set VAE_SO_DIR so processParams can find the VAE math .so
@@ -708,6 +856,9 @@ bool pyms_register_hdl(const std::string &va_path) {
 
     Report::UserWarning0() << ".HDL: compiled and registered " << module_name
         << " from " << va_path;
+    }  // for each module of the file
+    drop_gen_dir();
+    (void)all_ok;   // a further module that failed has its own error above
     return true;
 
 #else

@@ -1,0 +1,44 @@
+The flow of a voltage-contribution branch read in another contribution (op)
+
+ground 0
+
+load "resistor.osdi"
+load "ammeter_double.va"
+load "ammeter.va"
+
+model resistor resistor
+model vsource vsource
+model ammeter_double ammeter_double
+model ammeter ammeter
+
+// in -> device -> out -> 1k -> ground, twice: the double ammeter, and the control
+v1 (in 0) vsource dc=1
+x2 (in out2) ammeter_double
+r2 (out2 0) resistor r=1k
+x1 (in out1) ammeter
+r1 (out1 0) resistor r=1k
+
+control
+  abort always
+  options rawfile="binary"
+  analysis op1 op
+  postprocess(PYTHON, "runme.py")
+endc
+
+embed "runme.py" <<<FILE
+from rawfile import rawread
+from runtest import *
+import sys
+
+op1 = rawread('op1.raw').get()
+tests = []
+# out = 1k / (R + 1k): R = 500 ohm for the double ammeter, 1k for the control
+for node, what, exact in (('out2', 'ammeter + I(p, n) <+ I(am)', 1000.0 / 1500.0),
+                          ('out1', 'ammeter alone (control)', 0.5)):
+    v = op1[node][0]
+    ok = abs(v - exact) < 1e-9
+    print("%-28s v = %.9f   expected %.9f   %s" % (what, v, exact, "ok" if ok else "WRONG"))
+    tests.append(ok)
+if isTest():
+    sys.exit(not all(tests))
+>>>FILE

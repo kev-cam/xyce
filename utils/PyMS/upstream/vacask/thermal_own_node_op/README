@@ -1,0 +1,20 @@
+Informational, not a defect: the operating point of a self-heating resistor (thermal
+port on its own node) is 1.7e-5 off the analytic value with VACASK's default
+tolerances and exact with tight ones.
+
+t1.va: I(p,n) <+ V(p,n)/r*(1 + alpha*Temp(t)); Pwr(t) <+ -V(p,n)^2/r, r = 1k,
+alpha = 1, Rth = 1k from t to ground, 1 V source, 1k load. Analytically
+u = V(in,out) solves u^3 + 2u - 1 = 0 (u = 0.45339765151640377), V(out) = 1 - u =
+0.546602348, V(th) = u^2 = 0.205569430.
+
+Commands (from this directory):
+  SIM_TEST=yes PYTHONPATH=<VACASK>/python SIM_MODULE_PATH=<build>/devices vacask test_thermal_own_node_default.sim
+  SIM_TEST=yes PYTHONPATH=<VACASK>/python SIM_MODULE_PATH=<build>/devices vacask test_thermal_own_node_tight.sim
+
+Observed (2026-10-25):
+  default: V(out) = 0.546593090 (rel 1.69e-05), V(th) = 0.205566219 (rel 1.56e-05);
+           the test accepts 1e-3 (VACASK's default reltol) and exits 0
+  tight (reltol=1e-12 vntol=1e-15 abstol=1e-18): V(out) = 0.546602348, V(th) = 0.205569430, exit 0
+Xyce through PyMS 1.1.0 gives the analytic value to 1e-6 with its default tolerances.
+Possible upstream question: whether the default op convergence check should stop
+1.7e-5 away on a two-unknown nonlinear loop.

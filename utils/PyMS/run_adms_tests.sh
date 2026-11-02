@@ -11,15 +11,32 @@
 #   ./run_adms_tests.sh --pyms     # PyMS only
 #
 
+#   Environment: XYCE (the Xyce executable), ADMS_DIR, CADENCE2XYCE, WORK,
+#   TIMEOUT (seconds per run), PYMS_CACHE / PYMS_VAE_CACHE (default: private
+#   directories under WORK, never the machine-wide /tmp defaults).
+#
+
 set -uo pipefail
 
-XYCE="${XYCE:-/usr/local/src/Xyce-8/xyce-build/src/Xyce}"
-ADMS_DIR="/usr/local/src/Xyce-8/xyce/utils/ADMS/examples"
-CADENCE2XYCE="/usr/local/src/Xyce-8/xyce/utils/cadence2xyce.pl"
-WORK="/tmp/adms_vs_pyms"
-TIMEOUT=120
+# The examples and the preprocessor live in this repository: utils/PyMS/.. = utils/.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+UTILS_DIR="$(dirname "$SCRIPT_DIR")"
 
-export LD_LIBRARY_PATH="/usr/local/src/Xyce-8/xyce-build/src:${LD_LIBRARY_PATH:-}"
+XYCE="${XYCE:-/usr/local/src/xyce-build/src/Xyce}"
+ADMS_DIR="${ADMS_DIR:-$UTILS_DIR/ADMS/examples}"
+CADENCE2XYCE="${CADENCE2XYCE:-$UTILS_DIR/cadence2xyce.pl}"
+WORK="${WORK:-/tmp/adms_vs_pyms}"
+TIMEOUT="${TIMEOUT:-900}"    # a cold PyMS build of a CMC model takes minutes
+
+for f in "$XYCE" "$CADENCE2XYCE"; do
+    [[ -f "$f" ]] || { echo "run_adms_tests.sh: $f not found" >&2; exit 2; }
+done
+[[ -d "$ADMS_DIR" ]] || { echo "run_adms_tests.sh: $ADMS_DIR not found" >&2; exit 2; }
+
+export LD_LIBRARY_PATH="$(dirname "$XYCE")${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+# Private PyMS caches: the defaults are shared by every process on the machine.
+export PYMS_CACHE="${PYMS_CACHE:-$WORK/pyms_hdl_cache}"
+export PYMS_VAE_CACHE="${PYMS_VAE_CACHE:-$WORK/pyms_vae_cache}"
 
 run_adms=1
 run_pyms=1
@@ -75,11 +92,10 @@ run_test() {
 
     local dir
     dir=$(dirname "$cir")
-    cd "$dir"
-    rm -rf /tmp/pyms_hdl_cache
-    timeout "$TIMEOUT" "$XYCE" $flags "$(basename "$cir")" > "$logfile" 2>&1
+    # The device-shell and math-library caches key on the .va's identity, so
+    # they are kept across the decks of one run (WORK is cleared at the start).
+    (cd "$dir" && timeout "$TIMEOUT" "$XYCE" $flags "$(basename "$cir")") > "$logfile" 2>&1
     local rc=$?
-    cd /usr/local/src
 
     if [[ $rc -eq 0 ]] && grep -q "End of Xyce" "$logfile"; then
         return 0

@@ -1,0 +1,9 @@
+// Control: the same charge written as one ddt() term, ddt(2*c*V).
+`include "disciplines.vams"
+module oneddt(p, n);
+  inout p, n;
+  electrical p, n;
+  parameter real r = 1k;
+  parameter real c = 50n;
+  analog I(p, n) <+ V(p, n) / r + ddt(2 * c * V(p, n));
+endmodule

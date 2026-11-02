@@ -1,0 +1,14 @@
+// The flow probe of a voltage-contribution branch read in another contribution:
+// the ammeter am (V(am) <+ 0) carries the current of the 1k from x to n, and
+// I(p, n) <+ I(am) adds that current again from p to n: two 1k paths, 500 ohm.
+`include "disciplines.vams"
+module ammeter_double(p, n);
+  inout p, n;
+  electrical p, n, x;
+  branch (p, x) am;
+  analog begin
+    V(am) <+ 0;
+    I(x, n) <+ V(x, n) / 1000;
+    I(p, n) <+ I(am);
+  end
+endmodule

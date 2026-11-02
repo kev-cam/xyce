@@ -1,5 +1,7 @@
-"""KNOWN FAILURE (2026-10-10, design q.50): a .model card's parameter must
-reach the PyMS .hdl module's math. Fix pending.
+"""A .model card's parameter must reach the PyMS .hdl module's math.
+Recorded as a known failure on 2026-10-10 (design q.50); FIXED 2026-10-24
+(P10 of PYMS_BUGS.md; the fix and its neighbours are measured by
+test_hdl_param_name_case.py).
 
 THE BUG (observed 2026-10-10 on DEVELOPMENT-202610100047 / 7cd78110; evidence
 decks sv2ghdl/tests/vamos/fixtures/spectre/engine_facts/E63): a Verilog-A
@@ -28,14 +30,15 @@ PYMS_VAE_CACHE, as test_hdl_cache_va_identity.py does). Per deck form:
   test_card_value_reaches_model  -- the module is bound on the card and the
                                     .op listing shows R 2000 (passes today:
                                     pins the symptom's first half)
-  test_card_value_applied        -- I(V1) = -5.0e-4 (the card's r=2k)
-                                    @unittest.expectedFailure until fixed
+  test_card_value_applied        -- I(V1) = -5.0e-4 (the card's r=2k);
+                                    @unittest.expectedFailure from 2026-10-10
+                                    until the fix of 2026-10-24
 
-Known-failure marking: the suite has no convention of its own, so this uses
-unittest's, which ``python3 -m unittest`` already honours: an expected failure
-is reported as such and does not fail the run ("OK (expected failures=2)");
-once the fix lands the two tests report "unexpected success" and the run
-FAILS until the decorators are removed. Skips when there is no Xyce binary.
+THE FIX: build_vae_so.py maps the shell's upper-case names back onto the
+module's own parameter names and bakes only the values the netlist supplied
+(the __GIVEN__ set) and the ones the shell set itself (__SET__); every other
+default is the emitter's, evaluated from the .va text with those values in
+place. Skips when there is no Xyce binary.
 
 Run:
     cd utils/PyMS && python3 -m unittest vae.tests.test_hdl_model_card_params -v
@@ -51,6 +54,12 @@ import unittest
 
 XYCE = os.environ.get("XYCE", "/usr/local/src/xyce-build/src/Xyce")
 XYCE_LIBDIR = os.path.dirname(XYCE)
+# The PyMS this test sits in (utils/PyMS): Xyce runs it through PYMS_DIR.
+# Without it Xyce took an inherited PYMS_DIR or its own lookup (the installed
+# /usr/local/share/xyce/PyMS first), so the test measured whichever copy
+# that was: I(V1) = -1.0e-3 with the copy before the fix, while this tree
+# was right (2026-10-25, PYMS1-G and -D saw it fail with PYMS_DIR unset).
+PYMS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 
 R_CARD = 2000.0                 # the card's r=2k
 I_EXPECTED = -1.0 / R_CARD      # 1 V across r=2k, as .print dc i(v1) signs it
@@ -99,6 +108,7 @@ d1 a 0 dm
 
 def _xyce_env(work):
     env = dict(os.environ)
+    env["PYMS_DIR"] = PYMS_DIR
     env["PYMS_CACHE"] = os.path.join(work, "hdl_cache")
     env["PYMS_VAE_CACHE"] = os.path.join(work, "vae_cache")
     env["LD_LIBRARY_PATH"] = XYCE_LIBDIR + (
@@ -167,11 +177,11 @@ class _CardParamMixin(object):
                          "the .op model listing does not show R 2000")
         self.assertNotIn("Netlist error", self.log)
 
-    @unittest.expectedFailure
     def test_card_value_applied(self):
         """I(V1) = -5.0e-4: the card's r=2k is what the module computes with.
-        KNOWN FAILURE since 2026-10-10 (module evaluated with its default
-        r = 1k, I(V1) = -1.0e-3, while the listing shows R 2000); fix pending."""
+        Known failure from 2026-10-10 (module evaluated with its default
+        r = 1k, I(V1) = -1.0e-3, while the listing showed R 2000) until the
+        fix of 2026-10-24."""
         i = _prn_value(self.prn, "I(V1)")
         self.assertTrue(
             abs(i - I_EXPECTED) <= RTOL * abs(I_EXPECTED),

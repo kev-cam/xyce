@@ -1,0 +1,9 @@
+// Two ddt() terms in one contribution: the charge is c*V + c*V = 2*c*V.
+`include "disciplines.vams"
+module twoddt(p, n);
+  inout p, n;
+  electrical p, n;
+  parameter real r = 1k;
+  parameter real c = 50n;
+  analog I(p, n) <+ V(p, n) / r + ddt(c * V(p, n)) + ddt(c * V(p, n));
+endmodule

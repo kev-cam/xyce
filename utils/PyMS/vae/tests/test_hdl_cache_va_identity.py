@@ -105,6 +105,9 @@ def main():
     open(va_b, "w").write(VA_SOFTPLUS)
 
     env = dict(os.environ)
+    # The PyMS this test sits in, not an inherited PYMS_DIR or Xyce's own
+    # lookup (the installed copy first): the test measures THIS tree.
+    env["PYMS_DIR"] = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
     env["PYMS_CACHE"] = os.path.join(work, "hdl_cache")
     env["PYMS_VAE_CACHE"] = os.path.join(work, "vae_cache")
     env["LD_LIBRARY_PATH"] = XYCE_LIBDIR + (

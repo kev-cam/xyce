@@ -1,0 +1,11 @@
+// Control: the same ammeter without the second contribution: 1k.
+`include "disciplines.vams"
+module ammeter(p, n);
+  inout p, n;
+  electrical p, n, x;
+  branch (p, x) am;
+  analog begin
+    V(am) <+ 0;
+    I(x, n) <+ V(x, n) / 1000;
+  end
+endmodule

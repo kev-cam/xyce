@@ -1,0 +1,41 @@
+Thermal port on a node of its own: operating point (default tolerances)
+
+ground 0
+
+load "resistor.osdi"
+load "t1.va"
+
+model resistor resistor
+model vsource vsource
+model t1 t1
+
+// 1 V -> t1 (in, out, th) -> out -> 1k -> ground; th -> 1k -> ground (the thermal resistance)
+v1 (in 0) vsource dc=1
+x1 (in out th) t1
+r2 (out 0) resistor r=1k
+rth (th 0) resistor r=1k
+
+control
+  abort always
+  options rawfile="binary"
+  analysis op1 op
+  postprocess(PYTHON, "runme.py")
+endc
+
+embed "runme.py" <<<FILE
+from rawfile import rawread
+from runtest import *
+import sys
+
+op1 = rawread('op1.raw').get()
+# analytic: u = V(in, out) solves u^3 + 2u - 1 = 0; out = 1 - u, V(th) = u^2
+u = 0.45339765151640377
+ok = True
+for node, exact in (('out', 1.0 - u), ('th', u*u)):
+    v = op1[node][0]
+    rel = abs(v - exact)/abs(exact)
+    print("V(%s) = %.9f  expected %.9f  rel %.2e" % (node, v, exact, rel))
+    ok = ok and rel < 1e-3   # VACASK default reltol: informational
+if isTest():
+    sys.exit(not ok)
+>>>FILE

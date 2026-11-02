@@ -1,0 +1,14 @@
+// A resistor heated by its own dissipation through a thermal port t.
+`include "disciplines.vams"
+`include "constants.vams"
+module t1(p, n, t);
+  inout p, n, t;
+  electrical p, n;
+  thermal t;
+  parameter real r = 1k;
+  parameter real alpha = 1.0;
+  analog begin
+    I(p, n) <+ V(p, n) / r * (1 + alpha * Temp(t));
+    Pwr(t) <+ -V(p, n) * V(p, n) / r;
+  end
+endmodule

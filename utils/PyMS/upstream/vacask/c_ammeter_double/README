@@ -1,0 +1,24 @@
+The flow of a voltage-contribution branch, read in another contribution, is 0 on openvaf-r/VACASK.
+
+  branch (p, x) am;
+  V(am) <+ 0;                    // an ammeter: p and x one node, the current an unknown
+  I(x, n) <+ V(x, n) / 1000;     // the 1k it measures
+  I(p, n) <+ I(am);              // ammeter_double.va: the measured current once more, p -> n
+
+The ammeter carries the 1k's current, (V(p) - V(n)) / 1k; the last line adds the
+same current from p to n, so the device is two 1k paths in parallel, 500 ohm. In
+a divider with 1k to ground and 1 V at the input: out = 1k / 1.5k = 0.666667.
+ammeter.va (control) is the same module without the last line: 1k, out = 0.5.
+
+Command (VACASK 2026-10 build, from this directory):
+  SIM_TEST=yes PYTHONPATH=<VACASK>/python SIM_MODULE_PATH=<build>/devices vacask test_ammeter_double.sim
+
+Observed (2026-10-25), exit 1:
+  ammeter + I(p, n) <+ I(am)   v = 0.500000000   expected 0.666666667   WRONG
+  ammeter alone (control)      v = 0.500000000   expected 0.500000000   ok
+
+0.5 is the answer with I(am) = 0: the probe of the 0 V branch reads no current
+(the Verilog-AMS LRM's flow of a branch with a potential contribution is the
+current through that source). Expected: exit 0. Xyce through PyMS 1.1.0 and
+1.1.2 gives 0.666666667 (PyMS 1.1.1 gave 0.5 too: it collapsed the probed
+short, a PyMS defect fixed in 1.1.2 -- not evidence for VACASK's value).

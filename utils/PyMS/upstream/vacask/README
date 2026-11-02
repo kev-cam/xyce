@@ -1,0 +1,9 @@
+Self-contained VACASK / openvaf-r test cases found while comparing PyMS (Xyce's
+Verilog-A route) with VACASK. Each directory holds the .va, a .sim netlist in the
+form of VACASK's own test/ directory (embedded runme.py, SIM_TEST=yes makes it
+exit non-zero on a wrong value), the command and the observed output (README).
+Expected values are analytic. Nothing here is built or run by Xyce's build.
+
+  two_ddt_terms/        DEFECT: a second identical ddt() term in one contribution is dropped
+  thermal_own_node_op/  informational: default op tolerance leaves 1.7e-5 on a self-heating loop
+  c_ammeter_double/     DEFECT: the flow I(br) of a V(br) <+ 0 branch read in another contribution is 0
