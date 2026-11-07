@@ -90,6 +90,15 @@ class VersionTests(unittest.TestCase):
         # defaults that read them; Xyce's k/q; a module's own TEMP / TNOM).
         self.assertGreaterEqual(tuple(int(x) for x in vae.__version__.split('.')), (1, 1, 6))
 
+    def test_version_carries_the_round_8_fixes(self):
+        # 1.1.7: the PYMS8 round (2026-11-07: the code review's findings --
+        # acceptStep's vae_needs_accept pointer dropped with the math library
+        # it came from (a .step of a baked parameter crashed); pow with a zero
+        # base and a bias-dependent exponent has slope 0; macro arguments
+        # substituted in one pass; an @(initial_step) capture of the
+        # temperature is held under .dc temp).
+        self.assertGreaterEqual(tuple(int(x) for x in vae.__version__.split('.')), (1, 1, 7))
+
     def test_version_file_agrees(self):
         with open(VERSION_FILE) as f:
             text = f.read()

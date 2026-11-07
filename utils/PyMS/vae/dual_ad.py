@@ -546,12 +546,12 @@ static inline _vd pow(const _vd& a, double b) {
 }
 static inline _vd pow(double a, const _vd& b) {
     _vd r{_noinit()}; r.v = std::pow(a, b.v);
-    _vad_chain(r, b, r.v * std::log(a)); return r;
+    _vad_chain(r, b, (r.v == 0.0) ? 0.0 : r.v * std::log(a)); return r;  // pow(0, y): value 0, slope 0
 }
 static inline _vd pow(const _vd& a, const _vd& b) {
     _vd r{_noinit()}; r.v = std::pow(a.v, b.v);
     double ga = (b.v == 0.0) ? 0.0 : ((a.v != 0.0) ? b.v * r.v / a.v : b.v * std::pow(a.v, b.v - 1.0));
-    _vad_chain2(r, a, ga, b, r.v * std::log(a.v)); return r;
+    _vad_chain2(r, a, ga, b, (r.v == 0.0) ? 0.0 : r.v * std::log(a.v)); return r;  // (a zero base: 0*log(0) is NaN)
 }
 static inline _vd atan2(const _vd& a, const _vd& b) {
     _vd r{_noinit()}; r.v = std::atan2(a.v, b.v); double q = a.v * a.v + b.v * b.v;

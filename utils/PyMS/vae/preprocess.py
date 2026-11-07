@@ -594,14 +594,19 @@ class _Preprocessor:
         # Pad args to match params length (empty if missing).
         while len(args) < len(params):
             args.append('')
-        repl = dict(zip(params, args))
-        # Build one combined regex with named groups would be tidier,
-        # but params are usually <10 — simple loop is fine.
-        for p, a in repl.items():
-            if not p:
-                continue
-            body = re.sub(rf'\b{re.escape(p)}\b', a, body)
-        return body
+        repl = {p: a for p, a in zip(params, args) if p}
+        if not repl:
+            return body
+        # One pass over the body with every parameter in one pattern: an
+        # argument is inserted once and never scanned again (substituting
+        # one parameter after another replaced a later parameter's name
+        # inside an earlier argument: `ADD2(b, 250) with parameters (a, b)
+        # gave ((250) + 2*(250))), and a function replacement inserts the
+        # argument literally (a backslash in it -- an escaped identifier --
+        # is not a re.sub template escape).
+        pat = re.compile(r'\b(?:' + '|'.join(re.escape(p) for p in
+                                              sorted(repl, key=len, reverse=True)) + r')\b')
+        return pat.sub(lambda m: repl[m.group(0)], body)
 
     def preprocess(self, filename: str) -> str:
         """Top-level entry. Returns the expanded source text for filename."""

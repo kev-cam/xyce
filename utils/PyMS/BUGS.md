@@ -19,7 +19,7 @@ VACASK: `/opt/build.VACASK/Release/simulator/vacask` (openvaf-r compiles the
 first on PATH). Every test in `vae/tests/` runs as a plain script
 (`python3 vae/tests/test_x.py`) and makes its own caches.
 
-Contents: CHANGES (1.1.5, 1.1.4, 1.1.3, 1.1.2, 1.1.1, 1.1.0) · A. silent wrong answers · B. loud failures of
+Contents: CHANGES (1.1.7, 1.1.6, 1.1.5, 1.1.4, 1.1.3, 1.1.2, 1.1.1, 1.1.0) · A. silent wrong answers · B. loud failures of
 legal Verilog-A · C. decisions and strictness · D. error messages ·
 E. caches and installation · F. upstream (openvaf-r/VACASK) · G. vamos
 follow-up.
@@ -27,6 +27,40 @@ follow-up.
 ---------------------------------------------------------------------------
 
 ## CHANGES
+
+### 1.1.7 (2026-11-07)
+
+The findings of the 1.1.6 code review (PYMS7-REVIEW, decks in its REV7/t1..t4) and the skeptic's A18:
+- B22 (the review's F1, BLOCKING): the generated `Instance::acceptStep` cached `dlsym(vae_dl_, "vae_needs_accept")`
+  in a function-static pointer keyed on the dlopen handle. A `.step` of a baked parameter makes processParams
+  dlclose the math library and dlopen the new one; glibc returns the same handle while the code lies elsewhere, so
+  the pointer was stale: SIGSEGV in 1.1.6, "Illegal instruction" in 1.1.5 (REV7/t1 b.cir: a held peak, `.step
+  m1:mode list 0 1 0`, `.tran`). xyce_device_gen.py: the pointer is an instance member (`pyms_needs_accept_`), read
+  with the held state when a library is loaded and cleared when it is dropped; it was the shell's only
+  function-static dlsym cache. test_library_swap_accept.
+- B23 (F2): the dual-number `pow(double, dual)` / `pow(dual, dual)` (dual_ad.py) took the exponent slope
+  `r.v*log(a)` = 0*(-inf) = NaN at a zero base, and every Jacobian column the exponent depends on was NaN
+  (`pow(max(V,0), 1+V)`: every DC point failed). The slope is 0 where the value is 0. test_pow_zero_base.
+- A22 (F4, silent, since before 1.1.0): preprocess.py `_substitute` replaced the macro parameters one after
+  another, so an argument naming a later parameter was substituted again (`define ADD2(a, b) ((a) + 2*(b))`,
+  `ADD2(b, 250)` gave ((250) + 2*(250)): V(2) 0.428571428 for 0.6), and re.sub read backslashes in an argument as
+  escapes. One combined pattern, one pass, the argument inserted literally. test_macro_args_one_pass.
+- A18 (the 1.1.6 skeptic): `@(initial_step) th = $temperature;` was folded into `th = _vae_T` (an "invariant"
+  initial_step body runs at every point) and followed a `.dc temp` sweep. ginac_emitter.py: a body that reads
+  `$temperature`, `$vt` without an argument or a thermal parameter is no longer invariant, so it is held like a
+  bias-dependent capture: the value of the initial step stays for the whole analysis (the user's thermal design:
+  `pyms_tsrc_` may move within an analysis later), and every `.step` point captures again. `$vt(300.15)` and other
+  temperature-free bodies stay invariant. test_temperature (test_initial_step_capture_held_under_dc_temp).
+
+Not done: the review's F3 (B24, a V/I switch row that is a NaN when the untaken arm is non-finite) -- the blend is
+the general IF-arm indicator mechanism, a select there is not a contained change. Found on the way: B25 (a held
+peak in a transient with tight tolerances stalls; 1.1.6 too).
+
+Gate (measured, PYMS8-FIX): vae/tests 59/59 modules (409 tests) on the chain; the review decks right (b.cir runs
+its 3 steps, z2 converges, ms.cir 0.6); the 21 deck families (1255 decks) against 1.1.6: right 1137 / loud 43 / n/a
+60 / wrong 11 / ok? 4, the same as 1.1.6, no deck worse, no value moved by more than 1e-9; corpus at 27 C 101 / 86 /
+82 with every printed value equal to 1.1.6's; the SK7 temperature toys: a3_dc_temp and a5_multi_dc right, the only
+failures left are A19 (noise) and A20 (`.step m1:TEMP`), with 1.1.6's values.
 
 ### 1.1.6 (2026-11-02)
 
@@ -989,6 +1023,68 @@ registers the first and warns: ".HDL: module helper of b.va has the name of
 the module helper of a1.va, registered before: not registered; the
 netlist's helper is the one of a1.va".
 
+### A18. A `$temperature` captured in @(initial_step) is not held under `.dc temp`
+
+FIXED in 1.1.7 (CHANGES 1.1.7; test_temperature
+test_initial_step_capture_held_under_dc_temp; the SK7 toys a3_dc_temp and
+a5_multi_dc now right to 1e-9). ginac_emitter.py `_invariant_body`: a body
+that reads `$temperature`, `$vt` without an argument or a thermal parameter
+is not invariant, so its variables are held (captured at the initial step,
+kept through the analysis, captured again at every `.step` point).
+`$vt(<constant>)` stays invariant. The original report:
+
+OPEN (the 1.1.6 skeptic, PYMS7-SKEPTIC step A; t7_live2.txt a3_dc_temp,
+a5_multi_dc). `@(initial_step) th = $temperature;` follows every point of a
+`.dc temp` sweep (283.15 at the second point for the captured 233.15). The
+emitter folds a capture that does not depend on the bias into `double th =
+_vae_T;` and gives it no held slot (the deck's eval.cpp line 50). A held
+V(p) capture does hold under `.dc temp`, and `.step temp` captures again at
+each step as intended. It matters for the thermal design: once `pyms_tsrc_`
+moves within an analysis (a thermal node), a captured `$temperature` must
+stay what it was at the initial step. hicumL0's INITIAL_MODEL block is an
+@(initial_step). Fix: a capture that reads `_vae_T` gets a held slot like a
+bias-dependent one.
+
+### A19. `white_noise` / `flicker_noise` contribute nothing in `.noise`
+
+OPEN, never supported (the 1.1.6 skeptic). ginac_emitter
+`_strip_noise_call` (codegen.py:308) replaces the noise sources with 0
+without a word: a deck whose module has `I(p, n) <+ white_noise(...)`
+gives onoise 1.6576e-26 (only the 1e12 ohm resistor) for 1.6576e-17. Until
+noise is implemented it should at least warn.
+
+### A20. `.step m1:TEMP` on a module's own TEMP parameter keeps a point's value
+
+OPEN (the 1.1.6 skeptic, t7_a12.txt). `.step m1:TEMP list 50 27 80` with the
+circuit at 27 C gives 323.15 / 323.15 / 353.15: the second point keeps 50
+for 27. The `_tp_restore` ambiguity (a stepped value that equals the circuit
+temperature is taken for "not given") that the source comment admits.
+
+### A21. PSP102: a 4 % Jacobian entry at an unphysical state and T >= 350 K
+
+OPEN, minor (the 1.1.6 skeptic; probe7*.txt). PSP102/102B/102E at a random
+state with F = -7e3 A and T >= 350 K: J of F I(D,S) column 0 is -91.39, the
+central difference -87.83; the full dual plan gives the same J, and the
+central difference is erratic at the neighbouring state (F not smooth
+there). 40-state scans at +-0.6 V and +-1.2 V at 300 K and 400 K show
+nothing above the noise floor. Probably the difference, not AD; kept to be
+checked against a smooth reference.
+
+### A22. A macro argument naming a later macro parameter was substituted twice
+
+FIXED in 1.1.7 (CHANGES 1.1.7; test_macro_args_one_pass). The 1.1.6 code
+review (F4, REV7/t4/ms.va); silent, since before 1.1.0. preprocess.py
+`_Preprocessor._substitute` replaced the parameters one after another in
+the body: with `define ADD2(a, b) ((a) + 2*(b))` the use `ADD2(b, 250)`
+first became ((b) + 2*(b)), then ((250) + 2*(250)); the divider gave V(2) =
+0.428571428 for 0.6. `SUB(b, a)` gave ((a) - (a)). And re.sub took each
+argument as a replacement template (a backslash -- an escaped identifier --
+was an escape: `\n1` became a newline). Now one combined pattern of every
+parameter (longest first), one pass, a function replacement. The CMC corpus
+had no hit (REV7/t4/scan.py: HiCUM QJMOD/QJMODF pass identity-position
+arguments only). Left as is: arguments are stripped, so an escaped
+identifier as the last argument loses its terminating blank.
+
 ---------------------------------------------------------------------------
 
 ## B. Loud failures of legal Verilog-A
@@ -1331,6 +1427,72 @@ FIXED in 1.1.5 (CHANGES 1.1.5; test_step_params_and_modules). Loud, 1.1.0 to
 registered a1 as a Diode level 2001 and `.model m1 a1` was a netlist error
 (m5_second_has_group_attr). The scan now reads the declaration of the module
 the shell is for (`module_name`).
+
+### B22. A .step of a baked parameter crashed a module with held state in a transient
+
+FIXED in 1.1.7 (CHANGES 1.1.7; test_library_swap_accept). The 1.1.6 code
+review (F1, BLOCKING; REV7/t1/stp2.va + b.cir); present since the 1.1.5
+library swap (A14). The generated `Instance::acceptStep` cached
+`dlsym(vae_dl_, "vae_needs_accept")` in function statics keyed on the dlopen
+handle. processParams dlclose's the old math library and dlopen's the new
+one at a `.step` of a baked parameter; glibc reuses the link_map, so the
+handle compares equal while the code moved: a stale function pointer,
+SIGSEGV (1.1.6, rc 139 at the second point of `.step m1:mode list 0 1 0`
+with `.tran`) or "Illegal instruction" (1.1.5), i.e. whatever code sits at
+the old address runs. Needs held state (pyms_nheld_ > 0), a transient and a
+rebuild of the library. Now the pointer is an instance member
+(`pyms_needs_accept_`), read with the held state when a library is loaded
+and cleared with everything else read from it when the library is dropped.
+It was the shell's only function-static dlsym cache (the param callback is
+reinstalled at every processParams; the other dlsym results are members
+cleared at the swap).
+
+### B23. pow with a zero base and a bias-dependent exponent: a NaN Jacobian
+
+FIXED in 1.1.7 (CHANGES 1.1.7; test_pow_zero_base). The 1.1.6 code review
+(F2, REV7/t2/z2.va): `I(p,n) <+ V(p,n)/1k + 1e-6*pow(max(V(p,n),0.0),
+1.0+V(p,n))` on a 1k divider failed every point of `.dc V1 0 1 0.5` (Failed
+Linear Solves); with a constant exponent (z3) it converged. dual_ad.py
+`pow(double, _vd)` and `pow(_vd, _vd)` took the slope along the exponent as
+`r.v*log(a.v)` = 0*(-inf) = NaN at a zero base. pow(0, y) is 0 for y > 0
+with slope 0 along y: the slope is now 0 wherever the value is 0. z2 now
+gives V(2) = 0, 0.24991164, 0.499823295.
+
+### B24. A V/I switch row is NaN when the untaken arm is not finite
+
+OPEN (the 1.1.6 code review, F3; REV7/t3/tc.va, tv.va). A branch with a
+voltage contribution in one arm and a current contribution in the other of a
+run-time condition is one blended row: `parameter real rs = rs0*($temperature
+/300.15); if (rs > 0) I(p,m) <+ V(p,m)/rs; else V(p,m) <+ 0;` with rs0 = 0
+gives `(V_p-V_m)*(_sel-1) + 1.0/rs*(V_p-V_m)*_sel - I*_sel` and 1/0*0 = NaN:
+every point fails (tc0.cir, tc2.cir rc 1; tc1 with rs0 = 1k is right at 27 C
+and 327.15 C). 1.1.5 refused tc.va (a parameter default reading
+$temperature), so tc0 is not a regression; the same with a variable computed
+from $temperature (tv0.cir) fails in 1.1.5 and 1.1.6, and so would any
+voltage-dependent or callback-parameter condition whose untaken arm is not
+finite. Mechanism: ginac_emitter.py builds the contributions of the arms of
+a run-time condition as indicator products (`_sel`, `1 - _sel`) at the GiNaC
+level and `_finalize_current_rows` adds them in one row (B5 describes the
+blend). Fix: emit the switch row (and the gated contributions) as a select
+(`_sel ? a : b`) whose AD takes the slope of the taken arm only -- a GiNaC
+conditional function through the printer and dual_ad; not a contained change,
+left for a round of its own. Until then: guard the division in the model
+(`rs > 0 ? V/rs : 0`).
+
+### B25. A held peak in a transient with tight tolerances stalls
+
+OPEN, found by the 1.1.7 round (FIX8/decks/h1.cir; 1.1.6 the same). The
+REV7 stp2.va module (`@(initial_step) pk = 0; if (V(p,n) > pk) pk = V(p,n);
+I(p,n) <+ V(p,n)/r + 1e-4*pk;`, mode=0) placed directly on `V1 in 0 SIN(0 1
+1k)` with R2 = 1k to ground, `.options timeint reltol=1e-6 abstol=1e-12`,
+`.tran 10u 2m`: the time stops at 1.48771230e-03 and Xyce prints millions of
+rows there with V(out) alternating 6.237404e-2 / 6.237420e-2 (2.6e6 rows in
+60 s, a 1 GB .prn). Without the .options line (h2.cir), or with R1 between
+the source and the device (h0.cir), it finishes. Not yet analysed: probably
+the held value and the accepted-step re-evaluation (acceptStep's
+vae_needs_accept evaluation) disagreeing at a point where V(p,n) is
+nowhere near the peak; to be checked with a trace of pyms_Hc_ / pyms_Hp_
+per accepted step.
 
 ---------------------------------------------------------------------------
 

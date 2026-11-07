@@ -175,6 +175,24 @@ class TestTemperature(unittest.TestCase):
         va = gmod("300.15 / tk", pre="    @(initial_model) tk = $temperature;\n", decl="  real tk;\n")
         self.check(va, ".step temp list 27 127\n.op\n.print dc v(out)", [0.5, A127], libs=1)
 
+    # 1.1.7 (BUGS.md A18): a .dc temp sweep moves the temperature between the
+    # points of one analysis; a value captured in @(initial_step) keeps the
+    # first point's temperature (1.1.6 folded the capture into the eval code
+    # as `tk = _vae_T` and it followed the sweep), a direct read follows it
+    def test_initial_step_capture_held_under_dc_temp(self):
+        sweep = ".dc temp 27 127 100\n.print dc v(out)"
+        self.check(gmod("300.15 / $temperature"), sweep, [0.5, A127], libs=1)
+        va = gmod("300.15 / tk", pre="    @(initial_step) tk = $temperature;\n", decl="  real tk;\n")
+        self.check(va, sweep, [0.5, 0.5], libs=1)
+        # through $vt and through a thermal parameter
+        va = gmod("$vt(300.15) / vk", pre="    @(initial_step) vk = $vt;\n", decl="  real vk;\n")
+        self.check(va, sweep, [0.5, 0.5], libs=1)
+        va = gmod("300.15 / tk", pre="    @(initial_step) tk = tr;\n",
+                  decl="  parameter real tr = $temperature;\n  real tk;\n")
+        self.check(va, sweep, [0.5, 0.5], libs=1)
+        # a later .step point is a new analysis: captured again
+        self.check(va, ".step temp list 27 127\n.op\n.print dc v(out)", [0.5, A127], libs=1)
+
     # ac: the operating point's temperature, and the slope there
     def test_ac_at_temperature(self):
         # I = 1e-3 * V^2 * T / 300.15 from (1 V dc, ac 1) to out, 1k to ground

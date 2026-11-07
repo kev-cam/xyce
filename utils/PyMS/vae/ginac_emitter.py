@@ -654,12 +654,17 @@ class GiNaCEmitter:
     _ANALYSIS_CALL_RE = re.compile(r'\banalysis\s*\(\s*((?:"[^"]*"\s*,?\s*)+)\)')
     # what an invariant @(initial_step) body may read besides parameters and
     # its own earlier assignments: it then computes the same at every point
-    # and runs where it stands in every context (toys/diode2.va)
+    # and runs where it stands in every context (toys/diode2.va).  Not the
+    # temperature: $temperature, $vt without an argument and the thermal
+    # parameters read the instance's temperature at each evaluation (which a
+    # .dc temp sweep -- later a thermal node -- moves between points), so a
+    # body that reads them captures the value of the initial step and is
+    # held like a bias-dependent one (1.1.7, BUGS.md A18).
     _INVARIANT_OK = frozenset((
         'ln', 'log', 'exp', 'sqrt', 'pow', 'abs', 'min', 'max', 'floor', 'ceil', 'sin', 'cos',
         'tan', 'asin', 'acos', 'atan', 'atan2', 'sinh', 'cosh', 'tanh', 'asinh', 'acosh',
         'atanh', 'hypot', 'limexp', 'lexp', 'lln', 'hypsmooth', 'hypmax', 'Tempdep',
-        '_vae_idiv', '_vae_imod', '_vae_rint', '$vt', '$temperature', '$simparam', '$mfactor',
+        '_vae_idiv', '_vae_imod', '_vae_rint', '$simparam', '$mfactor',
         '$param_given', '$port_connected', '$strobe', '$display', '$write', '$fstrobe',
         '$fwrite', '$fdisplay', '$warning', '$debug', '$finish', '$stop'))
 
@@ -677,7 +682,7 @@ class GiNaCEmitter:
         return list(dict.fromkeys(out))
 
     def _invariant_body(self, node, params: set) -> bool:
-        known = set(params)
+        known = set(params) - self._thermal_params
         for st in _ast_walk(node.children[0] if node.children else None):
             if st.kind == NodeKind.CONTRIB or st.kind == NodeKind.INITIAL_STEP:
                 return False
@@ -691,6 +696,9 @@ class GiNaCEmitter:
                 for m in re.finditer(r"(?<![\w.'`])([$]?[A-Za-z_]\w*)", s):
                     nm = m.group(1)
                     if nm in known or nm in self._INVARIANT_OK:
+                        continue
+                    # $vt(T) of an invariant argument (scanned on) is invariant
+                    if nm == '$vt' and re.match(r'\s*\(', s[m.end():]):
                         continue
                     return False
             if st.kind == NodeKind.ASSIGN and st.lhs:

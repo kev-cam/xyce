@@ -882,6 +882,11 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '',
     h.append('  bool pyms_seen_init_, pyms_committed_, pyms_accept_eval_;')
     h.append('  const char* (*pyms_take_msg_)();')
     h.append('  const char* (*pyms_take_err_)();')
+    # vae_needs_accept of the loaded library: read with the held state and
+    # dropped with the library (a function-static cache keyed on the dlopen
+    # handle went stale when a re-dlopen returned the same handle for a
+    # library mapped elsewhere: SIGSEGV at a .step of a baked parameter).
+    h.append('  int (*pyms_needs_accept_)();')
     h.append('  std::vector<int> pyms_cx_slot_, pyms_cx_pend_, pyms_cx_dir_;')
     h.append('  std::vector<double> pyms_cx_c0_, pyms_cx_c1_, pyms_cx_t0_, pyms_cx_t1_;')
     h.append('  std::vector<int> pyms_cx_np_;  // predictions since the event last fired')
@@ -1059,7 +1064,7 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '',
     c.append(f'  numExtVars = {n_ext};')
     c.append('  pyms_remap_built_ = false; pyms_jit_ = false; pyms_key_ = 0;')
     c.append('  pyms_nheld_ = 0; pyms_last_ph_ = -1; pyms_seen_init_ = false; pyms_committed_ = false; pyms_accept_eval_ = false;')
-    c.append('  pyms_take_msg_ = nullptr; pyms_take_err_ = nullptr; pyms_cx_n_ = 0;')
+    c.append('  pyms_take_msg_ = nullptr; pyms_take_err_ = nullptr; pyms_needs_accept_ = nullptr; pyms_cx_n_ = 0;')
     c.append(f'  numIntVars = {n_int + n_cur};  // internal nodes, then branch currents')
     c.append(f'  numStateVars = 0;')
     c.append(f'  numStoreVars = 0;')
@@ -1241,7 +1246,7 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '',
     # read from it (the row remap, the held state, the cross events)
     c.append('      if (vae_dl_) {')
     c.append('        dlclose(vae_dl_); vae_dl_ = nullptr; vae_eval_ = nullptr; vae_jac_ = nullptr;')
-    c.append('        pyms_remap_built_ = false; pyms_take_msg_ = nullptr; pyms_take_err_ = nullptr;')
+    c.append('        pyms_remap_built_ = false; pyms_take_msg_ = nullptr; pyms_take_err_ = nullptr; pyms_needs_accept_ = nullptr;')
     c.append('        pyms_Hc_.clear(); pyms_Hp_.clear(); pyms_H0_.clear(); pyms_nheld_ = 0; pyms_last_ph_ = -1;')
     c.append('        pyms_cx_slot_.clear(); pyms_cx_pend_.clear(); pyms_cx_dir_.clear(); pyms_cx_n_ = 0;')
     c.append('      }')
@@ -1295,6 +1300,7 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '',
     c.append('        PymsHIFn _hi = (PymsHIFn)dlsym(vae_dl_, "vae_held_init");')
     c.append('        if (_hi) _hi(pyms_Hc_.data());')
     c.append('        pyms_Hp_ = pyms_Hc_; pyms_H0_ = pyms_Hc_;')
+    c.append('        pyms_needs_accept_ = (PymsNFn)dlsym(vae_dl_, "vae_needs_accept");')
     c.append('      }')
     c.append('      pyms_take_msg_ = (const char* (*)())dlsym(vae_dl_, "vae_take_message");')
     c.append('      pyms_take_err_ = (const char* (*)())dlsym(vae_dl_, "vae_take_error");')
@@ -1327,8 +1333,7 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '',
     c.append('void Instance::acceptStep() {')
     c.append('  if (pyms_nheld_ <= 0) return;')
     c.append('  typedef int (*PymsNFn)();')
-    c.append('  static PymsNFn _na = 0; static void* _na_dl = 0;')
-    c.append('  if (_na_dl != vae_dl_) { _na = (PymsNFn)dlsym(vae_dl_, "vae_needs_accept"); _na_dl = vae_dl_; }')
+    c.append('  PymsNFn _na = pyms_needs_accept_;')
     # (an event pending at this point fires in this evaluation: the circuit
     # changes here, and the crossing prediction starts afresh from it)
     c.append('  bool _fired = false;')
