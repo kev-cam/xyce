@@ -218,6 +218,36 @@ def scan_va_attributes(va_path: str, defines=None, module_name=None, siblings=Tr
 # Emit C++ that adds the RSER (series) / RPAR (parallel) loss branches to the
 # simple-R/L/C behavioral stamp. They assume the enclosing stamp has already
 # emitted `double V_drop = V(p) - V(n);` and that li_<node> members exist.
+_NOISE_RE = re.compile(r'(?<![\w$])(white_noise|flicker_noise|noise_table_log|noise_table)\s*\(')
+
+
+def noise_sources(mod):
+    """The noise source calls of a module (its analog block and analog
+    functions), as (function name, source line or 0), first use of each name
+    and line, in source order (1.1.8, BUGS.md A19: PyMS drops them)."""
+    found = []
+
+    def scan(text, loc):
+        for m in _NOISE_RE.finditer(text or ''):
+            k = (m.group(1), getattr(loc, 'line', 0) or 0)
+            if k not in found:
+                found.append(k)
+
+    def walk(node):
+        if node is None:
+            return
+        for t in (node.expr, node.text, node.condition, node.lhs):
+            scan(t, node.loc)
+        for ch in (node.children or []):
+            walk(ch)
+        walk(node.else_body)
+
+    walk(mod.analog_block)
+    for f in getattr(mod, 'functions', []) or []:
+        walk(f.body)
+    return found
+
+
 def _emit_rpar(c, rpar_ref, a, b):
     """Parallel leakage RPAR directly across the +/- terminals (no node)."""
     c.append(f'    double Rpar = {rpar_ref}; if (Rpar < 1e-12) Rpar = 1e-12;')
@@ -622,6 +652,17 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '',
     # for a module TEMP, above) and DTEMP stays applied; Xyce's built-in
     # diode takes the circuit temperature there and drops DTEMP.
     _all_upper = {pn.upper() for pn, _d, _ii, _cx in params}
+    # ``aliasparam ALIAS = TARGET`` (1.1.8, BUGS.md B26): the alias is another
+    # netlist name of the target's value, on the card and the instance line
+    # alike (as openvaf-r has it).  Registered with addPar on the target's
+    # member; the constructors hand a given alias over to the target's name
+    # (pyms_unalias_), so given("TARGET"), the math library's key and
+    # $param_given see the target.  An alias of an array parameter is not.
+    _aliases = [(a, t) for a, t in getattr(mod, 'aliases', {}).items() if t in _cxx_of]
+    for a, t in _aliases:
+        if a.upper() == 'XYCEADMSINSTTEMP':
+            raise DeviceGenError(f"{va_path}: aliasparam {a}: the name is the device shell's own")
+    _all_upper |= {a.upper() for a, _t in _aliases}
     _shell_temp = 'TEMP' not in _all_upper
     _shell_dtemp = 'DTEMP' not in _all_upper
 
@@ -694,6 +735,16 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '',
         if node.else_body:
             find_contribs(node.else_body)
     find_contribs(mod.analog_block)
+
+    # (1.1.8, BUGS.md A19) PyMS has no noise: the emitter replaces the noise
+    # sources by 0, so a .noise analysis sees none of the module's noise.  Say
+    # so (Xyce shows a generator note as a ".HDL:" warning on every run).
+    _noise = noise_sources(mod)
+    if _noise:
+        print(f"xyce_device_gen: note: module {mod.name} of {va_path}: "
+              + ", ".join(f"{fn} (line {ln})" if ln else fn for fn, ln in _noise)
+              + ": PyMS does not implement noise; these sources contribute nothing (a .noise analysis "
+              "shows none of this module's noise)")
 
     # ================================================================
     # Generate header
@@ -823,6 +874,7 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '',
     # the cross events of a transient place a breakpoint where they predict
     # the crossing.
     h.append('  void acceptStep();')
+    h.append('  bool isConverged();')
     h.append('  bool getInstanceBreakPoints(std::vector<Util::BreakPoint> &breakPointTimes);')
     h.append('')
     h.append('  Model &getModel() { return model_; }')
@@ -887,6 +939,10 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '',
     # handle went stale when a re-dlopen returned the same handle for a
     # library mapped elsewhere: SIGSEGV at a .step of a baked parameter).
     h.append('  int (*pyms_needs_accept_)();')
+    # (1.1.8, B25) which held slots the last Newton evaluation wrote a new
+    # value to (its branch of the held update), at which iteration, and how
+    # often this solve was held back for a branch change (isConverged)
+    h.append('  std::vector<char> pyms_cv_pat_; int pyms_cv_it_, pyms_cv_forced_; bool pyms_cv_ok_;')
     h.append('  std::vector<int> pyms_cx_slot_, pyms_cx_pend_, pyms_cx_dir_;')
     h.append('  std::vector<double> pyms_cx_c0_, pyms_cx_c1_, pyms_cx_t0_, pyms_cx_t1_;')
     h.append('  std::vector<int> pyms_cx_np_;  // predictions since the event last fired')
@@ -960,6 +1016,8 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '',
     c.append('#include <cstdio>')
     c.append('#include <cctype>')
     c.append('#include <functional>')
+    if _aliases:
+        c.append('#include <algorithm>')
     c.append('#include <fstream>')
     c.append('#include <sstream>')
     c.append('#include <sys/stat.h>')
@@ -976,6 +1034,41 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '',
         c.append('  const Descriptor &d = *(*it).second;')
         c.append('  if (d.hasGivenMember()) d.setGiven(e, false);')
         c.append('  Xyce::Device::setValueGiven(e, d.getSerialNumber(), false);')
+        c.append('}')
+
+    if _aliases:
+        # (1.1.8, B26) the netlist's parameters with every given alias renamed
+        # to its target, and the target's default entry dropped when an alias
+        # gives it: setParams applies the entries in order and the default's
+        # entry (given = false) would undo the alias's value and given flag.
+        # Both names given: an error.
+        c.append('static const char *const pyms_alias_tab_[] = {'
+                 + ', '.join('"%s", "%s"' % (a.upper(), t.upper()) for a, t in _aliases) + ', nullptr};')
+        c.append('static std::vector<Param> pyms_unalias_(const std::vector<Param> &in) {')
+        c.append('  std::vector<Param> out; std::vector<std::string> tg;')
+        c.append('  for (const Param &q : in) for (int i = 0; pyms_alias_tab_[i]; i += 2)')
+        c.append('    if (q.given() && q.tag() == pyms_alias_tab_[i]) {')
+        c.append('      tg.push_back(pyms_alias_tab_[i + 1]);')
+        c.append('      for (const Param &o : in) if (o.given() && o.tag() == pyms_alias_tab_[i + 1])')
+        c.append('        Report::UserError0() << "PyMS: parameter " << pyms_alias_tab_[i + 1] << " given twice, as itself and as its aliasparam " << pyms_alias_tab_[i];')
+        c.append('    }')
+        c.append('  for (const Param &q : in) {')
+        c.append('    const char *t = nullptr;')
+        c.append('    for (int i = 0; pyms_alias_tab_[i]; i += 2) if (q.tag() == pyms_alias_tab_[i]) t = pyms_alias_tab_[i + 1];')
+        c.append('    if (t) { if (q.given()) { Param r(q); r.setTag(t); out.push_back(r); } continue; }')
+        c.append('    if (!q.given() && std::find(tg.begin(), tg.end(), q.tag()) != tg.end()) continue;')
+        c.append('    out.push_back(q);')
+        c.append('  }')
+        c.append('  return out;')
+        c.append('}')
+        # a later setParam of an alias (.step Y1:ALIAS): the target counts as given
+        c.append('static void pyms_alias_given_(DeviceEntity &e) {')
+        c.append('  const ParameterMap &pm = e.getParameterMap();')
+        c.append('  for (int i = 0; pyms_alias_tab_[i]; i += 2) {')
+        c.append('    ParameterMap::const_iterator a = pm.find(pyms_alias_tab_[i]), t = pm.find(pyms_alias_tab_[i + 1]);')
+        c.append('    if (a != pm.end() && t != pm.end() && Xyce::Device::wasValueGiven(e, (*a).second->getSerialNumber()))')
+        c.append('      Xyce::Device::setValueGiven(e, (*t).second->getSerialNumber(), true);')
+        c.append('  }')
         c.append('}')
 
     # Array-param tables — emitted once as namespace-scope static const double[].
@@ -1021,6 +1114,13 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '',
                 c.append('    .setAutoConvertTemperature(false)  // the module\'s own value, as the netlist gives it')
             c.append(f'    .setUnit(U_NONE)')
             c.append(f'    .setDescription("{pname}");')
+    for a, t in _aliases:
+        if _is_inst_of.get(t):
+            c.append(f'  p.addPar("{a.upper()}", {_resolve_default(t)}, &Instance::{_cxx_of[t]})')
+            if t.upper() in ('TEMP', 'TNOM'):
+                c.append('    .setAutoConvertTemperature(false)')
+            c.append(f'    .setUnit(U_NONE)')
+            c.append(f'    .setDescription("aliasparam of {t}");')
     # the instance's Xyce temperature (kelvin), as Xyce's ADMS devices have it
     if _shell_temp:
         c.append('  p.addPar("TEMP", 0.0, &Instance::pyms_itemp_)')
@@ -1049,6 +1149,13 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '',
                 c.append('    .setAutoConvertTemperature(false)  // the module\'s own value, as the netlist gives it')
             c.append(f'    .setUnit(U_NONE)')
             c.append(f'    .setDescription("{pname}");')
+    for a, t in _aliases:
+        if not _is_inst_of.get(t) or t in _also_model:
+            c.append(f'  p.addPar("{a.upper()}", {_resolve_default(t)}, &Model::{_cxx_of[t]})')
+            if t.upper() in ('TEMP', 'TNOM'):
+                c.append('    .setAutoConvertTemperature(false)')
+            c.append(f'    .setUnit(U_NONE)')
+            c.append(f'    .setDescription("aliasparam of {t}");')
     c.append('}')
     c.append('')
 
@@ -1065,6 +1172,7 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '',
     c.append('  pyms_remap_built_ = false; pyms_jit_ = false; pyms_key_ = 0;')
     c.append('  pyms_nheld_ = 0; pyms_last_ph_ = -1; pyms_seen_init_ = false; pyms_committed_ = false; pyms_accept_eval_ = false;')
     c.append('  pyms_take_msg_ = nullptr; pyms_take_err_ = nullptr; pyms_needs_accept_ = nullptr; pyms_cx_n_ = 0;')
+    c.append('  pyms_cv_it_ = -1; pyms_cv_forced_ = 0; pyms_cv_ok_ = true;')
     c.append(f'  numIntVars = {n_int + n_cur};  // internal nodes, then branch currents')
     c.append(f'  numStateVars = 0;')
     c.append(f'  numStoreVars = 0;')
@@ -1083,7 +1191,17 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '',
     # the device card supplies — which is why ``resistance=100``
     # was being ignored.
     c.append('  setDefaultParams();')
-    c.append('  setParams(ib.params);')
+    c.append('  setParams(' + ('pyms_unalias_(ib.params)' if _aliases else 'ib.params') + ');')
+    # (1.1.8, A23/A24) A parameter given as an expression of a .global_param
+    # (or of a .param a .DC/.STEP sweeps, which Xyce makes global) is a
+    # dependent parameter: setParams leaves the member at its default and only
+    # updateDependentParameters() writes the expression's value -- every
+    # built-in device calls it here, before processParams.  Without it the
+    # math library was built from the declaration default, and Xyce reprocesses
+    # the instance only when the global's value CHANGES, so a .global_param
+    # (never changed) and the first sweep point equal to the nominal ran with
+    # the default.
+    c.append('  updateDependentParameters();')
     c.append('  pyms_tsrc_ = &pyms_tdev_;')
     c.append('  if (!given("XYCEADMSINSTTEMP")) pyms_temp_ = getDeviceOptions().temp.getImmutableValue<double>();')
     if _shell_temp:
@@ -1122,6 +1240,8 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '',
     c.append('static double pyms_param_cb(const char* nm) { return g_pyms_cur ? g_pyms_cur->getCbParam(nm) : 0.0; }')
     c.append('')
     c.append('bool Instance::processParams() {')
+    if _aliases:
+        c.append('  pyms_alias_given_(*this);')
     if _temp_par_inst:
         c.extend(_tp_restore(_cxx_of[_temp_par_inst]))
     if _shell_temp:
@@ -1349,6 +1469,8 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '',
     c.append('    pyms_cx_c1_[k] = pyms_Hc_[s]; pyms_cx_t1_[k] = t;')
     c.append('  }')
     c.append('}')
+    c.append('')
+    c.append('bool Instance::isConverged() { return pyms_cv_ok_; }')
     c.append('')
     # Timestep control of the cross events: from the last two accepted
     # values, a breakpoint at the predicted crossing when it falls within the
@@ -1678,6 +1800,26 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '',
     c.append('')
     c.append(f'    double Fb[{MAXB}]={{}}, Qb[{MAXB}]={{}};')
     c.append(f'    vae_eval_(&state, Fb, Qb);')
+    # (1.1.8, B25) A Newton evaluation whose held update took another branch
+    # than the previous iteration's (`if (V > pk) pk = V;` written at one
+    # iterate, not at the next) leaves the iterate a solution of neither
+    # branch; the solver's update test can still pass (the step is tiny), and
+    # Xyce's default trapezoid rule carries the residual error of an
+    # algebraic row on, alternating in sign, without damping it: a held peak
+    # that grazes its own value (a periodic source) rang +-8e-8 V and, with a
+    # tight reltol, crushed the time step to 1e-17 s (FIX8 h1.cir).  Such a
+    # solve is not converged (isConverged; Xyce's device convergence test) --
+    # one more iteration solves the branch the iterate is in; at most three
+    # per solve, so a solution on the boundary still converges.
+    c.append('    if (pyms_nheld_ > 0 && state.Hw && !pyms_accept_eval_) {')
+    c.append('      const int _it = getSolverState().newtonIter;')
+    c.append('      std::vector<char> _pat(pyms_nheld_);')
+    c.append('      for (int k = 0; k < pyms_nheld_; k++) _pat[k] = (state.Hw[k] != state.Hr[k]);')
+    c.append('      if (_it <= 0 || _it != pyms_cv_it_ + 1) { pyms_cv_forced_ = 0; pyms_cv_ok_ = true; }')
+    c.append('      else if (_pat != pyms_cv_pat_ && pyms_cv_forced_ < 3) { pyms_cv_ok_ = false; pyms_cv_forced_++; }')
+    c.append('      else pyms_cv_ok_ = true;')
+    c.append('      pyms_cv_pat_.swap(_pat); pyms_cv_it_ = _it;')
+    c.append('    }')
     c.append('')
     c.append('    // Sanitize NaN/Inf')
     c.append(f'    for (int i = 0; i < {MAXB}; i++) {{')
@@ -1986,7 +2128,8 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '',
         if not is_inst or pname in _also_model:
             dval = _resolve_default(pname)
             c.append(f'  {_cxx} = {dval};')
-    c.append('  setModParams(mb.params);')
+    c.append('  setModParams(' + ('pyms_unalias_(mb.params)' if _aliases else 'mb.params') + ');')
+    c.append('  updateDependentParameters();  // card values given as expressions of globals (A23/A24)')
     if _temp_par_model:
         c.append(f'  pyms_tp_val_ = {_cxx_of[_temp_par_model]}; pyms_tp_given_ = given("TEMP");')
     # Wire the MOSFET channel-type variable (xyceTypeVariable, e.g. TYPE) from
@@ -2008,6 +2151,8 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '',
     # at its default). One whose default reads an instance parameter cannot be
     # (the Model is shared); the math library evaluates it per instance.
     c.append('bool Model::processParams() {')
+    if _aliases:
+        c.append('  pyms_alias_given_(*this);')
     if _temp_par_model:
         c.extend(_tp_restore(_cxx_of[_temp_par_model]))
     for p, tree, deps in _dep_order:

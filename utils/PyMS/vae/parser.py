@@ -184,6 +184,10 @@ class Module:
     genvars: list[str] = field(default_factory=list)
     # ``analog function`` declarations (AnalogFunction), in source order.
     functions: list = field(default_factory=list)
+    # ``aliasparam ALIAS = TARGET;`` (LRM 3.4.7): alias -> target, in source
+    # order.  The device shell registers each alias as another name of the
+    # target's value on the .model card / instance line (1.1.8, BUGS.md B26).
+    aliases: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -580,6 +584,8 @@ class Parser:
                         if _also_model(attrs):
                             p.also_model = True
                         mod.params.append(p)
+                elif self.at('aliasparam'):
+                    self._parse_aliasparam(mod)
             elif self.at('branch'):
                 # branch (node[, node2]) name [, name2 ...] ;
                 #   Verilog-A allows a comma-separated list of branch
@@ -604,6 +610,8 @@ class Parser:
                             mod.branch_neg_map[branch_name] = second_name
                 else:
                     self._skip_to_semi()
+            elif self.at('aliasparam'):
+                self._parse_aliasparam(mod)
             elif self.at('genvar'):
                 self.advance()
                 mod.genvars.extend(n for n, _, _ in self._parse_decl_names('genvar'))
@@ -622,11 +630,50 @@ class Parser:
 
         self.expect('endmodule')
         self._check_port_param_names(mod)
+        self._check_aliases(mod)
         self._apply_variable_initializers(mod)
         self._apply_grounds(mod)
         from .int_ops import lower_integer_ops
         lower_integer_ops(mod)
         return mod
+
+    def _parse_aliasparam(self, mod: Module):
+        """``aliasparam ALIAS = TARGET ;`` -- recorded in mod.aliases (checked
+        against the parameters in _check_aliases, after the body)."""
+        loc = self._loc()
+        self.advance()  # aliasparam
+        alias = self.consume_ident()
+        self.expect('=')
+        target = self.consume_ident()
+        self._skip_inline_attrs()
+        self.expect(';')
+        if alias in mod.aliases:
+            raise self._error(f"aliasparam '{alias}' declared twice", loc)
+        mod.aliases[alias] = target
+        if not hasattr(self, '_alias_locs'):
+            self._alias_locs = {}
+        self._alias_locs[(mod.name, alias)] = loc
+
+    def _check_aliases(self, mod: Module):
+        """An alias names a parameter of the module (LRM 3.4.7) and is no
+        parameter, port or other alias itself, in any case (Xyce folds the
+        card's names to capitals)."""
+        names = {p.name for p in mod.params}
+        upper = {p.name.upper() for p in mod.params}
+        for alias, target in mod.aliases.items():
+            loc = getattr(self, '_alias_locs', {}).get((mod.name, alias), SourceLoc(self.filename, 0))
+            if target not in names:
+                raise self._error(f"aliasparam {alias} = {target}: module '{mod.name}' has no parameter "
+                                  f"'{target}'", loc)
+            if alias.upper() in upper:
+                raise self._error(f"aliasparam {alias}: module '{mod.name}' already has a parameter of that "
+                                  f"name (Xyce parameter names are case-insensitive)", loc)
+        seen = {}
+        for alias in mod.aliases:
+            if alias.upper() in seen:
+                raise self._error(f"aliasparams '{seen[alias.upper()]}' and '{alias}' differ only in case",
+                                  getattr(self, '_alias_locs', {}).get((mod.name, alias), SourceLoc(self.filename, 0)))
+            seen[alias.upper()] = alias
 
     # --- ground declarations ---
 

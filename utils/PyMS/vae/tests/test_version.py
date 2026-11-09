@@ -99,6 +99,16 @@ class VersionTests(unittest.TestCase):
         # temperature is held under .dc temp).
         self.assertGreaterEqual(tuple(int(x) for x in vae.__version__.split('.')), (1, 1, 7))
 
+    def test_version_carries_the_round_9_fixes(self):
+        # 1.1.8: the PYMS9 round (2026-11-08: a device parameter given as an
+        # expression of a .global_param, or of a .param a .DC/.STEP sweeps,
+        # reaches the math library (updateDependentParameters in the shell's
+        # constructors); aliasparam names are parameters of the card and the
+        # instance line; a Newton iterate on the other branch of a held update
+        # is not converged (the trapezoid ringing that stalled a held peak);
+        # dropped noise sources are named in a warning).
+        self.assertGreaterEqual(tuple(int(x) for x in vae.__version__.split('.')), (1, 1, 8))
+
     def test_version_file_agrees(self):
         with open(VERSION_FILE) as f:
             text = f.read()

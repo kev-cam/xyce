@@ -19,7 +19,7 @@ VACASK: `/opt/build.VACASK/Release/simulator/vacask` (openvaf-r compiles the
 first on PATH). Every test in `vae/tests/` runs as a plain script
 (`python3 vae/tests/test_x.py`) and makes its own caches.
 
-Contents: CHANGES (1.1.7, 1.1.6, 1.1.5, 1.1.4, 1.1.3, 1.1.2, 1.1.1, 1.1.0) · A. silent wrong answers · B. loud failures of
+Contents: CHANGES (1.1.8, 1.1.7, 1.1.6, 1.1.5, 1.1.4, 1.1.3, 1.1.2, 1.1.1, 1.1.0) · A. silent wrong answers · B. loud failures of
 legal Verilog-A · C. decisions and strictness · D. error messages ·
 E. caches and installation · F. upstream (openvaf-r/VACASK) · G. vamos
 follow-up.
@@ -27,6 +27,44 @@ follow-up.
 ---------------------------------------------------------------------------
 
 ## CHANGES
+
+### 1.1.8 (2026-11-08)
+
+The vamos round 8 findings (sv2ghdl FIX2E8 raw/probe.py) and the 1.1.7 round's B25:
+- A24 (BLOCKING, silent) and A23 (silent), one cause: a card or instance-line value that is an expression of a
+  .global_param, or of a .param a .DC / .STEP sweeps (Xyce makes it global), is a Xyce dependent parameter:
+  setParams leaves the member at its default and only DeviceEntity::updateDependentParameters() writes the
+  expression's value. Every built-in device calls it in its constructor; the generated shell did not, so the
+  math library was built from the declaration default, and Xyce reprocesses an instance only when the global's
+  value changes: a .global_param (r21-r24: 0.5 for 1/3) and the first sweep point equal to the nominal (q1:
+  `.DC rr LIST 2k 4k` 0.5 0.2 for 1/3 0.2; q3, q4, q11, q12) ran with the default. xyce_device_gen.py: both
+  constructors call updateDependentParameters() after setParams / setModParams. test_global_dependent_params.
+- B25 (stall): a held peak on a sine with `reltol=1e-6` stopped at 1.4877 ms printing millions of rows. At the
+  second peak V(p,n) grazes its own held value: the predictor is above pk (the held update is written), the next
+  iterate below (it is not), and Newton accepted that iterate, a solution of neither branch. Xyce's default
+  trapezoid rule carries the residual error of an algebraic row on, alternating in sign, undamped (+-8e-8 V);
+  near the zero crossing the error test crushed the step to 1e-17 s. At the default tolerances the same ringing
+  was a 2e-5 V error at the end of the run. The shell now has Instance::isConverged() (Xyce's device convergence
+  test, ENFORCEDEVICECONV, on by default): false when a Newton evaluation wrote its held slots on another
+  branch than the previous iteration (at most three times per solve). No change in Xyce or N_DEV_PyMS.C.
+  test_held_branch_newton.
+- B26: `aliasparam ALIAS = TARGET` was skipped by the parser; the alias is now another name of the target on the
+  card (a model parameter) and the instance line (an instance parameter; both for xyceAlsoModel), as openvaf-r has
+  it: addPar on the target's member, and the constructors hand a given alias to the target (pyms_unalias_), so
+  the value, given() / $param_given and .global_param / .step expressions all reach it. Both names given is an
+  error; an alias of a name that is no parameter is a parse error. test_aliasparam.
+- A19 (partly): the noise sources PyMS drops (white_noise, flicker_noise; a noise_table call too) are named, with their
+  lines, in a ".HDL:" warning on every run. Noise itself is still not implemented. test_noise_warning.
+
+Not done: A25 (an instance parameter on a .model card; a decision), B27 (the R/C/L group stamps ignore the other
+parameters; by design so far), B24, A20, A21.
+
+Gate (measured, PYMS9-FIX): vae/tests 63/63 modules (420 tests) on the chain; the vamos round 8 probes right
+(q1-q12, r21-r24); FIX8 h1.cir finishes (6679 rows, V(out) at 2 ms 2.38095238e-2 = 0.1 pk / 2); the 21 deck families
+(1255 decks) against 1.1.7: right 1137 / loud 43 / n/a 60 / wrong 11 / ok? 4, the same as 1.1.7, no deck worse, one
+value moved by more than 1e-9 (c_sk5 h5_held_peak 2.25e-10 -> 5.0e-11 for 0: the extra Newton iteration of B25);
+corpus at 27 C 101 / 86 / 82 with every printed value equal to 1.1.7's; the SK7 temperature toys 57/62 with 1.1.7's
+values (the five left are A19 and A20).
 
 ### 1.1.7 (2026-11-07)
 
@@ -1047,7 +1085,9 @@ bias-dependent one.
 
 ### A19. `white_noise` / `flicker_noise` contribute nothing in `.noise`
 
-OPEN, never supported (the 1.1.6 skeptic). ginac_emitter
+OPEN, never supported (the 1.1.6 skeptic). Since 1.1.8 no longer silent:
+the generator names every dropped noise source and its line in a ".HDL:"
+warning (xyce_device_gen.noise_sources; test_noise_warning). ginac_emitter
 `_strip_noise_call` (codegen.py:308) replaces the noise sources with 0
 without a word: a deck whose module has `I(p, n) <+ white_noise(...)`
 gives onoise 1.6576e-26 (only the 1e12 ohm resistor) for 1.6576e-17. Until
@@ -1084,6 +1124,43 @@ parameter (longest first), one pass, a function replacement. The CMC corpus
 had no hit (REV7/t4/scan.py: HiCUM QJMOD/QJMODF pass identity-position
 arguments only). Left as is: arguments are stripped, so an escaped
 identifier as the last argument loses its terminating blank.
+
+### A23. A .global_param read by a device parameter is ignored
+
+FIXED in 1.1.8 (CHANGES 1.1.8; test_global_dependent_params): the shell's
+constructors did not call updateDependentParameters() (see A24). Found by vamos round 8 (sv2ghdl FIX2E8 raw/probe.py r21-r24,
+logs/raw_probe_b.txt). `.global_param rr=2k` with `.model c1 a2 r={rr}`
+gives out 0.5 for 1/3: the declaration default is used, exit 0. The same
+on the Y line (`g={gg}`, r23) and for an integer (`k={kk}`, r24). A built-in
+`.model rm r r={rr}` reads it right (r22). vamos emits no .global_param.
+
+### A24. The first .DC/.STEP point equal to a .param's nominal runs with the declaration default
+
+FIXED in 1.1.8 (CHANGES 1.1.8; test_global_dependent_params). Not A14's
+processParams path: such a value is a Xyce dependent parameter, written
+only by DeviceEntity::updateDependentParameters(), which every built-in
+device calls in its constructor and the generated shell did not; Xyce
+reprocesses the instance only when the global's value changes, so the
+first point equal to the nominal kept the default (a later point, a
+change, was right). vamos's xyce.off_grid workaround is no longer needed.
+Found by vamos round 8 (FIX2E8 raw/probe.py q1-q12). `.param rr=2k`,
+card `r={rr}`, `.DC rr LIST 2k 4k` gives 0.5 0.2 for 1/3 0.2 (q1). The same
+with `r={2*rr}` (q11), a Y-line parameter (q3), .STEP (q4) and .STEP + .TRAN
+(q12). Right: an off-grid nominal (q2, q8, q10), a later point equal to the
+nominal (q9, LIST 4k 2k), no sweep (q5), a built-in R (q7). Silent, in the
+construct A14 claims fixed. Probably A14's processParams path: the first
+point does not count as a change, and the instance never baked the
+nominal's value. vamos works around it (xyce.off_grid: swept nominals
+printed off the grid).
+
+### A25. An instance parameter on a .model card is ignored with a warning
+
+OPEN, maybe Xyce convention (FIX2E8 raw r05). A `(* type="instance" *)`
+parameter given on the .model card is ignored with only "No model parameter
+G found for model C1 of type A2, parameter ignored"; the default is used.
+Xyce's ADMS devices behave the same unless xyceAlsoModel. vamos never
+prints it there. Decide: accept it on the card as the instance default (as
+openvaf-r does), or make it an error.
 
 ---------------------------------------------------------------------------
 
@@ -1481,7 +1558,16 @@ left for a round of its own. Until then: guard the division in the model
 
 ### B25. A held peak in a transient with tight tolerances stalls
 
-OPEN, found by the 1.1.7 round (FIX8/decks/h1.cir; 1.1.6 the same). The
+FIXED in 1.1.8 (CHANGES 1.1.8; test_held_branch_newton). Analysed with a
+trace of every evaluation (FIX9 b25.sh): the held value was constant at the
+stall and the device's F and Jacobian exact; the ringing started at the
+second Vin peak, where V(p,n) grazes pk: a Newton iterate on the other
+branch of the held update was accepted, and the trapezoid rule's undamped
+algebraic rows kept the error (method=gear finished). The shell's
+isConverged() now asks for one more iteration when the branch changed.
+Not a PyMS-only effect in principle (any non-smooth device under trap can
+leave a Newton-tolerance error that rings), but the held update made it
+systematic. Found by the 1.1.7 round (FIX8/decks/h1.cir; 1.1.6 the same). The
 REV7 stp2.va module (`@(initial_step) pk = 0; if (V(p,n) > pk) pk = V(p,n);
 I(p,n) <+ V(p,n)/r + 1e-4*pk;`, mode=0) placed directly on `V1 in 0 SIN(0 1
 1k)` with R2 = 1k to ground, `.options timeint reltol=1e-6 abstol=1e-12`,
@@ -1493,6 +1579,23 @@ the held value and the accepted-step re-evaluation (acceptStep's
 vae_needs_accept evaluation) disagreeing at a point where V(p,n) is
 nowhere near the peak; to be checked with a trace of pyms_Hc_ / pyms_Hp_
 per accepted step.
+
+### B26. aliasparam names are not parameters of the device
+
+FIXED in 1.1.8 (CHANGES 1.1.8; test_aliasparam). vamos may print the alias
+again. Found by vamos round 8 (FIX2E8). `ya2 X1 in out c gal=1m` with
+`aliasparam gal = g` gives "Unrecognized parameter GAL"; on the card
+`ral=2k` gives only the warning "No model parameter RAL found ...,
+parameter ignored" and exit 0 (silent in a bare Xyce run). openvaf-r and
+VACASK accept both. vamos prints the target name.
+
+### B27. The Resistor/Capacitor/Inductor groups ignore the module's other parameters
+
+By design so far (FIX2E8 raw l02, l06). A module with xyceModelGroup
+Resistor runs PyMS's simple R stamp, which uses only the value parameter:
+`I(p,n) <+ V(p,n)/(R*rm)` ignores rm on the card (0.5 for 1/3). Either run
+such a module through the full eval when it reads other parameters, or
+refuse the extra parameters.
 
 ---------------------------------------------------------------------------
 
