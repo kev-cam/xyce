@@ -125,16 +125,16 @@ class TestXyce(unittest.TestCase):
         self.assertAlmostEqual(self.out(ALSO_MACRO, 'r=2k'), 1.0 / 3.0, delta=1e-8)
         self.assertAlmostEqual(self.out(ALSO_MACRO, ''), 0.2, delta=1e-8)
 
-    def test_an_instance_only_parameter_on_a_card_is_warned_and_ignored(self):
-        # The Xyce/ADMS rule, the vsrc deck of the question: Xyce's netlist
-        # warning for a card parameter the model does not have (its policy for
-        # every device), exit 0, the default r = 1k.  On the instance line the
-        # value is right.
+    def test_an_instance_only_parameter_on_a_card_is_the_default(self):
+        # 1.1.9 (BUGS.md A25): the openvaf-r/VACASK rule replaces the
+        # Xyce/ADMS one -- every instance parameter is accepted on the card
+        # as the instance default (until 1.1.8: "No model parameter R found
+        # ..., parameter ignored", the default r = 1k used).  The full set is
+        # in test_card_instance_params.
         rc, log, val = run_xyce(INST_ONLY, 'r=2k', '')
         self.assertEqual(rc, 0, log[-2000:])
-        self.assertIn('No model parameter R found for model MM of type A1, parameter ignored',
-                      ' '.join(log.split()))
-        self.assertAlmostEqual(val, 0.5, delta=1e-8)
+        self.assertNotIn('No model parameter', ' '.join(log.split()))
+        self.assertAlmostEqual(val, 1.0 / 3.0, delta=1e-8)
         self.assertAlmostEqual(self.out(INST_ONLY, '', 'r=2k'), 1.0 / 3.0, delta=1e-8)
 
 

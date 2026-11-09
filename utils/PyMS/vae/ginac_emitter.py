@@ -3030,7 +3030,23 @@ class GiNaCEmitter:
         # (With ddt() the gate is applied to the two parts after the split.)
         sprod = ' * '.join(f'({s})' for s in self._cond_stack) if self._cond_stack else None
         if sprod and not has_ddt:
-            ginac_expr = f'(({ginac_expr}) * ({sprod}))'
+            # (1.1.9, BUGS.md B24) A select, not a product: the gated value is
+            # an intermediate whose VALUE is the C++ ternary (S != 0 ? e : 0),
+            # printed from e when the metaprogram runs, so the dual-number
+            # Jacobian takes the slope of the taken arm only.  The product
+            # e * S was NaN wherever the untaken arm is not finite (1/rs * V
+            # * 0 with rs = 0: every point of a V/I switch failed).  The
+            # arithmetic form stays the intermediate's expression (its
+            # voltage dependence for the analyses that ask).
+            self._sel_counter += 1
+            gc = f'_gc_{self._sel_counter}'
+            lines.append(f'{pfx}symbol {gc}("{gc}");')
+            lines.append(f'{pfx}{{ ex _gce = _safe_ex([&]() -> ex {{ return ({ginac_expr}); }});')
+            lines.append(f'{pfx}  int_raw[int_syms.size()] = string("((({sprod}) != 0.0) ? (") + to_cpp(_gce) + ") : 0.0)";')
+            lines.append(f'{pfx}  int_syms.push_back({gc});')
+            lines.append(f'{pfx}  int_exprs.push_back(_safe_ex([&]() -> ex {{ return _gce * ({sprod}); }}));')
+            lines.append(f'{pfx}  int_names.push_back("{gc}"); }}')
+            ginac_expr = gc
         branch_label = f'{node.contrib_kind.name}({",".join(node.branch)})'
 
         # A branch with a current unknown (every voltage-contribution

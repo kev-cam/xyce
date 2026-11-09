@@ -248,6 +248,278 @@ def noise_sources(mod):
     return found
 
 
+# --- the simple R/C stamp's canonical forms (1.1.9, BUGS.md B27) ---------
+# The simple stamp (below, generate_device_cpp) replaces the module's analog
+# code by a linear element; it is right only when that code IS the element.
+# simple_rlc_form() reduces the analog block to one linear form per branch --
+# straight-line real assignments inlined, noise contributions dropped (PyMS
+# drops them anyway, A19), sums of products of numbers, parameters, V(a,b),
+# I(a,b) and ddt() of them with constant factors -- and the caller compares
+# it with the form its stamp implements.  Anything else (a condition, a
+# function, $temperature, $vt, $abstime, an unknown name, a division by a
+# non-constant, ...) is "not simple": the full evaluation runs.
+
+class _NotSimple(Exception):
+    pass
+
+
+_RLC_TOK = re.compile(r'\s*(?:(\d+\.?\d*(?:[eE][-+]?\d+)?|\.\d+(?:[eE][-+]?\d+)?)([TGMKkmunpfa](?![\w]))?'
+                      r'|([A-Za-z_]\w*)|(\S))')
+_RLC_SCALE = {'T': 1e12, 'G': 1e9, 'M': 1e6, 'K': 1e3, 'k': 1e3, 'm': 1e-3, 'u': 1e-6,
+              'n': 1e-9, 'p': 1e-12, 'f': 1e-15, 'a': 1e-18}
+_RLC_NOISE = re.compile(r'^\s*(white_noise|flicker_noise|noise_table|noise_table_log)\s*\(')
+
+
+def _rlc_tokens(text):
+    out, i = [], 0
+    text = text.rstrip()
+    while i < len(text):
+        m = _RLC_TOK.match(text, i)
+        if not m or m.end() == i:
+            raise _NotSimple(text)
+        i = m.end()
+        if m.group(1) is not None:
+            out.append(('num', float(m.group(1)) * _RLC_SCALE.get(m.group(2) or '', 1.0)))
+        elif m.group(3) is not None:
+            out.append(('id', m.group(3)))
+        elif m.group(4) in '+-*/(),':
+            out.append(('op', m.group(4)))
+        else:
+            raise _NotSimple(text)
+    return out
+
+
+def _poly_add(a, b, s=1.0):
+    r = dict(a)
+    for k, v in b.items():
+        r[k] = r.get(k, 0.0) + s * v
+        if r[k] == 0.0:
+            del r[k]
+    return r
+
+
+def _poly_mul(a, b):
+    r = {}
+    for ka, va in a.items():
+        for kb, vb in b.items():
+            f = dict(ka)
+            for x, pw in kb:
+                f[x] = f.get(x, 0) + pw
+                if f[x] == 0:
+                    del f[x]
+            k = tuple(sorted(f.items()))
+            r[k] = r.get(k, 0.0) + va * vb
+            if r[k] == 0.0:
+                del r[k]
+    if len(r) > 64:
+        raise _NotSimple('too many terms')
+    return r
+
+
+def _branch_key(kind, a, b):
+    """(factor, sign) of an access V(a,b) / I(a,b), orientation normalised."""
+    if a == b:
+        raise _NotSimple('same-node branch')
+    return ('%s:%s:%s' % (kind, a, b), 1.0) if a < b else ('%s:%s:%s' % (kind, b, a), -1.0)
+
+
+class _RlcParser:
+    def __init__(self, toks, env, params, nodes):
+        self.t, self.i, self.env, self.params, self.nodes = toks, 0, env, params, nodes
+
+    def peek(self):
+        return self.t[self.i] if self.i < len(self.t) else (None, None)
+
+    def take(self, op=None):
+        tk = self.peek()
+        if tk[0] is None or (op is not None and tk != ('op', op)):
+            raise _NotSimple('syntax')
+        self.i += 1
+        return tk
+
+    def parse(self):
+        p = self.expr()
+        if self.i != len(self.t):
+            raise _NotSimple('trailing')
+        return p
+
+    def expr(self):
+        p = self.term()
+        while self.peek() in (('op', '+'), ('op', '-')):
+            s = 1.0 if self.take()[1] == '+' else -1.0
+            p = _poly_add(p, self.term(), s)
+        return p
+
+    def term(self):
+        p = self.unary()
+        while self.peek() in (('op', '*'), ('op', '/')):
+            op = self.take()[1]
+            q = self.unary()
+            if op == '*':
+                p = _poly_mul(p, q)
+            else:
+                if len(q) != 1:
+                    raise _NotSimple('division by a sum')
+                (k, v), = q.items()
+                if v == 0.0 or any(not x.startswith('P:') for x, _pw in k):
+                    raise _NotSimple('division by a non-constant')
+                p = _poly_mul(p, {tuple((x, -pw) for x, pw in k): 1.0 / v})
+        return p
+
+    def unary(self):
+        if self.peek() == ('op', '-'):
+            self.take()
+            return _poly_mul({(): -1.0}, self.unary())
+        if self.peek() == ('op', '+'):
+            self.take()
+            return self.unary()
+        return self.primary()
+
+    def access(self, kind):
+        self.take('(')
+        a = self.take()
+        if a[0] != 'id' or a[1] not in self.nodes:
+            raise _NotSimple('access')
+        b = None
+        if self.peek() == ('op', ','):
+            self.take()
+            b = self.take()
+            if b[0] != 'id' or b[1] not in self.nodes:
+                raise _NotSimple('access')
+        self.take(')')
+        if b is None:
+            raise _NotSimple('single-node access')
+        f, s = _branch_key(kind, a[1], b[1])
+        return {((f, 1),): s}
+
+    def primary(self):
+        tk = self.take()
+        if tk[0] == 'num':
+            return {(): tk[1]}
+        if tk == ('op', '('):
+            p = self.expr()
+            self.take(')')
+            return p
+        if tk[0] != 'id':
+            raise _NotSimple('token')
+        nm = tk[1]
+        if self.peek() == ('op', '('):
+            if nm in ('V', 'I'):
+                return self.access(nm)
+            if nm == 'ddt':
+                self.take('(')
+                inner = self.expr()
+                self.take(')')
+                out = {}
+                for k, v in inner.items():
+                    acc = [(x, pw) for x, pw in k if not x.startswith('P:')]
+                    if len(acc) != 1 or acc[0][1] != 1 or acc[0][0][0] not in 'VI':
+                        raise _NotSimple('ddt of a non-linear term')
+                    nk = tuple(sorted([(x, pw) for x, pw in k if x.startswith('P:')]
+                                      + [('D:' + acc[0][0], 1)]))
+                    out = _poly_add(out, {nk: v})
+                return out
+            raise _NotSimple('function ' + nm)
+        if nm in self.env:
+            if self.env[nm] is None:
+                raise _NotSimple('variable ' + nm)
+            return self.env[nm]
+        if nm in self.params:
+            return {(('P:' + nm, 1),): 1.0}
+        raise _NotSimple('name ' + nm)
+
+
+def simple_rlc_form(mod, nodes):
+    """The analog block as {(contribution kind 'I'|'V', branch factor):
+    poly}, or None when it is not a straight-line linear form (see above)."""
+    params = {p.name for p in mod.params}
+    env, rows = {}, {}
+
+    def ev(text):
+        return _RlcParser(_rlc_tokens(text or ''), env, params, nodes).parse()
+
+    def walk(n):
+        if n is None:
+            return
+        if n.kind == NodeKind.BLOCK:
+            if getattr(n, 'loop', None):
+                raise _NotSimple('loop')
+            for ch in n.children or []:
+                walk(ch)
+            return
+        if n.kind == NodeKind.ASSIGN:
+            try:
+                env[n.lhs] = ev(n.expr)
+            except _NotSimple:
+                env[n.lhs] = None      # not simple, an error only where it is used
+            return
+        if n.kind == NodeKind.CONTRIB:
+            if _RLC_NOISE.match(n.expr or ''):
+                return
+            br = tuple(n.branch or ())
+            if len(br) != 2 or n.contrib_kind not in (ContribKind.I, ContribKind.V):
+                raise _NotSimple('branch')
+            if br[0] not in nodes or br[1] not in nodes:
+                raise _NotSimple('branch')
+            f, s = _branch_key(n.contrib_kind.name, br[0], br[1])
+            rows[f] = _poly_add(rows.get(f, {}), ev(n.expr), s)
+            return
+        raise _NotSimple(str(n.kind))
+
+    try:
+        walk(getattr(mod, 'analog_block', None))
+    except _NotSimple:
+        return None
+    return {k: v for k, v in rows.items() if v}
+
+
+def _rlc_form_equal(a, b):
+    if set(a) != set(b):
+        return False
+    for f in a:
+        if set(a[f]) != set(b[f]):
+            return False
+        for k, v in a[f].items():
+            if abs(v - b[f][k]) > 1e-12 * max(abs(v), abs(b[f][k])):
+                return False
+    return True
+
+
+def rlc_expected_form(kind, p0, p1, names, loss=None):
+    """The form the simple stamp implements (kind R: names = (R,); R_SHEET:
+    (rsh, l, w); C: (C,), loss {'rser': name|None, 'rpar': name|None,
+    'mid': node|None})."""
+    rows = {}
+
+    def add(kind_, a, b, poly):
+        f, s = _branch_key(kind_, a, b)
+        rows[f] = _poly_add(rows.get(f, {}), {k: s * v for k, v in poly.items()})
+
+    def acc(kind_, a, b):
+        f, s = _branch_key(kind_, a, b)
+        return f, s
+    if kind in ('R', 'R_SHEET'):
+        f, s = acc('V', p0, p1)
+        k = [(f, 1), ('P:' + names[0], -1)]
+        if kind == 'R_SHEET':
+            k += [('P:' + names[1], -1), ('P:' + names[2], 1)]
+        add('I', p0, p1, {tuple(sorted(k)): s})
+    elif kind == 'C':
+        loss = loss or {}
+        x = loss.get('mid') or p0
+        f, s = acc('V', x, p1)
+        add('I', x, p1, {tuple(sorted([('D:' + f, 1), ('P:' + names[0], 1)])): s})
+        if loss.get('rpar'):
+            f, s = acc('V', p0, p1)
+            add('I', p0, p1, {tuple(sorted([(f, 1), ('P:' + loss['rpar'], -1)])): s})
+        if loss.get('mid'):
+            f, s = acc('I', p0, loss['mid'])
+            add('V', p0, loss['mid'], {tuple(sorted([(f, 1), ('P:' + loss['rser'], 1)])): s})
+    else:
+        return None
+    return {k: v for k, v in rows.items() if v}
+
+
 def _emit_rpar(c, rpar_ref, a, b):
     """Parallel leakage RPAR directly across the +/- terminals (no node)."""
     c.append(f'    double Rpar = {rpar_ref}; if (Rpar < 1e-12) Rpar = 1e-12;')
@@ -536,6 +808,39 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '',
                 'mid_idx':  n_ext        if has_mid else None,
             }
 
+    # (1.1.9, BUGS.md B27) The simple stamp replaces the module's analog code
+    # by a linear element: only when that code is exactly the element's
+    # canonical form (simple_rlc_form / rlc_expected_form: I(p,n) <+ V(p,n)/R,
+    # the sheet form rsh*l/w, I <+ ddt(C*V) with the QSPICE rser/rpar network,
+    # inlined straight-line variables, noise contributions dropped).  Anything
+    # else -- another parameter (I <+ V/(R*rm): rm on the card ignored, 0.5 for
+    # 1/3), $temperature, a constant factor, a condition, a non-linear term --
+    # runs the full evaluation.  The Inductor stamp is never used: its
+    # inductor was a 1e3 S operating-point placeholder, wrong in a transient.
+    if simple_rlc:
+        def _pname(ref):
+            cx = ref[len('model_.'):] if ref.startswith('model_.') else ref
+            return next((p.name for p in mod.params if _cxx_mangle(p.name) == cx), None)
+        _pn = [p[0] for p in ports]
+        if 'n1' in _pn and 'n2' in _pn:
+            _p0, _p1 = 'n1', 'n2'
+        elif simple_rlc[0] == 'R_SHEET' and len(_pn) >= 3:
+            _p0, _p1 = _pn[0], _pn[2]
+        else:
+            _p0, _p1 = _pn[0], _pn[1]
+        _names = tuple(_pname(r) for r in simple_rlc[1:])
+        _loss = None
+        if rlc_loss:
+            _loss = {'rser': _pname(rlc_loss['rser']) if rlc_loss['rser'] else None,
+                     'rpar': _pname(rlc_loss['rpar']) if rlc_loss['rpar'] else None,
+                     'mid': rlc_loss['mid_name']}
+        _want = (None if simple_rlc[0] == 'L' or None in _names
+                 else rlc_expected_form(simple_rlc[0], _p0, _p1, _names, _loss))
+        _have = simple_rlc_form(mod, set(_pn) | set(internals))
+        if _want is None or _have is None or not _rlc_form_equal(_have, _want):
+            simple_rlc = None
+            rlc_loss = None
+
     # Split scalar vs array params. Scalars go into Model/Instance class
     # members via addPar; arrays are emitted once as namespace-scope static
     # const double[].
@@ -622,8 +927,13 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '',
     # takes the card's value (Instance::processParams). Without it a card
     # value of such a parameter was "No model parameter W found" (PSP103,
     # BSIM-CMG, BSIM-SOI, BSIM6, Mextram, VBIC, EKV carry 270 of them).
-    _also_model = {p.name for p in mod.params
-                   if getattr(p, 'is_instance', False) and getattr(p, 'also_model', False)}
+    # (1.1.9, BUGS.md A25) Every instance parameter is one: the card's value
+    # is the default of every instance of that model, a value on the
+    # instance line wins, as openvaf-r/VACASK have it (an instance parameter
+    # on a card was "No model parameter G found ..., parameter ignored", the
+    # default used, exit 0).  A .step / .param sweep of the card value
+    # reaches the instances through Model::processInstanceParams.
+    _also_model = {p.name for p in mod.params if getattr(p, 'is_instance', False)}
     _cxx_of = {pn: cx for pn, _d, _ii, cx in params}
     _is_inst_of = {pn: ii for pn, _d, ii, _cx in params}
     # A module parameter named TEMP (EKV 2.6, fbh_hbt: "device temperature in
@@ -634,9 +944,13 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '',
     # would change it -- and bake it, a library per temperature.  The shell
     # undoes that write in processParams (1.1.6): a TEMP equal to the circuit
     # temperature that the module's value is not goes back to the module's
-    # value and given-ness (a .step of the module's own TEMP to exactly the
-    # circuit temperature is the one value this cannot tell; it keeps the
-    # previous one).  VACASK never writes a module parameter either.
+    # value and given-ness.  VACASK never writes a module parameter either.
+    # (1.1.9, BUGS.md A20) The device manager's write is told by its second
+    # write, XYCEADMSINSTTEMP / XYCEADMSMODTEMP (K), made right after TEMP:
+    # processParams reads that parameter's given flag and clears it.  A TEMP
+    # written without it (.step m1:TEMP, also to exactly the circuit
+    # temperature) is the netlist's value and given; until 1.1.8 a stepped
+    # value equal to the circuit temperature kept the previous point's.
     _temp_par_inst = next((pn for pn, _d, ii, _cx in params if ii and pn.upper() == 'TEMP'), None)
     _temp_par_model = next((pn for pn, _d, ii, _cx in params
                             if (not ii or pn in _also_model) and pn.upper() == 'TEMP'), None)
@@ -670,11 +984,16 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '',
         ct = ('getDeviceOptions().temp.getImmutableValue<double>()' if kelvin
               else 'getDeviceOptions().temp.getImmutableValue<double>() - CONSTCtoK')
         return [f'  {{ const double _ct = {ct};',
-                f'    if (std::fabs({member} - _ct) <= 1e-9 * (1.0 + std::fabs(_ct))) {{',
-                f'      {member} = {val};  // the device manager\'s write (or the same value): the netlist\'s',
+                f'    if (pyms_mgr_temp_ && std::fabs({member} - _ct) <= 1e-9 * (1.0 + std::fabs(_ct))) {{',
+                f'      {member} = {val};  // the device manager\'s write: the netlist\'s value',
                 f'      if (!{giv}) pyms_ungive_(*this, "TEMP");',
-                f'    }} else if ({member} != {val}) {{ {val} = {member}; {giv} = given("TEMP"); }}',
+                f'    }} else {{ {val} = {member}; {giv} = given("TEMP"); }}  // the netlist\'s / a .step\'s',
                 '  }']
+
+    def _mgr_flag(pname):
+        # this processParams follows the device manager's temperature write
+        return [f'  const bool pyms_mgr_temp_ = given("{pname}");',
+                f'  pyms_ungive_(*this, "{pname}");']
 
     # Branch-current unknowns (MNA). The target branch of every voltage
     # contribution and every branch whose current is probed (I(a,b), I(br))
@@ -979,6 +1298,7 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '',
     h.append('  std::string vaFile_;')
     if _temp_par_model:
         h.append('  double pyms_tp_val_; bool pyms_tp_given_;  // the module\'s own TEMP (see processParams)')
+        h.append('  double pyms_modtemp_;  // K: XYCEADMSMODTEMP, the device manager\'s second write (A20)')
     h.append('};')
     h.append('')
 
@@ -1156,6 +1476,12 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '',
                 c.append('    .setAutoConvertTemperature(false)')
             c.append(f'    .setUnit(U_NONE)')
             c.append(f'    .setDescription("aliasparam of {t}");')
+    if _temp_par_model:
+        c.append('  p.addPar("XYCEADMSMODTEMP", 0.0, &Model::pyms_modtemp_)')
+        c.append('    .setExpressionAccess(NO_DOC)')
+        c.append('    .setUnit(U_DEGK)')
+        c.append('    .setCategory(CAT_TEMP)')
+        c.append('    .setDescription("PyMS: the temperature Xyce\'s device manager sets (internal; tells its TEMP write)");')
     c.append('}')
     c.append('')
 
@@ -1242,6 +1568,8 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '',
     c.append('bool Instance::processParams() {')
     if _aliases:
         c.append('  pyms_alias_given_(*this);')
+    if _temp_par_inst or _shell_temp:
+        c.extend(_mgr_flag('XYCEADMSINSTTEMP'))
     if _temp_par_inst:
         c.extend(_tp_restore(_cxx_of[_temp_par_inst]))
     if _shell_temp:
@@ -1266,7 +1594,10 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '',
             continue  # a string default or one that reads a string: the math library evaluates it
         if p.name in _thermal:
             continue  # a default that reads $temperature / $vt: the math library evaluates it
-        c.append(f'  if (!given("{p.name.upper()}")) {_cxx_of[p.name]} = {_cxx_default(p, tree, True)};')
+        _ng = f'!given("{p.name.upper()}")'
+        if p.name in _also_model:  # a card value is the instance's (1.1.9, A25)
+            _ng += f' && !model_.given("{p.name.upper()}")'
+        c.append(f'  if ({_ng}) {_cxx_of[p.name]} = {_cxx_default(p, tree, True)};')
     # (1.1.5) processParams runs again when a .step (or .sampling) changes a
     # parameter: the JIT library baked the old values, so the key of the
     # current values is computed again and a library of other values is
@@ -2128,6 +2459,8 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '',
         if not is_inst or pname in _also_model:
             dval = _resolve_default(pname)
             c.append(f'  {_cxx} = {dval};')
+    if _temp_par_model:
+        c.append('  pyms_modtemp_ = 0.0;')
     c.append('  setModParams(' + ('pyms_unalias_(mb.params)' if _aliases else 'mb.params') + ');')
     c.append('  updateDependentParameters();  // card values given as expressions of globals (A23/A24)')
     if _temp_par_model:
@@ -2154,6 +2487,7 @@ def generate_device_cpp(mod, xyce_src_dir: str, va_path: str = '',
     if _aliases:
         c.append('  pyms_alias_given_(*this);')
     if _temp_par_model:
+        c.extend(_mgr_flag('XYCEADMSMODTEMP'))
         c.extend(_tp_restore(_cxx_of[_temp_par_model]))
     for p, tree, deps in _dep_order:
         if _is_inst_of.get(p.name, True) or p.name not in _cxx_of:

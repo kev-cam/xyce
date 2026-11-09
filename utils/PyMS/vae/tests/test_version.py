@@ -109,6 +109,15 @@ class VersionTests(unittest.TestCase):
         # dropped noise sources are named in a warning).
         self.assertGreaterEqual(tuple(int(x) for x in vae.__version__.split('.')), (1, 1, 8))
 
+    def test_version_carries_the_round_10_fixes(self):
+        # 1.1.9: the PYMS10 round (2026-11-09: an instance parameter on a
+        # .model card is the default of the model's instances, as openvaf-r
+        # has it; an R/C/L-group module that reads other parameters runs the
+        # full evaluation; a gated contribution is a select (a V/I switch row
+        # with a non-finite untaken arm is no longer NaN); a .step of a
+        # module's own TEMP to the circuit temperature is taken).
+        self.assertGreaterEqual(tuple(int(x) for x in vae.__version__.split('.')), (1, 1, 9))
+
     def test_version_file_agrees(self):
         with open(VERSION_FILE) as f:
             text = f.read()

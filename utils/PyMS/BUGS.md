@@ -19,7 +19,7 @@ VACASK: `/opt/build.VACASK/Release/simulator/vacask` (openvaf-r compiles the
 first on PATH). Every test in `vae/tests/` runs as a plain script
 (`python3 vae/tests/test_x.py`) and makes its own caches.
 
-Contents: CHANGES (1.1.8, 1.1.7, 1.1.6, 1.1.5, 1.1.4, 1.1.3, 1.1.2, 1.1.1, 1.1.0) · A. silent wrong answers · B. loud failures of
+Contents: CHANGES (1.1.9, 1.1.8, 1.1.7, 1.1.6, 1.1.5, 1.1.4, 1.1.3, 1.1.2, 1.1.1, 1.1.0) · A. silent wrong answers · B. loud failures of
 legal Verilog-A · C. decisions and strictness · D. error messages ·
 E. caches and installation · F. upstream (openvaf-r/VACASK) · G. vamos
 follow-up.
@@ -27,6 +27,51 @@ follow-up.
 ---------------------------------------------------------------------------
 
 ## CHANGES
+
+### 1.1.9 (2026-11-09)
+
+The 1.1.8 round's open items (PYMS10-FIX):
+- A25 (silent; user decision: accept when it can be applied properly): an instance parameter on a .model card is the
+  default of every instance of that model, a value on the instance line wins, as openvaf-r has it (VACASK, FIX10
+  vac/a25: card r=2k 1/3, card 2k + line 500 2/3). xyce_device_gen.py: every instance parameter is registered on the
+  model too (the xyceAlsoModel machinery of 1.1.1, now for all of them; an instance that does not give it copies the
+  card's in processParams, given for $param_given); a .step of the card value or a card expression of a swept .param
+  reaches the instances that do not give their own; an instance parameter whose default reads another parameter is
+  no longer re-evaluated over the card's value (that also fixes the xyceAlsoModel ones). Until 1.1.8: "No model
+  parameter G found ..., parameter ignored", the default used, exit 0. test_card_instance_params; the last case of
+  test_also_model_params now expects the card value.
+- B27 (silent): the simple R/C stamp replaced a Resistor/Capacitor/Inductor-group module's analog code by a linear
+  element whenever the module had a value parameter, whatever the code computed: another parameter (`I(p,n) <+
+  V(p,n)/(R*rm)`: rm on the card, 0.5 for 1/3), $temperature (`V(p,n)/(R*$temperature/300.15)` at 77 C: 0.5 for
+  0.4616), a constant factor, an intermediate variable, a condition were all dropped. Now the stamp runs only when the
+  analog block, reduced to one linear form per branch (straight-line variables inlined, noise contributions dropped;
+  xyce_device_gen.py simple_rlc_form), is exactly the form the stamp implements (rlc_expected_form: I(p,n) <+ V(p,n)/R;
+  the sheet form rsh*l/w; I <+ ddt(C*V) or C*ddt(V) with the QSPICE rser/rpar network of qspice_cap.va); anything else
+  runs the full evaluation. The Inductor stamp is no longer used at all (its inductor was a 1e3 S operating-point
+  placeholder, wrong in a transient): an Inductor-group module always runs the full evaluation. toys/resistor.va and
+  capacitor.va keep the stamp. test_rlc_group_other_params.
+- B24 (loud, NaN): a contribution under a run-time condition is a select: an intermediate whose value is the C++
+  ternary (S != 0 ? e : 0), printed from e when the metaprogram runs, so the dual-number Jacobian takes the taken
+  arm's slope. The product e * S was NaN where the untaken arm is not finite (`if (rs > 0) I(p,m) <+ V(p,m)/rs; else
+  V(p,m) <+ 0;` with rs = 0: every point failed). ginac_emitter.py, the contribution walk. Not covered: a gated
+  contribution that carries ddt() (its split parts are still gated by the product). test_switch_row_select.
+- A20 (silent): `.step m1:TEMP list 50 27 80` at 27 C gave 323.15 / 323.15 / 353.15 K. The shell undoes the device
+  manager's write of the circuit temperature into a module's own TEMP (1.1.6) and told that write by its value; it now
+  tells it by the manager's second write (XYCEADMSINSTTEMP / XYCEADMSMODTEMP, made right after TEMP; the model shell
+  registers XYCEADMSMODTEMP when it has a TEMP), so a stepped TEMP equal to the circuit temperature is taken and given.
+  test_step_own_temp.
+- A21 closed: the 4 % was the difference quotient, not AD (FIX10 a21: a long-double copy of the PSP102B eval; central
+  differences at steps 1e-2..1e-5 give -91.42 / -91.386 / -91.40 / -91.38 for AD's -91.386; smaller steps, and every
+  double step, collapse to -87.83 because x_ds = x_d - x_s (6e-9) cancels to a constant in the quotient).
+
+Gate (measured, PYMS10-FIX, rerun after the B27 canonical-form rework): vae/tests 67/67 modules (448 tests) on the chain; the 21 deck families (1255 decks)
+against 1.1.8: right 1137 / loud 43 / n/a 60 / wrong 11 / ok? 4, the same as 1.1.8, no deck worse; two values moved by
+more than 1e-9: c_own m_inst_on_card 0.5 -> 1/3 (A25: the card's instance parameter now applies) and c_fix5
+fx5_abstime_cond_tran 2.2e-7 (still right; the $abstime-gated contributions are selects now, B24, a rounding change at
+the 1 ms switch of a transient); corpus at 27 C 101 / 87 / 83 (1.1.8: 101 / 86 / 82): sg13g2 r3_cmc runs now (B27:
+the full evaluation; I(V1) -8.58287913e-3, VACASK -8.582879125e-3) and sg13g2 resistor.va gives 0.999999 for 1.0
+(B27: the module's own 1 mOhm default with no value given, which the simple stamp skipped), every other printed value
+equal to 1.1.8's; the SK7 temperature toys 59/62 (1.1.8 57/62: the two A20 cases right; the three left are A19 noise).
 
 ### 1.1.8 (2026-11-08)
 
@@ -1095,14 +1140,26 @@ noise is implemented it should at least warn.
 
 ### A20. `.step m1:TEMP` on a module's own TEMP parameter keeps a point's value
 
-OPEN (the 1.1.6 skeptic, t7_a12.txt). `.step m1:TEMP list 50 27 80` with the
+FIXED in 1.1.9 (CHANGES 1.1.9; test_step_own_temp): the device manager's write
+is told by its XYCEADMSINSTTEMP / XYCEADMSMODTEMP write, not by the value.
+Was: OPEN (the 1.1.6 skeptic, t7_a12.txt). `.step m1:TEMP list 50 27 80` with the
 circuit at 27 C gives 323.15 / 323.15 / 353.15: the second point keeps 50
 for 27. The `_tp_restore` ambiguity (a stepped value that equals the circuit
 temperature is taken for "not given") that the source comment admits.
 
 ### A21. PSP102: a 4 % Jacobian entry at an unphysical state and T >= 350 K
 
-OPEN, minor (the 1.1.6 skeptic; probe7*.txt). PSP102/102B/102E at a random
+CLOSED in 1.1.9, a difference artifact (CHANGES 1.1.9). FIX10 a21/a21.py
+instruments every intermediate of the PSP102B eval (SK7 corpus_t7/033) and
+builds a long-double copy: at the state below, long-double central
+differences at relative steps 1e-2, 1e-3, 1e-4, 1e-5 give -91.421, -91.386,
+-91.397, -91.377 for AD's -91.3863 (1e-6: -90.71, 1e-7: -87.83, the double
+quotient's value at every step). The path the small steps lose: x_ds =
+x_d - x_s (5.9e-9; AD slope 2.9828e-12, long-double quotient 2.9825e-12,
+double quotient exactly 0) -> Delta_N1 -> migid -> sigVds/sf*migid*V_NOI2 in
+I(D,S), with the noise node at -1.06 V. The double value of F itself differs
+from the long-double one by 7.8e-7 (relative) there: an ill-conditioned
+state, not an AD error. Was: OPEN, minor (the 1.1.6 skeptic; probe7*.txt). PSP102/102B/102E at a random
 state with F = -7e3 A and T >= 350 K: J of F I(D,S) column 0 is -91.39, the
 central difference -87.83; the full dual plan gives the same J, and the
 central difference is erratic at the neighbouring state (F not smooth
@@ -1155,7 +1212,10 @@ printed off the grid).
 
 ### A25. An instance parameter on a .model card is ignored with a warning
 
-OPEN, maybe Xyce convention (FIX2E8 raw r05). A `(* type="instance" *)`
+FIXED in 1.1.9 (CHANGES 1.1.9; test_card_instance_params): accepted as the
+default of the model's instances, the openvaf-r/VACASK rule (user decision
+2026-11-09). vamos may print it on the card again.
+Was: OPEN, maybe Xyce convention (FIX2E8 raw r05). A `(* type="instance" *)`
 parameter given on the .model card is ignored with only "No model parameter
 G found for model C1 of type A2, parameter ignored"; the default is used.
 Xyce's ADMS devices behave the same unless xyceAlsoModel. vamos never
@@ -1537,7 +1597,12 @@ gives V(2) = 0, 0.24991164, 0.499823295.
 
 ### B24. A V/I switch row is NaN when the untaken arm is not finite
 
-OPEN (the 1.1.6 code review, F3; REV7/t3/tc.va, tv.va). A branch with a
+FIXED in 1.1.9 for contributions without ddt() (CHANGES 1.1.9;
+test_switch_row_select): a gated contribution is a select intermediate whose
+value is the ternary; the dual Jacobian follows it. Left: a gated
+contribution that carries ddt() still gates its static and charge parts by
+the product (no failing case known).
+Was: OPEN (the 1.1.6 code review, F3; REV7/t3/tc.va, tv.va). A branch with a
 voltage contribution in one arm and a current contribution in the other of a
 run-time condition is one blended row: `parameter real rs = rs0*($temperature
 /300.15); if (rs > 0) I(p,m) <+ V(p,m)/rs; else V(p,m) <+ 0;` with rs0 = 0
@@ -1591,7 +1656,12 @@ VACASK accept both. vamos prints the target name.
 
 ### B27. The Resistor/Capacitor/Inductor groups ignore the module's other parameters
 
-By design so far (FIX2E8 raw l02, l06). A module with xyceModelGroup
+FIXED in 1.1.9 (CHANGES 1.1.9; test_rlc_group_other_params): the simple
+stamp runs only for the canonical forms it implements (simple_rlc_form /
+rlc_expected_form); any other analog code (another parameter, $temperature,
+a factor, a variable, a condition) runs the full evaluation; the Inductor
+stamp is not used.
+Was: by design so far (FIX2E8 raw l02, l06). A module with xyceModelGroup
 Resistor runs PyMS's simple R stamp, which uses only the value parameter:
 `I(p,n) <+ V(p,n)/(R*rm)` ignores rm on the card (0.5 for 1/3). Either run
 such a module through the full eval when it reads other parameters, or
@@ -1616,7 +1686,9 @@ refuse the extra parameters.
 - C5. An instance-only parameter on a `.model` card: VACASK takes it (1/3 on
   the vsrc deck), Xyce warns and ignores it (0.5) unless the parameter is
   `xyceAlsoModel` (PYMS1-E/F). Xyce's rule, not a PyMS defect; vamos moves
-  such a value to the instance line.
+  such a value to the instance line. SUPERSEDED in 1.1.9 (A25, user
+  decision 2026-11-09): PyMS takes it as VACASK does, the default of the
+  model's instances.
 - C6. The legacy nonzero-only retry in build_vae_so.py (drop zero-valued
   baked parameters and build again) runs only for shells without a
   `__GIVEN__` marker, which no current generator writes; delete it
