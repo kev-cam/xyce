@@ -19,8 +19,11 @@ to an integer variable is marked (ASTNode.int_lhs) and rounded there.  A text
 the typer cannot read (an array index, a hierarchical name) is left as it
 was.  Since 1.1.10 an integer bitwise or shift operation (``& | ^ ^~ << >>
 <<< >>> ~``) is rewritten to ``_vae_ibit ( a , b , code )`` the same way, with
-32-bit semantics (BUGS.md B28).  No other text changes, so a module without integer division compiles
-to the same program as before.
+32-bit semantics (BUGS.md B28), and since 1.1.11 an integer ``+ - * **``
+and unary ``-`` (codes 8-12 of the same helper), which wrap at 32 bits as
+the LRM and va_const do (BUGS.md B29); a real ``a ** b`` becomes
+``pow ( a , b )`` (it reached C++ as ``**`` before).  No other text changes, so a module
+without integer arithmetic compiles to the same program as before.
 """
 
 from __future__ import annotations
@@ -245,18 +248,52 @@ def _type(n, types, ftypes):
 # arithmetic, ~ the bitwise negation.  The codes are those of the helper
 # (ginac_emitter._IBIT_CORE).  Before, the text reached C++ / GiNaC on
 # doubles and the module did not build.
-_IBIT_CODE = {'&': 0, '|': 1, '^': 2, '^~': 3, '~^': 3, '<<': 4, '<<<': 4, '>>': 5, '>>>': 6}
+_IBIT_CODE = {'&': 0, '|': 1, '^': 2, '^~': 3, '~^': 3, '<<': 4, '<<<': 4, '>>': 5, '>>>': 6,
+              # since 1.1.11 (BUGS.md B29) the arithmetic wraps at 32 bits too:
+              # + - * and the power of LRM table 4-6, as va_const does
+              '+': 8, '-': 9, '*': 10, '**': 12}
 _IBIT_NOT = 7
+_IBIT_NEG = 11
 
 
-def _is_ibit(n):
-    if n.kind == 'un' and n.op == '~' and n.kids[0].type == 'int':
-        return True
+_WRAP_ONLY = ('+', '-', '*')
+
+
+def _lit(n):
+    while n.kind == 'paren':
+        n = n.kids[0]
+    return n.value if n.kind == 'num' and n.type == 'int' else None
+
+
+def _literal_in_range(n):
+    """+ - * of two integer literals whose result fits 32 bits: nothing to
+    wrap, the text stays (`1 + 1`)."""
+    if n.kind != 'bin':
+        return False
+    a, b = _lit(n.kids[0]), _lit(n.kids[1])
+    if a is None or b is None:
+        return False
+    v = a + b if n.op == '+' else a - b if n.op == '-' else a * b
+    return -2**31 <= v < 2**31
+
+
+def _is_ibit(n, wrap=True):
+    """n is an integer operation of the helper.  wrap False (inside an array
+    index, where a wrap has no use): + - * and unary - stay as written."""
+    if not wrap and n.op in _WRAP_ONLY:
+        return False
+    if n.op in _WRAP_ONLY and _literal_in_range(n):
+        return False
+    if n.kind == 'un' and n.kids[0].type == 'int':
+        if n.op == '~':
+            return True
+        # -<literal> is the literal (no int32 literal negates past the range)
+        return n.op == '-' and n.kids[0].kind != 'num'
     return (n.kind == 'bin' and n.op in _IBIT_CODE
             and n.kids[0].type == 'int' and n.kids[1].type == 'int')
 
 
-def _render(n, toks):
+def _render(n, toks, wrap=True):
     """The text of n with every integer / and % below it rewritten (and a
     based literal as its decimal value, and an integer bitwise or shift
     operation as _vae_ibit)."""
@@ -264,29 +301,33 @@ def _render(n, toks):
         return str(n.value)
     if n.kind == 'bin' and n.op in ('/', '%') and n.kids[0].type == 'int' and n.kids[1].type == 'int':
         fn = '_vae_idiv' if n.op == '/' else '_vae_imod'
-        return f'{fn} ( {_render(n.kids[0], toks)} , {_render(n.kids[1], toks)} )'
-    if _is_ibit(n):
+        return f'{fn} ( {_render(n.kids[0], toks, wrap)} , {_render(n.kids[1], toks, wrap)} )'
+    if n.kind == 'bin' and n.op == '**' and not _is_ibit(n, wrap) and not (n.kids[0].type == 'int' and n.kids[1].type == 'int'):
+        # a real power (1.1.11): the text reached C++ / GiNaC as ** and did not build
+        return f'pow ( {_render(n.kids[0], toks, wrap)} , {_render(n.kids[1], toks, wrap)} )'
+    if _is_ibit(n, wrap):
         if n.kind == 'un':
-            return f'_vae_ibit ( {_render(n.kids[0], toks)} , 0 , {_IBIT_NOT} )'
-        return (f'_vae_ibit ( {_render(n.kids[0], toks)} , {_render(n.kids[1], toks)} , '
+            code = _IBIT_NOT if n.op == '~' else _IBIT_NEG
+            return f'_vae_ibit ( {_render(n.kids[0], toks, wrap)} , 0 , {code} )'
+        return (f'_vae_ibit ( {_render(n.kids[0], toks, wrap)} , {_render(n.kids[1], toks, wrap)} , '
                 f'{_IBIT_CODE[n.op]} )')
     parts, pos = [], n.s
     for c in sorted(n.kids, key=lambda c: c.s):
         parts.extend(v for _, v in toks[pos:c.s])
-        parts.append(_render(c, toks))
+        parts.append(_render(c, toks, wrap and n.kind != 'index'))
         pos = c.e
     parts.extend(v for _, v in toks[pos:n.e])
     return ' '.join(parts)
 
 
-def _has_int_div(n):
+def _has_int_div(n, wrap=True):
     if n.kind == 'bin' and n.op in ('/', '%') and n.kids[0].type == 'int' and n.kids[1].type == 'int':
         return True
     if n.kind == 'num' and n.op == 'based':
         return True
-    if _is_ibit(n):
+    if _is_ibit(n, wrap) or (n.kind == 'bin' and n.op == '**'):
         return True
-    return any(_has_int_div(c) for c in n.kids)
+    return any(_has_int_div(c, wrap and n.kind != 'index') for c in n.kids)
 
 
 def analyse(text: str, types: dict, ftypes: Optional[dict] = None):

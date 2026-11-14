@@ -1,0 +1,32 @@
+The power operator on two integers: openvaf-r does not follow the integer
+rules of the Verilog-AMS LRM (table 4-6), and its constant and run-time
+results for the same power disagree.
+
+  r1 = 2 ** (k - 2) + 1000;            // ipow.va, k = 1 at run time: 2 ** -1
+  r2 = 3 ** (k + 39) - 689955897;      // ipow.va, run time: 3 ** 40
+  r3 = 3 ** 40 - 689955897;            // ipow.va, a constant expression
+  parameter integer rp = 2 ** -1 + 1000;   // ipowp.va, parameter default
+
+LRM table 4-6: with two integer operands the result is an integer, and a
+negative exponent gives 0 unless the base is 1 or -1, so 2 ** -1 = 0 and r1
+and rp are 1000. 3 ** 40 does not fit 32 bits; integer arithmetic is 32-bit
+two's complement, which gives 689956897 (3**40 mod 2**32), so r2 and r3 are
+1000. Whatever the overflow rule, r2 and r3 compute the same power and
+should be equal.
+
+Command (VACASK 0.3.4-91-g64489cf7, openvaf-r 20260616-3-g0e83f1ed, from this
+directory):
+  SIM_TEST=yes SIM_OPENVAF=<openvaf-r> PYTHONPATH=<VACASK>/python \
+    SIM_MODULE_PATH=<build>/devices vacask test_int_power.sim
+
+Observed (2026-11-14), exit 1:
+  analog: 2 ** (k - 2) + 1000          v = 1001   expected 1000   WRONG
+  analog: 3 ** (k + 39) - 689955897    v = 0   expected 1000   WRONG
+  analog: 3 ** 40 - 689955897          v = 2147483647   expected 1000   WRONG
+  parameter: 2 ** -1 + 1000            v = 1001   expected 1000   WRONG
+
+2 ** -1 gives 1 in both the analog block and a parameter default. The run-time
+and constant forms of 3 ** 40 give different values (0 and 2147483647 for the
+whole expression). Expected: exit 0.
+Xyce through PyMS 1.1.11 gives 1000 for all four (1.1.10 could not build
+ipow.va: the integer ** reached the C++ as **, BUGS.md B29).

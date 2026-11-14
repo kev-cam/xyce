@@ -1,0 +1,44 @@
+Power operator on integers
+
+ground 0
+
+load "resistor.osdi"
+load "ipow.va"
+load "ipowp.va"
+
+model resistor resistor
+model ipow ipow
+model ipowp ipowp
+
+x1 (o1 o2 o3 0) ipow
+r1 (o1 0) resistor r=1k
+r2 (o2 0) resistor r=1k
+r3 (o3 0) resistor r=1k
+x4 (o4 0) ipowp
+r4 (o4 0) resistor r=1k
+
+control
+  abort always
+  options rawfile="binary"
+  analysis op1 op
+  postprocess(PYTHON, "runme.py")
+endc
+
+embed "runme.py" <<<FILE
+from rawfile import rawread
+from runtest import *
+import sys
+
+op1 = rawread('op1.raw').get()
+tests = []
+for node, what in (('o1', 'analog: 2 ** (k - 2) + 1000'),
+                   ('o2', 'analog: 3 ** (k + 39) - 689955897'),
+                   ('o3', 'analog: 3 ** 40 - 689955897'),
+                   ('o4', 'parameter: 2 ** -1 + 1000')):
+    v = op1[node][0]
+    ok = abs(v - 1000.0) < 1e-9
+    print("%-36s v = %.10g   expected 1000   %s" % (what, v, "ok" if ok else "WRONG"))
+    tests.append(ok)
+if isTest():
+    sys.exit(not all(tests))
+>>>FILE

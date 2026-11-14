@@ -1,0 +1,8 @@
+// The same negative-exponent power in a parameter default: 2 ** -1 = 0 (LRM table 4-6), + 1000.
+`include "disciplines.vams"
+module ipowp(p, n);
+  inout p, n;
+  electrical p, n;
+  parameter integer rp = 2 ** -1 + 1000;
+  analog V(p, n) <+ rp;
+endmodule

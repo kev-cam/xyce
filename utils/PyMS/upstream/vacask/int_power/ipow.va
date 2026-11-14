@@ -1,0 +1,21 @@
+// The power operator on two integers (Verilog-AMS LRM table 4-6).
+// k = 1 at run time (an integer variable), so each power is computed in the analog block.
+//   o1: 2 ** (k - 2) = 2 ** -1 = 0 (a negative exponent gives 0 unless the base is 1 or -1), + 1000
+//   o2: 3 ** (k + 39) = 3 ** 40, an integer: 689956897 in 32-bit two's complement, - 689955897
+//   o3: the same 3 ** 40 as a constant expression (folded by the compiler), - 689955897
+// Every output is 1000.
+`include "disciplines.vams"
+module ipow(o1, o2, o3, n);
+  inout o1, o2, o3, n;
+  electrical o1, o2, o3, n;
+  integer k, r1, r2, r3;
+  analog begin
+    k = (V(o1, n) > 1e9) ? 3 : 1;
+    r1 = 2 ** (k - 2) + 1000;
+    r2 = 3 ** (k + 39) - 689955897;
+    r3 = 3 ** 40 - 689955897;
+    V(o1, n) <+ r1;
+    V(o2, n) <+ r2;
+    V(o3, n) <+ r3;
+  end
+endmodule

@@ -124,6 +124,11 @@ class VersionTests(unittest.TestCase):
         # and >>> <<< ^~ ~^ are single tokens (BUGS.md B28).
         self.assertGreaterEqual(tuple(int(x) for x in vae.__version__.split('.')), (1, 1, 10))
 
+    def test_version_carries_the_b29_fix(self):
+        # 1.1.11 (2026-11-14): integer + - * ** and unary - of the analog
+        # block wrap at 32 bits (BUGS.md B29), and a real ** builds (B30).
+        self.assertGreaterEqual(tuple(int(x) for x in vae.__version__.split('.')), (1, 1, 11))
+
     def test_version_file_agrees(self):
         with open(VERSION_FILE) as f:
             text = f.read()

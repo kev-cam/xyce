@@ -75,8 +75,8 @@ class TestInlining(unittest.TestCase):
     def test_case_expression_evaluated_once(self):
         m = parse_verilog_a(CASES["case_once"][0], filename="c.va")
         incs = [n for n in _ast_walk(m.analog_block) if n.kind == NodeKind.ASSIGN
-                and re.fullmatch(r'\S+ \+ 1', ' '.join((n.expr or '').split()))]
-        self.assertEqual(len(incs), 1)          # one copy of the body: c = c + 1
+                and re.fullmatch(r'\S+ \+ 1|_vae_ibit \( \S+ , 1 , 8 \)', ' '.join((n.expr or '').split()))]
+        self.assertEqual(len(incs), 1)          # one copy of the body: c = c + 1 (1.1.11: the wrapping helper)
 
     def test_no_call_left(self):
         m = parse_verilog_a(CASES["nested"][0], filename="c.va")

@@ -188,7 +188,9 @@ def _py_rint(x):
 def _py_ibit(a, b, op, *_site):
     """An integer bitwise or shift operation on 32-bit integers (int_ops
     _IBIT_CODE): 0 &, 1 |, 2 ^, 3 ^~, 4 <<, 5 >> (logical), 6 >>>
-    (arithmetic), 7 ~a."""
+    (arithmetic), 7 ~a; since 1.1.11 (B29) 8 +, 9 -, 10 *, 11 -a, 12 **
+    (LRM table 4-6: a negative exponent gives 0 unless the base is 1 or -1),
+    each wrapped to 32 bits."""
     x, y, op = int(a) & 0xffffffff, int(b), int(op)
     sx = x - (1 << 32) if x & 0x80000000 else x
     yu = y & 0xffffffff
@@ -206,8 +208,22 @@ def _py_ibit(a, b, op, *_site):
         r = 0 if not 0 <= y < 32 else x >> y
     elif op == 6:
         r = (-1 if sx < 0 else 0) if not 0 <= y < 32 else sx >> y
-    else:
+    elif op == 7:
         r = ~x
+    elif op == 8:
+        r = x + yu
+    elif op == 9:
+        r = x - yu
+    elif op == 10:
+        r = x * yu
+    elif op == 11:
+        r = -x
+    else:
+        sy = yu - (1 << 32) if yu & 0x80000000 else yu
+        if sy < 0:
+            r = 1 if sx == 1 else ((-1 if sy % 2 else 1) if sx == -1 else 0)
+        else:
+            r = pow(x, sy, 1 << 32)
     r &= 0xffffffff
     return float(r - (1 << 32) if r & 0x80000000 else r)
 
@@ -225,7 +241,11 @@ _IBIT_CORE = (
     'case 3: r = ~(ux ^ uy); break; case 4: r = far ? 0u : (ux << y); break; '
     'case 5: r = far ? 0u : (ux >> y); break; '
     'case 6: r = far ? (sx < 0 ? ~0u : 0u) : (unsigned)(sx >> y); break; '
-    'default: r = ~ux; } return (long long)(int)r; }'
+    'case 7: r = ~ux; break; case 8: r = ux + uy; break; case 9: r = ux - uy; break; '
+    'case 10: r = ux * uy; break; case 11: r = 0u - ux; break; '
+    'default: { int sy = (int)uy; if (sy < 0) r = (sx == 1) ? 1u : (sx == -1 ? ((sy & 1) ? ~0u : 1u) : 0u); '
+    'else { unsigned b = ux; r = 1u; while (sy) { if (sy & 1) r *= b; b *= b; sy >>= 1; } } } } '
+    'return (long long)(int)r; }'
 )
 _IBIT_CPP = 'static inline double _vae_ibit(double a,double b,int op){ return (double)_vae_ibit_i((long long)a,(long long)b,op); }'
 # ... and C++ for the generated eval code (doubles holding integer values).

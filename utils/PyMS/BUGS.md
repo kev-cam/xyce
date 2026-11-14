@@ -19,7 +19,7 @@ VACASK: `/opt/build.VACASK/Release/simulator/vacask` (openvaf-r compiles the
 first on PATH). Every test in `vae/tests/` runs as a plain script
 (`python3 vae/tests/test_x.py`) and makes its own caches.
 
-Contents: CHANGES (1.1.10, 1.1.9, 1.1.8, 1.1.7, 1.1.6, 1.1.5, 1.1.4, 1.1.3, 1.1.2, 1.1.1, 1.1.0) · A. silent wrong answers · B. loud failures of
+Contents: CHANGES (1.1.11, 1.1.10, 1.1.9, 1.1.8, 1.1.7, 1.1.6, 1.1.5, 1.1.4, 1.1.3, 1.1.2, 1.1.1, 1.1.0) · A. silent wrong answers · B. loud failures of
 legal Verilog-A · C. decisions and strictness · D. error messages ·
 E. caches and installation · F. upstream (openvaf-r/VACASK) · G. vamos
 follow-up.
@@ -27,6 +27,23 @@ follow-up.
 ---------------------------------------------------------------------------
 
 ## CHANGES
+
+### 1.1.11 (2026-11-14)
+
+- B29 (silent): an integer `+ - *`, unary `-` or `**` in the analog block did not wrap at 32 bits (the integer is
+  a double there), and a product past 2**53 was not even exact: `((a >> 1) + 1004) / 2` with a = -8 was 1073742324,
+  not -1073741324. int_ops.py rewrites each such operation on integer operands to the B28 helper,
+  `_vae_ibit(a, b, code)` with codes 8 `+`, 9 `-`, 10 `*`, 11 unary `-`, 12 `**`, computed on 32-bit unsigned
+  patterns; `**` follows LRM table 4-6 (a negative exponent gives 0 unless the base is 1 or -1), as va_const does
+  for the parameter defaults. A negated literal stays a literal, and the arithmetic inside an array index is left as
+  written (a wrap has no use there). The integer `**` of the analog block did not build before at all (it reached
+  the C++ as `**`). test_int_wrap; the C++ core and the Python fold agree on 20000 random operand/code triples.
+- B30 (loud): a real `a ** b` in the analog block reached the C++ as `**` and did not build ("invalid type argument
+  of unary '*'"); int_ops.py writes it as `pow ( a , b )`. test_int_wrap (the last two outputs).
+- F11 filed: openvaf-r's integer `**` (upstream/vacask/int_power). VACASK agrees with 1.1.11 on every `+ - *` and
+  unary `-` case of test_int_wrap and on the real powers.
+
+Gate (measured, 1.1.11): vae/tests 69/69 modules (456 tests) on the chain; tests/vamos 90/90 modules (3433 tests) and hazard3 3/3 against the landed tree and the installed copy; the corpus at 27 C 101 / 87 / 83, the same as 1.1.9 with every printed value equal (rel. 1e-12), 35 of the 83 running models (PSP 102/103, BSIM-CMG, BSIM-SOI, BSIM6, HICUM, L-UTSOI, VBIC, EKV, sg13g2 r3_cmc) carrying the new wrap (run before the in-range-literal exemption, which only keeps 1.1.9 text). The deck families were not rerun.
 
 ### 1.1.10 (2026-11-13)
 
@@ -1715,14 +1732,21 @@ same expressions in parameter defaults were not tried here.
 
 ### B29. Integer + - * do not wrap at 32 bits
 
-Open, low priority (found with B28). The analog block carries an integer
-as a double, so an integer sum, difference or product past 32 bits keeps
+FIXED in 1.1.11 (CHANGES 1.1.11; test_int_wrap). Was: open, low priority
+(found with B28). The analog block carries an integer
+as a double, so an integer sum, difference or product past 32 bits kept
 growing where Verilog-A (and VACASK) wraps: `r = (a >> 1) + 1004` with
-a = -8 (2147483644 + 1004) is 2147484648 in PyMS 1.1.10, -2147482648 in
-VACASK (measured 2026-11-13). No case is known that depends on
-the wrap (not searched for). A fix would wrap every integer + - * through a helper (as
-int_ops does for / and %), which touches every integer loop counter, so
-it waits for a case that needs it.
+a = -8 (2147483644 + 1004) was 2147484648 in PyMS 1.1.10, -2147482648 in
+VACASK (measured 2026-11-13). The integer `**` of the analog block did not
+build at all.
+
+### B30. A real ** in analog code does not build
+
+FIXED in 1.1.11 (CHANGES 1.1.11; test_int_wrap). Was: found 2026-11-14
+while testing B29. `V(p, n) <+ x ** 3.0` (x real) reached the generated
+ginac.cpp as `x ** 3.0`: "invalid type argument of unary '*' (have
+'double')", the device refused. pow(x, 3.0) worked; parameter defaults
+(va_const) handled `**` already.
 
 ---------------------------------------------------------------------------
 
@@ -2062,6 +2086,14 @@ analytic value, by Xyce's ADMS build of the model, or by another engine.
   openvaf-r refuses `>>>` ("unexpected token '>>>'"); IEEE 1364-2005 has
   it, but no Verilog-AMS LRM copy was at hand to confirm Verilog-AMS
   includes it, so it is not reported upstream yet.
+- F11. DEFECT, `upstream/vacask/int_power/`: openvaf-r's integer `**` does
+  not follow LRM table 4-6 and folds a constant power unlike its run time.
+  `2 ** -1` gives 1 (expected 0) in the analog block and in a parameter
+  default; `3 ** 40` gives a different value folded (whole expression
+  2147483647) than at run time (0); expected 689956897 (32-bit two's
+  complement) both ways. Measured 2026-11-14, VACASK 0.3.4-91-g64489cf7,
+  openvaf-r 20260616-3-g0e83f1ed. PyMS 1.1.11 gives 1000 for all four
+  outputs (1.1.10 could not build the analog-block module, B29).
 
 ---------------------------------------------------------------------------
 

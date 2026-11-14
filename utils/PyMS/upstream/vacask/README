@@ -8,3 +8,4 @@ Expected values are analytic. Nothing here is built or run by Xyce's build.
   thermal_own_node_op/  informational: default op tolerance leaves 1.7e-5 on a self-heating loop
   c_ammeter_double/     DEFECT: the flow I(br) of a V(br) <+ 0 branch read in another contribution is 0
   int_bitwise_not/      DEFECT: openvaf-r compiles ~ on an integer as -x (~1000 + 2001 gives 1001)
+  int_power/            DEFECT: openvaf-r integer ** ignores LRM table 4-6 (2 ** -1 gives 1) and folds 3 ** 40 unlike its run time
