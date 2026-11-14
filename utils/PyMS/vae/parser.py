@@ -252,8 +252,10 @@ _TOKEN_PATTERNS = [
     # u n p f a) belongs to the number, so ``1a`` and ``1K`` are one token.
     ('NUMBER', r'[+-]?(?:\d[\d_]*\.?[\d_]*|\.\d[\d_]*)(?:[eE][+-]?\d[\d_]*)?(?:[TGMKkmunpfa])?'),
     ('IDENT', r'[A-Za-z_\$`][A-Za-z0-9_\$]*'),
-    # The two-character operators are single tokens (``>=`` was ``>`` ``=``).
-    ('OP', r'\*\*|<<|>>|<=|>=|==|!=|&&|\|\||[+\-*/%(){},;:=<>!&|~\[\]@^?.]'),
+    # The two-character operators are single tokens (``>=`` was ``>`` ``=``),
+    # and so are the arithmetic shifts and the xnor (1.1.10, BUGS.md B28:
+    # ``>>>`` was ``>>`` ``>``).
+    ('OP', r'\*\*|<<<|>>>|<<|>>|\^~|~\^|<=|>=|==|!=|&&|\|\||[+\-*/%(){},;:=<>!&|~\[\]@^?.]'),
     ('WS', r'\s+'),
 ]
 

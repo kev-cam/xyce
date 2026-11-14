@@ -9,4 +9,4 @@ personality) can require a minimum version instead of guarding every
 Verilog-A form itself.  Bump it with every change in behaviour.
 """
 
-__version__ = '1.1.9'
+__version__ = '1.1.10'

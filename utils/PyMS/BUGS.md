@@ -19,7 +19,7 @@ VACASK: `/opt/build.VACASK/Release/simulator/vacask` (openvaf-r compiles the
 first on PATH). Every test in `vae/tests/` runs as a plain script
 (`python3 vae/tests/test_x.py`) and makes its own caches.
 
-Contents: CHANGES (1.1.9, 1.1.8, 1.1.7, 1.1.6, 1.1.5, 1.1.4, 1.1.3, 1.1.2, 1.1.1, 1.1.0) · A. silent wrong answers · B. loud failures of
+Contents: CHANGES (1.1.10, 1.1.9, 1.1.8, 1.1.7, 1.1.6, 1.1.5, 1.1.4, 1.1.3, 1.1.2, 1.1.1, 1.1.0) · A. silent wrong answers · B. loud failures of
 legal Verilog-A · C. decisions and strictness · D. error messages ·
 E. caches and installation · F. upstream (openvaf-r/VACASK) · G. vamos
 follow-up.
@@ -27,6 +27,22 @@ follow-up.
 ---------------------------------------------------------------------------
 
 ## CHANGES
+
+### 1.1.10 (2026-11-13)
+
+- B28 (loud): an integer bitwise or shift operation in the analog block (`r = (a >> 1) + 1004`, `~a`, `a << 2`,
+  `a & b`, `a | b`, `a ^ b`, `a ^~ b`, `a >>> 1`) made the generated ginac.cpp fail to compile (the integer is a
+  double there), and parser.py split `>>>` into `>>` `>`: the module was refused. int_ops.py rewrites each such
+  operation on integer operands to `_vae_ibit(a, b, code)`, with 32-bit semantics (`>>` logical, `>>>` arithmetic,
+  `~` the bitwise negation; a shift by 32 or more, or by a negative count, gives 0, and -1 for `>>>` of a negative);
+  ginac_emitter.py folds it in Python at elaboration (_py_ibit), holds it as the GiNaC function vae_ibit (slope 0)
+  and prints the C++ helper (_IBIT_CORE) in the eval code; dual_ad.py's dual number converts to long long, so the
+  dual copy overloads the helper. parser.py tokenizes `>>>` `<<<` `^~` `~^` as single operators. The same text in a
+  parameter default already worked (va_const). test_int_bitwise.
+- Not changed: integer `+ - *` still do not wrap at 32 bits (the integer is a double): `(a >> 1) + 1004` with
+  a = -8 is 2147484648 (2.14748465e+09 printed), where VACASK wraps to -2147482648 (B29).
+
+Gate (measured, 1.1.10): vae/tests 68/68 modules (452 tests) on the chain; tests/vamos 90/90 modules (3433 tests) against the landed tree and the installed copy, hazard3 3/3. The deck families and the corpus were not rerun (the rewrite applies only to integer bitwise/shift operations in analog code, which did not build before; the tokenizer change affects `>>>` `<<<` `^~` `~^`, and `a ^ ~b` already equalled `a ^~ b`).
 
 ### 1.1.9 (2026-11-09)
 
@@ -1669,7 +1685,8 @@ refuse the extra parameters.
 
 ### B28. Integer bitwise and shift operators in analog code do not build
 
-Open (found 2026-11-13 while writing the F9 case). An integer variable
+FIXED in 1.1.10 (CHANGES 1.1.10; test_int_bitwise). Was: open (found
+2026-11-13 while writing the F9 case). An integer variable
 assigned from a bitwise or shift expression in the analog block makes
 the generated `ginac.cpp` fail to compile, so the device is refused
 ("build_vae_so: ... did not build", "Netlist error"). Module, through the
@@ -1695,6 +1712,17 @@ need the operands cast to a 32-bit integer (and `>>` done on the unsigned
 pattern, `>>>` as the signed shift). Loud, so no silent wrong answer.
 Test: one module per row, each 1000 (or -2147482648) at the op. The
 same expressions in parameter defaults were not tried here.
+
+### B29. Integer + - * do not wrap at 32 bits
+
+Open, low priority (found with B28). The analog block carries an integer
+as a double, so an integer sum, difference or product past 32 bits keeps
+growing where Verilog-A (and VACASK) wraps: `r = (a >> 1) + 1004` with
+a = -8 (2147483644 + 1004) is 2147484648 in PyMS 1.1.10, -2147482648 in
+VACASK (measured 2026-11-13). No case is known that depends on
+the wrap (not searched for). A fix would wrap every integer + - * through a helper (as
+int_ops does for / and %), which touches every integer loop counter, so
+it waits for a case that needs it.
 
 ---------------------------------------------------------------------------
 
@@ -2022,8 +2050,8 @@ analytic value, by Xyce's ADMS build of the model, or by another engine.
   the analog block and in a parameter default: VACASK 1001 (= -1000 +
   2001); expected 1000 (~1000 = -1001). VACASK's own netlist evaluator gives
   1000 for the same expression (the deck's control). Measured 2026-11-13,
-  VACASK 0.3.4-91-g64489cf7, openvaf-r 20260616. PyMS cannot build the
-  module (B28).
+  VACASK 0.3.4-91-g64489cf7, openvaf-r 20260616. PyMS 1.1.10 gives 1000
+  (1.1.9 could not build the module, B28).
 - F10. Notes on shifts (2026-11-13, same builds), not filed as defects:
   openvaf-r gets `>>` right (`(-8 >> 1) + 1004` = -2147482648, a logical
   shift, in the analog block and in a parameter default); an earlier note

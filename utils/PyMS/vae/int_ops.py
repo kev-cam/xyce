@@ -17,7 +17,9 @@ those exactly (Python at elaboration, a GiNaC function in the metaprogram, a
 C++ helper in the generated eval code).  An assignment of a real expression
 to an integer variable is marked (ASTNode.int_lhs) and rounded there.  A text
 the typer cannot read (an array index, a hierarchical name) is left as it
-was; no other text changes, so a module without integer division compiles
+was.  Since 1.1.10 an integer bitwise or shift operation (``& | ^ ^~ << >>
+<<< >>> ~``) is rewritten to ``_vae_ibit ( a , b , code )`` the same way, with
+32-bit semantics (BUGS.md B28).  No other text changes, so a module without integer division compiles
 to the same program as before.
 """
 
@@ -238,14 +240,36 @@ def _type(n, types, ftypes):
         n.type = 'int' if a == 'int' and b == 'int' else 'real'
 
 
+# The bitwise and shift operators on integers (1.1.10, BUGS.md B28): one
+# helper, _vae_ibit(a, b, code), with 32-bit semantics -- >> logical, >>>
+# arithmetic, ~ the bitwise negation.  The codes are those of the helper
+# (ginac_emitter._IBIT_CORE).  Before, the text reached C++ / GiNaC on
+# doubles and the module did not build.
+_IBIT_CODE = {'&': 0, '|': 1, '^': 2, '^~': 3, '~^': 3, '<<': 4, '<<<': 4, '>>': 5, '>>>': 6}
+_IBIT_NOT = 7
+
+
+def _is_ibit(n):
+    if n.kind == 'un' and n.op == '~' and n.kids[0].type == 'int':
+        return True
+    return (n.kind == 'bin' and n.op in _IBIT_CODE
+            and n.kids[0].type == 'int' and n.kids[1].type == 'int')
+
+
 def _render(n, toks):
     """The text of n with every integer / and % below it rewritten (and a
-    based literal as its decimal value)."""
+    based literal as its decimal value, and an integer bitwise or shift
+    operation as _vae_ibit)."""
     if n.kind == 'num' and n.op == 'based':
         return str(n.value)
     if n.kind == 'bin' and n.op in ('/', '%') and n.kids[0].type == 'int' and n.kids[1].type == 'int':
         fn = '_vae_idiv' if n.op == '/' else '_vae_imod'
         return f'{fn} ( {_render(n.kids[0], toks)} , {_render(n.kids[1], toks)} )'
+    if _is_ibit(n):
+        if n.kind == 'un':
+            return f'_vae_ibit ( {_render(n.kids[0], toks)} , 0 , {_IBIT_NOT} )'
+        return (f'_vae_ibit ( {_render(n.kids[0], toks)} , {_render(n.kids[1], toks)} , '
+                f'{_IBIT_CODE[n.op]} )')
     parts, pos = [], n.s
     for c in sorted(n.kids, key=lambda c: c.s):
         parts.extend(v for _, v in toks[pos:c.s])
@@ -259,6 +283,8 @@ def _has_int_div(n):
     if n.kind == 'bin' and n.op in ('/', '%') and n.kids[0].type == 'int' and n.kids[1].type == 'int':
         return True
     if n.kind == 'num' and n.op == 'based':
+        return True
+    if _is_ibit(n):
         return True
     return any(_has_int_div(c) for c in n.kids)
 

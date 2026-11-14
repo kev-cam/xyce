@@ -118,6 +118,12 @@ class VersionTests(unittest.TestCase):
         # module's own TEMP to the circuit temperature is taken).
         self.assertGreaterEqual(tuple(int(x) for x in vae.__version__.split('.')), (1, 1, 9))
 
+    def test_version_carries_the_b28_fix(self):
+        # 1.1.10 (2026-11-13): the integer bitwise and shift operators of the
+        # analog block build (>> logical, >>> arithmetic, ~, <<, &, |, ^, ^~),
+        # and >>> <<< ^~ ~^ are single tokens (BUGS.md B28).
+        self.assertGreaterEqual(tuple(int(x) for x in vae.__version__.split('.')), (1, 1, 10))
+
     def test_version_file_agrees(self):
         with open(VERSION_FILE) as f:
             text = f.read()

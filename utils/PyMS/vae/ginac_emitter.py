@@ -185,7 +185,49 @@ def _py_rint(x):
     return r if x >= 0 else -r
 
 
-_INT_HELPERS_PY = {'_vae_idiv': _py_idiv, '_vae_imod': _py_imod, '_vae_rint': _py_rint}
+def _py_ibit(a, b, op, *_site):
+    """An integer bitwise or shift operation on 32-bit integers (int_ops
+    _IBIT_CODE): 0 &, 1 |, 2 ^, 3 ^~, 4 <<, 5 >> (logical), 6 >>>
+    (arithmetic), 7 ~a."""
+    x, y, op = int(a) & 0xffffffff, int(b), int(op)
+    sx = x - (1 << 32) if x & 0x80000000 else x
+    yu = y & 0xffffffff
+    if op == 0:
+        r = x & yu
+    elif op == 1:
+        r = x | yu
+    elif op == 2:
+        r = x ^ yu
+    elif op == 3:
+        r = ~(x ^ yu)
+    elif op == 4:
+        r = 0 if not 0 <= y < 32 else x << y
+    elif op == 5:
+        r = 0 if not 0 <= y < 32 else x >> y
+    elif op == 6:
+        r = (-1 if sx < 0 else 0) if not 0 <= y < 32 else sx >> y
+    else:
+        r = ~x
+    r &= 0xffffffff
+    return float(r - (1 << 32) if r & 0x80000000 else r)
+
+
+_INT_HELPERS_PY = {'_vae_idiv': _py_idiv, '_vae_imod': _py_imod, '_vae_rint': _py_rint,
+                   '_vae_ibit': _py_ibit}
+# The C++ of _vae_ibit (the eval code and the metaprogram): the core on
+# integers, and the double form the expressions call.  The dual copy of the
+# eval code (dual_ad) overloads the double form on _vd, whose value converts
+# with its explicit long long operator; the result has no slope.
+_IBIT_CORE = (
+    'static inline long long _vae_ibit_i(long long x,long long y,int op){ unsigned ux = (unsigned)x, uy = (unsigned)y; '
+    'int sx = (int)ux; bool far = (y < 0 || y >= 32); unsigned r; switch (op) { '
+    'case 0: r = ux & uy; break; case 1: r = ux | uy; break; case 2: r = ux ^ uy; break; '
+    'case 3: r = ~(ux ^ uy); break; case 4: r = far ? 0u : (ux << y); break; '
+    'case 5: r = far ? 0u : (ux >> y); break; '
+    'case 6: r = far ? (sx < 0 ? ~0u : 0u) : (unsigned)(sx >> y); break; '
+    'default: r = ~ux; } return (long long)(int)r; }'
+)
+_IBIT_CPP = 'static inline double _vae_ibit(double a,double b,int op){ return (double)_vae_ibit_i((long long)a,(long long)b,op); }'
 # ... and C++ for the generated eval code (doubles holding integer values).
 # The run-time messages of the eval code (since 1.1.4): a warning is queued
 # (vae_take_message) and an error kept (vae_take_error); the device shell
@@ -228,6 +270,8 @@ def _int_helpers_cpp(n_sites: int) -> tuple:
         'static inline double _vae_idiv(double a,double b,int site=-1){ if (b==0.0) { _vae_div0(site); return 0.0; } return std::trunc(a/b); }',
         'static inline double _vae_imod(double a,double b,int site=-1){ if (b==0.0) { _vae_div0(site); return 0.0; } return a-b*std::trunc(a/b); }',
         'static inline double _vae_rint(double x){ return x>=0.0 ? std::floor(x+0.5) : -std::floor(-x+0.5); }',
+        _IBIT_CORE,
+        _IBIT_CPP,
     )
 
 
@@ -236,6 +280,8 @@ _INT_HELPERS_CPP = (
     'static inline double _vae_idiv(double a,double b,int site=-1){ return b==0.0 ? 0.0 : std::trunc(a/b); }',
     'static inline double _vae_imod(double a,double b,int site=-1){ return b==0.0 ? 0.0 : a-b*std::trunc(a/b); }',
     'static inline double _vae_rint(double x){ return x>=0.0 ? std::floor(x+0.5) : -std::floor(-x+0.5); }',
+    _IBIT_CORE,
+    _IBIT_CPP,
 )
 
 # A current probe in Verilog-A expression text: I(a, b), I(br) or the port
@@ -664,7 +710,7 @@ class GiNaCEmitter:
         'ln', 'log', 'exp', 'sqrt', 'pow', 'abs', 'min', 'max', 'floor', 'ceil', 'sin', 'cos',
         'tan', 'asin', 'acos', 'atan', 'atan2', 'sinh', 'cosh', 'tanh', 'asinh', 'acosh',
         'atanh', 'hypot', 'limexp', 'lexp', 'lln', 'hypsmooth', 'hypmax', 'Tempdep',
-        '_vae_idiv', '_vae_imod', '_vae_rint', '$simparam', '$mfactor',
+        '_vae_idiv', '_vae_imod', '_vae_rint', '_vae_ibit', '$simparam', '$mfactor',
         '$param_given', '$port_connected', '$strobe', '$display', '$write', '$fstrobe',
         '$fwrite', '$fdisplay', '$warning', '$debug', '$finish', '$stop'))
 
@@ -1675,6 +1721,16 @@ class GiNaCEmitter:
         lines.append('static void vae_idiv_print(const ex& a, const ex& b, const ex& s, const print_context& c) { c.s << "_vae_idiv("; a.print(c); c.s << ","; b.print(c); c.s << ",(int)"; s.print(c); c.s << ")"; }')
         lines.append('static void vae_imod_print(const ex& a, const ex& b, const ex& s, const print_context& c) { c.s << "_vae_imod("; a.print(c); c.s << ","; b.print(c); c.s << ",(int)"; s.print(c); c.s << ")"; }')
         lines.append('static void vae_rint_print(const ex& x, const print_context& c) { c.s << "_vae_rint("; x.print(c); c.s << ")"; }')
+        # the integer bitwise and shift operations (1.1.10, BUGS.md B28):
+        # vae_ibit(a, b, code), folded when a and b are numbers, else held
+        lines.append(_IBIT_CORE)
+        lines.append('DECLARE_FUNCTION_3P(vae_ibit)')
+        lines.append('static ex vae_ibit_eval(const ex& a, const ex& b, const ex& k) {')
+        lines.append('    if (is_a<numeric>(a) && is_a<numeric>(b) && is_a<numeric>(k)) return numeric((long)_vae_ibit_i((long long)ex_to<numeric>(a).to_double(), (long long)ex_to<numeric>(b).to_double(), (int)ex_to<numeric>(k).to_double()));')
+        lines.append('    return vae_ibit(a, b, k).hold();')
+        lines.append('}')
+        lines.append('static void vae_ibit_print(const ex& a, const ex& b, const ex& k, const print_context& c) { c.s << "_vae_ibit("; a.print(c); c.s << ","; b.print(c); c.s << ",(int)"; k.print(c); c.s << ")"; }')
+        lines.append('REGISTER_FUNCTION(vae_ibit, eval_func(vae_ibit_eval).derivative_func(vae_int_deriv3).print_func<print_csrc_double>(vae_ibit_print))')
         lines.append('REGISTER_FUNCTION(vae_idiv, eval_func(vae_idiv_eval).derivative_func(vae_int_deriv3).print_func<print_csrc_double>(vae_idiv_print))')
         lines.append('REGISTER_FUNCTION(vae_imod, eval_func(vae_imod_eval).derivative_func(vae_int_deriv3).print_func<print_csrc_double>(vae_imod_print))')
         lines.append('REGISTER_FUNCTION(vae_rint, eval_func(vae_rint_eval).derivative_func(vae_int_deriv1).print_func<print_csrc_double>(vae_rint_print))')
@@ -3585,7 +3641,7 @@ class GiNaCEmitter:
         for va_name, ginac_name in _VA_TO_GINAC.items():
             result = re.sub(rf'\b{va_name}\b(?=\s*\()', ginac_name, result)
         # integer / % and the integer rounding -> the metaprogram's GiNaC functions
-        result = re.sub(r'\b_vae_(idiv|imod|rint)\b(?=\s*\()', r'vae_\1', result)
+        result = re.sub(r'\b_vae_(idiv|imod|rint|ibit)\b(?=\s*\()', r'vae_\1', result)
         # min/max → _vae_min/_vae_max (GiNaC-compatible helpers, avoid name collision)
         result = re.sub(r'\bmin\b(?=\s*\()', '_vae_min', result)
         result = re.sub(r'\bmax\b(?=\s*\()', '_vae_max', result)
@@ -3683,7 +3739,7 @@ class GiNaCEmitter:
         _skip = set(_VA_TO_GINAC.values()) | {'numeric', 'ex', VT_SYM, T_SYM}
         _skip |= {f'V_{n}' for n in self.all_nodes}
         _skip |= {'_vae_min', '_vae_max', 'hypsmooth', 'hypmax', 'Tempdep',
-                  'vae_idiv', 'vae_imod', 'vae_rint'}
+                  'vae_idiv', 'vae_imod', 'vae_rint', 'vae_ibit'}
         _skip |= self.instance_params
         def _subst_known(m):
             name = m.group(0)

@@ -22,5 +22,5 @@ Observed (2026-11-13), exit 1:
 1001 = -1000 + 2001: openvaf-r compiles ~ on an integer as the arithmetic
 negation. VACASK's netlist evaluator gets it right, so the defect is in
 openvaf-r. Expected: exit 0.
-PyMS 1.1.9 does not build bnot.va at all (BUGS.md B28), so there is no Xyce
-reference value; 1000 is the analytic one.
+Xyce through PyMS 1.1.10 gives 1000 (1.1.9 could not build bnot.va,
+BUGS.md B28).

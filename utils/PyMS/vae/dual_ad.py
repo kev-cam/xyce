@@ -432,6 +432,7 @@ struct _vd {
     inline explicit _vd(_noinit) {}
     explicit operator double() const { return v; }
     explicit operator int() const { return (int)v; }
+    explicit operator long long() const { return (long long)v; }
     explicit operator bool() const { return v != 0.0; }
     inline _vd& operator+=(const _vd& b) { v += b.v; for (int i = 0; i < NT; ++i) d[i] += b.d[i]; return *this; }
     inline _vd& operator-=(const _vd& b) { v -= b.v; for (int i = 0; i < NT; ++i) d[i] -= b.d[i]; return *this; }
