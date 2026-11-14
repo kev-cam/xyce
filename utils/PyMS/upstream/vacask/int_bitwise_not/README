@@ -1,0 +1,26 @@
+Bitwise not of an integer: openvaf-r computes ~x as -x.
+
+  r = ~a + 2001;                          // bnot.va, analog block, a = 1000
+  parameter integer rn = ~a + 2001;       // bnotp.va, parameter default
+
+~ is the bitwise negation (IEEE 1364-2005 5.1.10, which Verilog-AMS takes its
+integer operators from). In 32-bit two's complement ~1000 = -1001, so both
+expressions are 1000. Each module drives V(p, n) <+ r into a 1k load; the
+operating point reads it. The deck's third source evaluates the same
+expression in VACASK's own netlist language as a control.
+
+Command (VACASK 0.3.4-91-g64489cf7, openvaf-r 20260616-3-g0e83f1ed, from this
+directory):
+  SIM_TEST=yes SIM_OPENVAF=<openvaf-r> PYTHONPATH=<VACASK>/python \
+    SIM_MODULE_PATH=<build>/devices vacask test_int_bitwise_not.sim
+
+Observed (2026-11-13), exit 1:
+  analog block: r = ~a + 2001      v = 1001   expected 1000   WRONG
+  parameter default: ~a + 2001     v = 1001   expected 1000   WRONG
+  netlist dc=~b + 2001 (control)   v = 1000   expected 1000   ok
+
+1001 = -1000 + 2001: openvaf-r compiles ~ on an integer as the arithmetic
+negation. VACASK's netlist evaluator gets it right, so the defect is in
+openvaf-r. Expected: exit 0.
+PyMS 1.1.9 does not build bnot.va at all (BUGS.md B28), so there is no Xyce
+reference value; 1000 is the analytic one.

@@ -1,0 +1,9 @@
+// The same expression in a parameter default: rn = ~1000 + 2001 = 1000.
+`include "disciplines.vams"
+module bnotp(p, n);
+  inout p, n;
+  electrical p, n;
+  parameter integer a = 1000;
+  parameter integer rn = ~a + 2001;
+  analog V(p, n) <+ rn;
+endmodule

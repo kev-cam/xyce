@@ -1667,6 +1667,35 @@ Resistor runs PyMS's simple R stamp, which uses only the value parameter:
 such a module through the full eval when it reads other parameters, or
 refuse the extra parameters.
 
+### B28. Integer bitwise and shift operators in analog code do not build
+
+Open (found 2026-11-13 while writing the F9 case). An integer variable
+assigned from a bitwise or shift expression in the analog block makes
+the generated `ginac.cpp` fail to compile, so the device is refused
+("build_vae_so: ... did not build", "Netlist error"). Module, through the
+Y route (`.hdl`, `.model mm opN`, `yopN x1 o1 0 mm`, 1k load, `.op`):
+
+    parameter integer a = -8;   // a = 1000 for ~
+    integer r;
+    analog begin r = <expr>; V(p, n) <+ r; end
+
+| expr | expected | g++ error |
+|---|---|---|
+| `(a >> 1) + 1004` | -2147482648 (logical shift, 32-bit wrap) | invalid operands of types 'double' and 'int' to binary 'operator>>' |
+| `(a >>> 1) + 1004` | 1000 | expected primary-expression before '>' token (emitted verbatim) |
+| `~a + 2001` | 1000 | wrong type argument to bit-complement |
+| `(a << 2) + 1032` | 1000 | ... 'operator<<' |
+| `(a & 12) + 992` | 1000 | ... 'operator&' |
+| `(a \| 3) + 1005` | 1000 | ... 'operator\|' |
+| `(a ^ 5) + 1011` | 1000 | ... 'operator^' |
+| `(a % 3) + 1002` | 1000 | builds, 1000 (right) |
+
+The integer is carried as a double in the emitted code; the operators
+need the operands cast to a 32-bit integer (and `>>` done on the unsigned
+pattern, `>>>` as the signed shift). Loud, so no silent wrong answer.
+Test: one module per row, each 1000 (or -2147482648) at the op. The
+same expressions in parameter defaults were not tried here.
+
 ---------------------------------------------------------------------------
 
 ## C. Decisions and strictness
@@ -1988,6 +2017,23 @@ analytic value, by Xyce's ADMS build of the model, or by another engine.
   (F2: 1.7e-5 on a thermal resistor). First step: rerun VACASK with
   reltol=1e-12 vntol=1e-15 abstol=1e-18; if the gap stays, print both
   engines' Vt and internal node voltages at one bias.
+- F9. DEFECT, `upstream/vacask/int_bitwise_not/`: openvaf-r compiles `~` on
+  an integer as the arithmetic negation. `r = ~a + 2001` with a = 1000, in
+  the analog block and in a parameter default: VACASK 1001 (= -1000 +
+  2001); expected 1000 (~1000 = -1001). VACASK's own netlist evaluator gives
+  1000 for the same expression (the deck's control). Measured 2026-11-13,
+  VACASK 0.3.4-91-g64489cf7, openvaf-r 20260616. PyMS cannot build the
+  module (B28).
+- F10. Notes on shifts (2026-11-13, same builds), not filed as defects:
+  openvaf-r gets `>>` right (`(-8 >> 1) + 1004` = -2147482648, a logical
+  shift, in the analog block and in a parameter default); an earlier note
+  that it shifted arithmetically came from VACASK's NETLIST language, where
+  `dc=(a >> 1) + 1004` with a = -8 gives 1000 (a C-style arithmetic shift).
+  That is VACASK's own expression language, not Verilog-A; vamos should
+  not map a Spectre `>>` there without checking Spectre's semantics.
+  openvaf-r refuses `>>>` ("unexpected token '>>>'"); IEEE 1364-2005 has
+  it, but no Verilog-AMS LRM copy was at hand to confirm Verilog-AMS
+  includes it, so it is not reported upstream yet.
 
 ---------------------------------------------------------------------------
 

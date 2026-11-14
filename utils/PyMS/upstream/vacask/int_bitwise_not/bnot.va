@@ -1,0 +1,13 @@
+// Bitwise negation of an integer (~ is the bitwise negation, as in IEEE 1364-2005 5.1.10).
+// a = 1000: ~a = -1001 (two's complement), + 2001 = 1000.
+`include "disciplines.vams"
+module bnot(p, n);
+  inout p, n;
+  electrical p, n;
+  parameter integer a = 1000;
+  integer r;
+  analog begin
+    r = ~a + 2001;
+    V(p, n) <+ r;
+  end
+endmodule
