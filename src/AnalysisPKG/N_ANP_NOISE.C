@@ -2127,6 +2127,25 @@ bool extractNOISEData(
     p_err = linePosition;
   }
 
+  if (p_err != 0)
+  {
+    Report::UserError0().at(netlist_filename, parsed_line[p_err].lineNumber_) << msg.str();
+    return false;
+  }
+
+  // The fields that must follow the output are src, the sweep type, and then
+  // either pts fstart fstop or the "= name" of DATA=name.  They are counted
+  // from the end of the output, because the output is four fields as V(a) and
+  // six as V(a,b): the fixed counts of the check above are those of V(a), and
+  // with V(a,b) they let the fields below be read past the end of the line.
+  const int lastRequired = linePosition + (dataFound ? 3 : 4);
+  if (lastRequired >= numFields)
+  {
+    Report::UserError0().at(netlist_filename, parsed_line[0].lineNumber_)
+      << ".NOISE line has an unexpected number of fields.  NumFields = " << numFields;
+    return false;
+  }
+
   // source is required
   stringVal = parsed_line[linePosition].string_;
   stringVal.toUpper();
@@ -2173,8 +2192,10 @@ bool extractNOISEData(
   }
 
   // pts_per_summary is optional.  If value is negative, assume it wasn't set.
+  // It is there when a field follows the last required one (linePosition is
+  // lastRequired here), whichever form the output has.
   parameter.setTag( "PTS_PER_SUMMARY" );
-  if ( (!dataFound && numFields >= 11) || (dataFound && numFields >= 10) )
+  if ( linePosition + 1 < numFields )
   {
     ++linePosition;     // Advance to next parameter.
     parameter.setVal( parsed_line[linePosition].string_ );
