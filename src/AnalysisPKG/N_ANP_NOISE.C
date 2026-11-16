@@ -1260,7 +1260,11 @@ void NOISE::setupAdjointRHS_()
     {
       double val=1.0;
       if (iout>0) val=-1.0;
-      bNoiseVecRealPtr->setElementByGlobalIndex( tmpGID, val, 0);
+      // summed, not set: with one node given twice, V(a,a), the +1 and the -1
+      // land on one row and the output is zero, where setting left the -1 and
+      // gave the noise of V(a).  The vector was zeroed above, so two different
+      // nodes get the same +1 and -1 as before.
+      bNoiseVecRealPtr->sumElementByGlobalIndex( tmpGID, val, 0);
     }
   }
   bNoiseVecRealPtr->fillComplete();
