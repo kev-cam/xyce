@@ -2882,7 +2882,11 @@ bool Instance::updateIntermediateVars4p82_ ()
   ScalingFactor = 1.0e-9;
 
   // Don't do charge computations in DC sweeps.
-  if (getSolverState().tranopFlag || getSolverState().acopFlag || getSolverState().transientFlag || getSolverState().dcsweepFlag)
+  // Harmonic balance and MPDE (blockAnalysisFlag_) load this device like a transient: none of
+  // the transient/AC flags is set while the HB system is solved, and without the charges the
+  // device has no intrinsic capacitance in HB (only what is computed outside this block).
+  if (getSolverState().tranopFlag || getSolverState().acopFlag || getSolverState().transientFlag || getSolverState().dcsweepFlag
+      || getSolverState().blockAnalysisFlag_)
   {
     ChargeComputationNeeded = true;
   }
