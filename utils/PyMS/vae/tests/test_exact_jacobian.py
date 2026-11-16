@@ -206,6 +206,53 @@ class TestLibrary(unittest.TestCase):
         dF1, _ = L.jac(L.state([0.9, 0.0], an=1, phase=1, held=True))
         self.assertTrue(close(dF1[0][p], 0.5e-3), dF1)
 
+    def test_flat_branch_row_at_any_common_mode(self):
+        # (B31, 1.1.12) V(p, n) <+ tanh(V(p, n)) at V(p, n) = 0: every exact
+        # slope of the branch equation is 0, so the row takes the slopes of a
+        # neighbouring point.  They must be there at ANY potential of the two
+        # nodes: the deck of test_flat_branch_equation solves at V(p) = V(n)
+        # = 1 V.  1.1.5-1.1.11 took a central difference of the residual; where
+        # GiNaC printed it as tanh(-V_n+V_p)+V_n-V_p (its term order is the
+        # machine's) the cubic term 2.7e-18 fell below ulp(1) in (tanh(u) +
+        # V_n) - V_p and the row was exactly 0 off 0 V: a singular matrix.
+        for full in (False, True):
+            L = Lib(mod("v_tanh", "  analog V(p, n) <+ tanh(V(p, n));"), self.work, full=full)
+            p, n = L.nodes.index('p'), L.nodes.index('n')
+            bad = []
+            for vcm in (0.0, 1e-3, 0.5, 1.0, -3.0, 50.0, 1e3):
+                dF, dQ = L.jac(L.state([vcm, vcm], [0.0]))
+                sp, sn = dF[0][p], dF[0][n]
+                want = math.tanh(1e-6 * (abs(vcm) + 1.0)) ** 2    # |1 - tanh'| one step along V(p)
+                if not (sp * sn < 0.0 and close(sp, -sn, 1e-6) and close(abs(sp), want, 1e-2)
+                        and dF[0][L.n] == 0.0 and not any(dQ[0])):
+                    bad.append((full, vcm, dF[0]))
+            self.assertEqual(bad, [])
+
+    def test_flat_branch_row_of_even_order(self):
+        # V(p, n) <+ V(p, n) + V(p, n)**2: the residual is -V(p, n)**2, flat
+        # at its (double) root 0 and even about it, so a central difference
+        # is 0 there at any step.  The row of a neighbouring point is one
+        # consistent row, of opposite slopes in V(p) and V(n).
+        L = Lib(mod("v_sq", "  analog V(p, n) <+ V(p, n) + V(p, n) * V(p, n);"), self.work)
+        p, n = L.nodes.index('p'), L.nodes.index('n')
+        bad = []
+        for vcm in (0.0, 1.0, 50.0):
+            dF, _ = L.jac(L.state([vcm, vcm], [0.0]))
+            sp, sn = dF[0][p], dF[0][n]
+            if not (sp * sn < 0.0 and close(sp, -sn, 1e-6) and close(abs(sp), 2e-6 * (abs(vcm) + 1.0), 1e-2)):
+                bad.append((vcm, dF[0]))
+        self.assertEqual(bad, [])
+
+    def test_row_with_a_slope_is_left_alone(self):
+        # the neighbouring point is for a row with no slope at all: one small
+        # slope (1 - tanh'(1e-3) = 1e-6 here) keeps the exact row
+        L = Lib(mod("v_tanh", "  analog V(p, n) <+ tanh(V(p, n));"), self.work)
+        p, n = L.nodes.index('p'), L.nodes.index('n')
+        for vp, vn in ((3.0, 0.0), (1.0 + 1e-3, 1.0)):
+            dF, _ = L.jac(L.state([vp, vn], [0.0]))
+            want = math.tanh(vp - vn) ** 2
+            self.assertTrue(close(abs(dF[0][p]), want, 1e-9) and close(dF[0][p], -dF[0][n], 1e-12), dF)
+
 
 MOS = mod("m1", "  inout d, g, s, b;\n  electrical d, g, s, b, di;\n  real vgs, vds, ids, k;\n"
                "  analog begin\n    vgs = V(g, s); vds = V(di, s); k = 0; ids = 0;\n"
@@ -292,10 +339,14 @@ class TestXyce(unittest.TestCase):
     def test_flat_branch_equation(self):
         # V(p, n) <+ tanh(V(p, n)): the solution V(p, n) = 0 has an exactly
         # zero slope of its branch equation (1 - tanh'(0)); the exact
-        # Jacobian alone is singular there (VACASK fails), the central
-        # difference of that row lets Newton through: V(out) = 1
+        # Jacobian alone is singular there (VACASK fails), the row of a
+        # neighbouring point lets Newton through: V(out) = 1, with both nodes
+        # at 1 V (B31: the central difference of 1.1.5-1.1.11 was 0 there
+        # under one of GiNaC's term orders).  v_sq: the same at a double
+        # root, where a central difference is 0 by symmetry.
         from vae.tests._decks import run_decks
-        bad = run_decks({"v_tanh": (mod("v_tanh", "  analog V(p, n) <+ tanh(V(p, n));"), "", 1.0)},
+        bad = run_decks({"v_tanh": (mod("v_tanh", "  analog V(p, n) <+ tanh(V(p, n));"), "", 1.0),
+                         "v_sq": (mod("v_sq", "  analog V(p, n) <+ V(p, n) + V(p, n) * V(p, n);"), "", 1.0)},
                         "pyms_jacflat_")
         self.assertEqual(bad, [])
 

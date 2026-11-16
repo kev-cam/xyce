@@ -19,7 +19,7 @@ VACASK: `/opt/build.VACASK/Release/simulator/vacask` (openvaf-r compiles the
 first on PATH). Every test in `vae/tests/` runs as a plain script
 (`python3 vae/tests/test_x.py`) and makes its own caches.
 
-Contents: CHANGES (1.1.11, 1.1.10, 1.1.9, 1.1.8, 1.1.7, 1.1.6, 1.1.5, 1.1.4, 1.1.3, 1.1.2, 1.1.1, 1.1.0) · A. silent wrong answers · B. loud failures of
+Contents: CHANGES (1.1.12, 1.1.11, 1.1.10, 1.1.9, 1.1.8, 1.1.7, 1.1.6, 1.1.5, 1.1.4, 1.1.3, 1.1.2, 1.1.1, 1.1.0) · A. silent wrong answers · B. loud failures of
 legal Verilog-A · C. decisions and strictness · D. error messages ·
 E. caches and installation · F. upstream (openvaf-r/VACASK) · G. vamos
 follow-up.
@@ -27,6 +27,23 @@ follow-up.
 ---------------------------------------------------------------------------
 
 ## CHANGES
+
+### 1.1.12 (2026-11-15)
+
+- B31 (loud, on one machine): the row of a branch equation with no slope at all (A12's corner, `V(p, n) <+
+  tanh(V(p, n))` at V(p, n) = 0) took a central difference of the residual, step 1e-6 (|V| + 1). All it can see is
+  the third-order term, 2.7e-18 with both nodes at 1 V, and the eval code sums that with the node potentials: where
+  GiNaC printed `tanh(-V_n+V_p)+V_n-V_p` (clevo-lx, GiNaC 1.8.8; D3: the term order is the machine's) the term was
+  rounded away and the row was exactly 0 at 0.5, 1 and -3 V of common mode, so test_flat_branch_equation had no DC
+  point there ("Numerically singular matrix") while the chain passed. At a double root (`V(p, n) <+ V(p, n) +
+  V(p, n) * V(p, n)`) the central difference is 0 by symmetry on every machine. dual_ad.py: the flat row takes the
+  exact row of a neighbouring point instead: each unknown the row can depend on is stepped by the same relative
+  1e-6, up and then down, the dual evaluation run there, the steepest of those rows kept whole. A slope is not
+  summed with the potentials (1 - tanh' is the step squared: -/+1.0e-12 at 0 V, -/+4.0e-12 at 1 V, both plans).
+  Rows with any slope are untouched. test_exact_jacobian: three library tests, and the double-root deck v_sq beside
+  v_tanh (both V(out) = 1).
+
+Gate (measured, 1.1.12, on clevo-lx, not the chain): vae/tests 69/69 modules (460 tests) on the landed tree with Xyce fb34a1dc; 1.1.11 was 68/69 there (test_flat_branch_equation). NOT rerun: tests/vamos, hazard3, the deck families and the corpus (sv2ghdl on clevo-lx is at 5d45dbe, older than vamos's 1.1.9 minimum; the change is confined to a branch row whose slopes are all exactly 0).
 
 ### 1.1.11 (2026-11-14)
 
@@ -1070,7 +1087,8 @@ tanh'(0) = 0) makes the matrix singular however exact the Jacobian is
 difference quotient was 3.3e-9 there): that row alone, and only when it is
 flat, takes a central difference quotient with a relative step (1e-6 (|V|
 + 1), 1e-6 (|I| + 1 mA)) on each unknown it can depend on, so Newton moves
-along the branch (c_own v_tanh 1.0; test_exact_jacobian). Results: the diode decks above 0.0652353 at 0, 1,
+along the branch (c_own v_tanh 1.0; test_exact_jacobian; since 1.1.12 the
+exact row of a neighbouring point at that step instead, B31). Results: the diode decks above 0.0652353 at 0, 1,
 10 and 50 V (1.2e-7 apart), the ac tests 1e-9 of the analytic gain of the
 operating point; bjtd504 IR(V1) -3.45006823e-2 (e0) / -3.45006606e-2 (e20)
 vs VACASK -3.45007895e-2 (3e-6; the operating points differ by Xyce's Newton
@@ -1747,6 +1765,61 @@ while testing B29. `V(p, n) <+ x ** 3.0` (x real) reached the generated
 ginac.cpp as `x ** 3.0`: "invalid type argument of unary '*' (have
 'double')", the device refused. pow(x, 3.0) worked; parameter defaults
 (va_const) handled `**` already.
+
+### B31. The flat row of a branch equation was exactly 0 off 0 V on one machine
+
+FIXED in 1.1.12 (CHANGES 1.1.12; test_exact_jacobian). Was: found 2026-11-15
+on clevo-lx (Debian 13, g++ 14.2, GiNaC 1.8.8, glibc 2.41) when 1.1.11 was
+installed there: test_exact_jacobian's test_flat_branch_equation failed on
+every run, 68/69 modules ("Numerically singular matrix found by Amesos", no
+DC point for v_tanh), while the chain passes 69/69. The deck solves at V(p) =
+V(n) = 1 V; the matrix Xyce wrote for the failed solve (`.options linsol
+output_failed_ls=1`) had the branch row all 0.
+
+Mechanism. A12's corner: every exact slope of `V(p, n) <+ tanh(V(p, n))` is
+0 at V(p, n) = 0, and that row took a central difference of the RESIDUAL
+with a step h = 1e-6 (|V| + 1) on each node potential. The residual's only
+term in h is the third-order one, h**3/3 = 2.7e-18 with the nodes at 1 V,
+and the eval code sums it with the potentials themselves. On clevo-lx GiNaC
+prints `tanh(-V_n+V_p)+V_n-V_p` (the term order follows its hash seeds, so
+it is the machine's: D3): `(tanh(u) + V_n) - V_p` rounds the term away under
+ulp(1) = 2.2e-16, both residuals are equal and the row is exactly 0. Summed
+the other way, `(V_n - V_p) + tanh(u)`, the term survives (-1.33e-12 at 1 V
+in double arithmetic), which is presumably what the chain's build prints
+(not seen). Measured on clevo-lx, vae_jacobian of the 1.1.11 library called
+directly (dF/dV(p), V(p) = V(n)): -3.33e-13 at 0 V, -4.33e-13 at 1 mV, 0 at
+0.5, 1 and -3 V, -8.36e-10 at 50 V. 1.1.0-1.1.4 did not show it: their step
+of 1e-4 (|V| + 1) left 2.7e-12 at 1 V. No step is right for every residual,
+and at a double root (`V(p, n) <+ V(p, n) + V(p, n) * V(p, n)`, residual
+-V(p, n)**2) a central difference is 0 by symmetry at any step: 0 at 0 and
+50 V, 1.1e-16 of rounding in both columns at 1 V, no DC point either.
+
+Fix (dual_ad.py, vae_jacobian): the flat row takes the exact ROW OF A
+NEIGHBOURING POINT, slopes instead of a difference of values. Each unknown
+the row can depend on is stepped by the same relative 1e-6, up and then
+down; the dual evaluation is run at that point; the steepest of those rows
+is kept whole (the earliest, unless a later one is more than twice as
+steep, so rows of one size do not turn on their rounding; a row with a
+non-finite value or slope is passed over). A slope is not summed with the
+potentials: 1 - tanh' is tanh**2 of the step. v_tanh, (dF/dV(p), dF/dV(n)):
+(-1.0e-12, 1.0e-12) at 0 V, (-4.0e-12, 4.0e-12) at 1 V, (-2.6e-9, 2.6e-9)
+at 50 V, the same in the sparse and the full plan; v_sq (2.0e-6, -2.0e-6)
+at 0 V, (4.0e-6, -4.0e-6) at 1 V: one consistent row, where stepping each
+column on its own would have given both columns one sign. Both decks: V(out)
+= 1. A row with any slope is untouched, and so is a row that is flat because
+it depends on nothing (the row of a neighbouring point is 0 as well).
+
+With the residual off 0 at the flat point the row lets Newton move along the
+branch: `V(p, n) <+ tanh(V(p, n)) + c`, c = 1e-3, 1e-6, -1e-3, finds its DC
+point in 9, 14 and 9 Jacobians with no convergence failure, V(out) 1.2e-6,
+9.6e-6 and 1.2e-6 from the analytic root (Xyce's Newton tolerance on a root
+of slope u**2 = 2e-2, 2e-4; not in the test for that reason).
+
+Test: test_exact_jacobian test_flat_branch_row_at_any_common_mode (0, 1 mV,
+0.5, 1, -3, 50, 1000 V, both plans), test_flat_branch_row_of_even_order,
+test_row_with_a_slope_is_left_alone, and v_sq beside v_tanh in
+test_flat_branch_equation. Repro of the old row without Xyce: dlopen the
+v_tanh library of 1.1.11, vae_jacobian with V[0] = V[1] = 1.
 
 ---------------------------------------------------------------------------
 

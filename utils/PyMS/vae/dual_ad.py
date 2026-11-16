@@ -385,27 +385,53 @@ extern "C" void vae_jacobian(VaeState* s, double* dFdV, double* dQdV){
   // A branch equation whose slopes are all exactly 0 at this point (the
   // contribution cancels its own branch voltage: V(p, n) <+ tanh(V(p, n))
   // at 0, where 1 - tanh'(0) = 0) makes the matrix singular however exact it
-  // is (VACASK fails there too).  That row alone takes a central difference
-  // quotient, a relative step on each unknown it can depend on: a slope of
-  // the size of the curvature, so Newton moves along the branch (1.1.0-1.1.4
-  // took a forward difference of every row).  Nowhere else.
+  // is (VACASK fails there too).  That row alone takes the exact row of a
+  // neighbouring point, so Newton moves along the branch: each unknown the
+  // row can depend on is stepped by a relative 1e-6, up and then down, the
+  // dual evaluation is run there, and the steepest of those rows is kept
+  // whole (the earliest, unless a later one is more than twice as steep:
+  // rows of one size do not turn on their rounding).  Slopes, not a
+  // difference of residuals (1.1.12, B31): the central difference of
+  // 1.1.5-1.1.11 sat in the third-order term of the residual, 2.7e-18 for
+  // tanh with the nodes at 1 V, under the rounding of the node potentials
+  // it is summed with -- an exactly 0 row off 0 V where GiNaC printed
+  // tanh(-V_n+V_p)+V_n-V_p -- and it is 0 by symmetry at a double root.  A
+  // slope has no such sum: 1 - tanh' is of the size of the step squared.
+  // Nowhere else.
   for (int k = 0; k < NC; ++k) {
     const int i = vae_current_row(k);
     if (i < 0 || i >= NB) continue;
     bool flat = true;
     for (int j = 0; j < NT && flat; ++j) if (dFdV[i*NT + j] != 0.0 || dQdV[i*NT + j] != 0.0) flat = false;
     if (!flat) continue;
-    static double Fp[%(nbx)d], Qp[%(nbx)d], Fm[%(nbx)d], Qm[%(nbx)d];
+    static _vd Fn[%(nbx)d], Qn[%(nbx)d];
+    double bf = 0.0, bq = 0.0;             // the row kept so far: its largest |dF|, |dQ|
     for (int p = 0; p < NZ; ++p) {
       if (nz[p][0] != i) continue;
       const int j = nz[p][1];
-      ::VaeState sp = *s, sm = *s; sp.Hw = 0; sm.Hw = 0;
-      double h;
-      if (j < N) { h = 1e-6 * (std::fabs(s->V[j]) + 1.0); sp.V[j] += h; sm.V[j] -= h; }
-      else { h = 1e-6 * (std::fabs(s->I[j - N]) + 1e-3); sp.I[j - N] += h; sm.I[j - N] -= h; }
-      _vae_eval_impl(&sp, Fp, Qp); _vae_eval_impl(&sm, Fm, Qm);
-      dFdV[i*NT + j] = (Fp[i] - Fm[i]) / (2.0 * h);
-      dQdV[i*NT + j] = (Qp[i] - Qm[i]) / (2.0 * h);
+      _vd& x = j < N ? a.V[j] : a.I[j - N];
+      const double x0 = x.v, h = 1e-6 * (std::fabs(x0) + (j < N ? 1.0 : 1e-3));
+      for (int side = 0; side < 2; ++side) {
+        x.v = side ? x0 - h : x0 + h;
+        _vae_eval_ad(&a, Fn, Qn);
+        double mf = 0.0, mq = 0.0;
+        bool ok = std::isfinite(Fn[i].v) && std::isfinite(Qn[i].v);
+        for (int q = 0; q < NZ && ok; ++q) {
+          if (nz[q][0] != i) continue;
+          const double f = Fn[i].d[nz[q][2]], g = Qn[i].d[nz[q][2]];
+          if (!std::isfinite(f) || !std::isfinite(g)) ok = false;
+          if (std::fabs(f) > mf) mf = std::fabs(f);
+          if (std::fabs(g) > mq) mq = std::fabs(g);
+        }
+        if (!ok || !(mf > 2.0 * bf || (bf == 0.0 && mf == 0.0 && mq > 2.0 * bq))) continue;
+        bf = mf; bq = mq;
+        for (int q = 0; q < NZ; ++q) {
+          if (nz[q][0] != i) continue;
+          dFdV[i*NT + nz[q][1]] = Fn[i].d[nz[q][2]];
+          dQdV[i*NT + nz[q][1]] = Qn[i].d[nz[q][2]];
+        }
+      }
+      x.v = x0;
     }
   }
 }
