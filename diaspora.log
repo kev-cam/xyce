@@ -1,0 +1,15 @@
+# diaspora.log - imports that were tried and did not work, and how they
+# went wrong.  Written by diaspora (github.com/kev-cam/diaspora): one block
+# per attempt, appended, never rewritten.  The verdicts are in
+# diaspora.ledger; `diaspora show <commit>` prints a commit's blocks.
+
+2026-11-17 run 20261117-224317 import sandia@e8cf80e124ff6816e2383c79b0f8c084a0e3688a Fix uninitialized member variable
+  tested with 47594c2d49 as a batch, which failed, then alone
+  test full-regression failed: 4 new failures: xyce/pyms:BSIM6.1.1/Benchmark_tests/gummel_nmos.sp, xyce/pyms:BSIM6.1.1/Benchmark_tests/idvg_pmos.sp, xyce/pyms:BSIM6.1.1/Benchmark_tests/ringosc_17.sp, xyce/pyms:BSIMCMG110.0.0_20160101/benchmark_test/cfrgeo.sp
+  these decks change outcome from run to run on unchanged master; with the reference measured again, both imports passed (run 20261118-052816) and are on master
+  => failed
+
+2026-11-17 run 20261117-224317 import sandia@47594c2d49cdd86d9aab3c62611df3680827f3e9 Fix passing null pointer in restart file save
+  test full-regression failed: 1 new failure: xyce/pyms:BSIMCMG110.0.0_20160101/benchmark_test/cfrgeo.sp
+  these decks change outcome from run to run on unchanged master; with the reference measured again, both imports passed (run 20261118-052816) and are on master
+  => failed
