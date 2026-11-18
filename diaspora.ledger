@@ -1,0 +1,2 @@
+{"commit": "e8cf80e124ff6816e2383c79b0f8c084a0e3688a", "date": "2026-11-18", "dir": "import", "kind": "bugfix", "peer": "sandia", "subject": "Fix uninitialized member variable", "tests": ["compile", "full-regression"], "verdict": "applied"}
+{"commit": "47594c2d49cdd86d9aab3c62611df3680827f3e9", "date": "2026-11-18", "dir": "import", "kind": "bugfix", "peer": "sandia", "subject": "Fix passing null pointer in restart file save", "tests": ["compile", "full-regression"], "verdict": "applied"}
